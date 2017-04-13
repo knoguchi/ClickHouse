@@ -5,6 +5,7 @@
 #include <Interpreters/InterpreterDropQuery.h>
 #include <Storages/IStorage.h>
 #include <Databases/IDatabase.h>
+#include <Interpreters/DDLWorker.h>
 
 
 namespace DB
@@ -26,10 +27,18 @@ InterpreterDropQuery::InterpreterDropQuery(ASTPtr query_ptr_, Context & context_
 
 BlockIO InterpreterDropQuery::execute()
 {
+    ASTDropQuery & drop = typeid_cast<ASTDropQuery &>(*query_ptr);
+
+    if (drop.cluster.empty())
+        return executeOnServer(drop);
+    else
+        return executeOnCluster(drop);
+}
+
+BlockIO InterpreterDropQuery::executeOnServer(ASTDropQuery & drop)
+{
     String path = context.getPath();
     String current_database = context.getCurrentDatabase();
-
-    ASTDropQuery & drop = typeid_cast<ASTDropQuery &>(*query_ptr);
 
     bool drop_database = drop.table.empty() && !drop.database.empty();
 
@@ -140,6 +149,13 @@ BlockIO InterpreterDropQuery::execute()
     }
 
     return {};
+}
+
+
+BlockIO InterpreterDropQuery::executeOnCluster(ASTDropQuery & drop)
+{
+    String query = drop.getRewrittenQueryWithoutOnCluster(context.getCurrentDatabase());
+    return executeDDLQueryOnCluster(query, drop.cluster, context);
 }
 
 
