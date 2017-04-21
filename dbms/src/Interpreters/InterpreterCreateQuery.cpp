@@ -459,8 +459,11 @@ String InterpreterCreateQuery::setEngine(
 }
 
 
-BlockIO InterpreterCreateQuery::createTableOnServer(ASTCreateQuery & create)
+BlockIO InterpreterCreateQuery::createTable(ASTCreateQuery & create)
 {
+    if (!create.cluster.empty())
+        return executeDDLQueryOnCluster(create, context);
+
     String path = context.getPath();
     String current_database = context.getCurrentDatabase();
 
@@ -564,15 +567,6 @@ BlockIO InterpreterCreateQuery::createTableOnServer(ASTCreateQuery & create)
 }
 
 
-BlockIO InterpreterCreateQuery::createTableOnCluster(ASTCreateQuery & create)
-{
-    /// Do we really should use that database for each server?
-    String query = create.getRewrittenQueryWithoutOnCluster(context.getCurrentDatabase());
-
-    return executeDDLQueryOnCluster(query, create.cluster, context);
-}
-
-
 BlockIO InterpreterCreateQuery::execute()
 {
     ASTCreateQuery & create = typeid_cast<ASTCreateQuery &>(*query_ptr);
@@ -583,10 +577,8 @@ BlockIO InterpreterCreateQuery::execute()
         createDatabase(create);
         return {};
     }
-    else if (!create.cluster.empty())
-        return createTableOnCluster(create);
     else
-        return createTableOnServer(create);
+        return createTable(create);
 }
 
 

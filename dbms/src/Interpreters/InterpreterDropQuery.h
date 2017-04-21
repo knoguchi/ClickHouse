@@ -22,9 +22,6 @@ public:
 private:
     ASTPtr query_ptr;
     Context context;
-
-    BlockIO executeOnServer(ASTDropQuery & drop);
-    BlockIO executeOnCluster(ASTDropQuery & drop);
 };
 
 

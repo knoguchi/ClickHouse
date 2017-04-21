@@ -163,8 +163,8 @@ public:
 
     void writeAlias(const String & name, std::ostream & s, bool hilite) const;
 
-protected:
-    /// Для подсветки синтаксиса.
+public:
+    /// For syntax highlighting.
     static const char * hilite_keyword;
     static const char * hilite_identifier;
     static const char * hilite_function;
@@ -177,7 +177,7 @@ private:
 };
 
 
-/// Квотировать идентификатор обратными кавычками, если это требуется.
+/// Surrounds an identifier by back quotes if it is necessary.
 String backQuoteIfNeed(const String & x);
 
 

@@ -2,7 +2,7 @@
 
 #include <Parsers/ASTExpressionList.h>
 #include <Parsers/ASTFunction.h>
-#include <Parsers/ASTDDLQueryWithOnCluster.h>
+#include <Parsers/ASTQueryWithOnCluster.h>
 
 
 namespace DB
@@ -10,7 +10,7 @@ namespace DB
 
 
 /// Query CREATE TABLE or ATTACH TABLE
-class ASTCreateQuery : public IAST, public ASTDDLQueryWithOnCluster
+class ASTCreateQuery : public IAST, public ASTQueryWithOnCluster
 {
 public:
     bool attach{false};    /// If true then it means what query is ATTACH TABLE.
@@ -95,8 +95,8 @@ protected:
                     << what << " "
                     << (if_not_exists ? "IF NOT EXISTS " : "")
                 << (settings.hilite ? hilite_none : "")
-                << (!database.empty() ? backQuoteIfNeed(database) + "." : "") << backQuoteIfNeed(table)
-                << (!cluster.empty() ? " ON CLUSTER " + backQuoteIfNeed(cluster) + " " : "");
+                << (!database.empty() ? backQuoteIfNeed(database) + "." : "") << backQuoteIfNeed(table);
+                formatOnCluster(settings);
         }
 
         if (!as_table.empty())
