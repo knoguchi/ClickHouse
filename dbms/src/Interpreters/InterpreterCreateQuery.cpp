@@ -64,12 +64,15 @@ InterpreterCreateQuery::InterpreterCreateQuery(ASTPtr query_ptr_, Context & cont
 }
 
 
-void InterpreterCreateQuery::createDatabase(ASTCreateQuery & create)
+BlockIO InterpreterCreateQuery::createDatabase(ASTCreateQuery & create)
 {
+    if (!create.cluster.empty())
+        return executeDDLQueryOnCluster(query_ptr, context);
+
     String database_name = create.database;
 
     if (create.if_not_exists && context.isDatabaseExist(database_name))
-        return;
+        return {};
 
     String database_engine_name;
     if (!create.storage)
@@ -148,6 +151,8 @@ void InterpreterCreateQuery::createDatabase(ASTCreateQuery & create)
 
         throw;
     }
+
+    return {};
 }
 
 
@@ -462,7 +467,7 @@ String InterpreterCreateQuery::setEngine(
 BlockIO InterpreterCreateQuery::createTable(ASTCreateQuery & create)
 {
     if (!create.cluster.empty())
-        return executeDDLQueryOnCluster(create, context);
+        return executeDDLQueryOnCluster(query_ptr, context);
 
     String path = context.getPath();
     String current_database = context.getCurrentDatabase();
@@ -574,8 +579,7 @@ BlockIO InterpreterCreateQuery::execute()
     /// CREATE|ATTACH DATABASE
     if (!create.database.empty() && create.table.empty())
     {
-        createDatabase(create);
-        return {};
+        return createDatabase(create);
     }
     else
         return createTable(create);
