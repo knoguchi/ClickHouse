@@ -239,6 +239,13 @@ if (USE_CAPNP)
     endif ()
 endif ()
 
+if (USE_PROTOBUF)
+    target_link_libraries (dbms ${PROTOBUF_LIBRARIES})
+    if (NOT USE_INTERNAL_PROTOBUF_LIBRARY)
+        target_include_directories (dbms BEFORE PRIVATE ${PROTOBUF_INCLUDE_DIR})
+    endif ()
+endif ()
+
 if (USE_RDKAFKA)
     target_link_libraries (dbms ${RDKAFKA_LIBRARY})
     if (NOT USE_INTERNAL_RDKAFKA_LIBRARY)

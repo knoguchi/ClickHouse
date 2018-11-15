@@ -31,6 +31,7 @@ The table below lists supported formats and how they can be used in `INSERT` and
 | [Null](#null) | ✗ | ✔ |
 | [XML](#xml) | ✗ | ✔ |
 | [CapnProto](#capnproto) | ✔ | ✔ |
+| [Protobuf](#protobuf) | ✔ | ✔ |
 
 <a name="tabseparated"></a>
 
@@ -615,6 +616,32 @@ Where `schema.capnp` looks like this:
 struct Message {
   SearchPhrase @0 :Text;
   c @1 :Uint64;
+}
+```
+
+Schema files are in the file that is located in the directory specified in [ format_schema_path](../operations/server_settings/settings.md#server_settings-format_schema_path) in the server configuration.
+
+Deserialization is effective and usually doesn't increase the system load.
+
+<a name="format_protobuf"></a>
+
+## Protobuf
+
+Protobuf is a binary message format similar to Thrift, but not like JSON or MessagePack.
+
+Protobuf messages are strictly typed and not self-describing, meaning they need an external schema description. The schema is applied on the fly and cached for each query.
+
+``` sql
+SELECT SearchPhrase, count() AS c FROM test.hits
+       GROUP BY SearchPhrase FORMAT Protobuf SETTINGS schema = 'schema:Message'
+```
+
+Where `schema.proto` looks like this:
+
+```
+Message {
+  SearchPhrase text;
+  c uint64;
 }
 ```
 
