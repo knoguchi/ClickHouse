@@ -128,6 +128,7 @@ void registerOutputFormatNull(FormatFactory & factory);
 /// Input only formats.
 
 void registerInputFormatCapnProto(FormatFactory & factory);
+void registerInputFormatProtobuf(FormatFactory & factory);
 
 
 FormatFactory::FormatFactory()
@@ -147,6 +148,7 @@ FormatFactory::FormatFactory()
     registerInputFormatJSONEachRow(*this);
     registerOutputFormatJSONEachRow(*this);
     registerInputFormatCapnProto(*this);
+    registerInputFormatProtobuf(*this);
 
     registerOutputFormatPretty(*this);
     registerOutputFormatPrettyCompact(*this);
