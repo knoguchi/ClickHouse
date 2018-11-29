@@ -37,17 +37,31 @@ private:
     ReadBuffer & istr;
     Block header;
     Parser parser;
+    /*
     const Message * prototype_msg;
     DescriptorPool descriptor_pool;
     DynamicMessageFactory message_factory;
-
+    */
+    std::unique_ptr<Message> message;
     std::unordered_map<std::string, const FieldDescriptor *> name_to_field;
     static const std::unordered_map<FieldDescriptor::CppType, const std::string> protobuf_type_to_column_type_name;
 
     void validateSchema();
     void insertOneMessage(MutableColumns & columns, Message * mutable_msg);
+
 };
 
+// my stuff
+ std::vector<std::string> input_files_;
+ std::vector<std::string> descriptor_set_in_names_; 
+ std::vector<std::pair<std::string, std::string>> proto_path_;
+
+std::string codec_type_;
+
+enum ErrorFormat {
+  ERROR_FORMAT_BLAH
+};
+ErrorFormat error_format_;
 }
 
 #endif // USE_PROTOBUF
