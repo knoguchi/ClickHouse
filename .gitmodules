@@ -25,6 +25,7 @@
 [submodule "contrib/protobuf"]
 	path = contrib/protobuf
 	url = https://github.com/protocolbuffers/protobuf.git
+	branch = 3.6.x
 [submodule "contrib/double-conversion"]
 	path = contrib/double-conversion
 	url = https://github.com/google/double-conversion.git
