@@ -187,9 +187,9 @@ ProtobufRowInputStream::ProtobufRowInputStream(ReadBuffer & istr_, const Block &
     vector<const FileDescriptor *> parsed_files;
     unique_ptr<DiskSourceTree> disk_source_tree;
     unique_ptr<ErrorPrinter> error_collector;
-    unique_ptr<DescriptorPool> descriptor_pool;
-    unique_ptr<DescriptorDatabase> descriptor_database;
-    unique_ptr<SourceTreeDescriptorDatabase> source_tree_database;
+    // unique_ptr<DescriptorPool> descriptor_pool;
+    //unique_ptr<DescriptorDatabase> descriptor_database;
+    // unique_ptr<SourceTreeDescriptorDatabase> source_tree_database;
 
     // add search path
     proto_path_.clear();
@@ -203,7 +203,7 @@ ProtobufRowInputStream::ProtobufRowInputStream(ReadBuffer & istr_, const Block &
     set<string> _dup_check;
     recursive_directory_iterator it(schema_dir);
     recursive_directory_iterator endit;
-
+    
     while (it != endit)
     {
         if (is_regular_file(*it) && it->path().extension().c_str() == string(".proto"))
@@ -222,13 +222,12 @@ ProtobufRowInputStream::ProtobufRowInputStream(ReadBuffer & istr_, const Block &
     error_collector.reset(new ErrorPrinter(error_format_, disk_source_tree.get()));
 
     // at this point, it knows the dirs to look for proto files
-    SourceTreeDescriptorDatabase *database = new SourceTreeDescriptorDatabase(disk_source_tree.get());
+    database = new SourceTreeDescriptorDatabase(disk_source_tree.get());
     database->RecordErrorsTo(error_collector.get());
-    descriptor_database.reset(database);
-    descriptor_pool.reset(new DescriptorPool(descriptor_database.get(), database->GetValidationErrorCollector()));
-
+    descriptor_pool = new DescriptorPool(database, database->GetValidationErrorCollector());
     descriptor_pool->EnforceWeakDependencies(true);
-    if (!ParseInputFiles(descriptor_pool.get(), &parsed_files))
+    
+    if (!ParseInputFiles(descriptor_pool, &parsed_files))
     {
         throw ("Parse input files failed");
     }
@@ -240,10 +239,10 @@ ProtobufRowInputStream::ProtobufRowInputStream(ReadBuffer & istr_, const Block &
         throw ("Type not defined: " + root_type);
     }
 
-
     // create dynamic message factory
-    DynamicMessageFactory dynamic_factory(descriptor_pool.get());
+    LOG_DEBUG(log, "creating dynamic message factory");
     prototype_msg = dynamic_factory.GetPrototype(type);
+    LOG_DEBUG(log, "finished dynamic message factory");
 
     if (nullptr == prototype_msg)
         throw Exception("Failed to create a prototype message from a message descriptor"/*, ErrorCodes::TODO*/);
@@ -263,6 +262,7 @@ ProtobufRowInputStream::ProtobufRowInputStream(ReadBuffer & istr_, const Block &
     }
 
     validateSchema();
+    LOG_DEBUG(log, "finished setup ProtobufRowInputStream");
 }
 
 vector<pair<string, const FieldDescriptor *>> ProtobufRowInputStream::traverse_message(const Descriptor *type)
@@ -331,6 +331,8 @@ void ProtobufRowInputStream::insertOneMessage(MutableColumns & columns, Message 
 
 bool ProtobufRowInputStream::read(MutableColumns & columns)
 {
+    LOG_DEBUG(log, "reading message");
+  
     if (istr.eof())
         return false;
 
@@ -345,13 +347,18 @@ bool ProtobufRowInputStream::read(MutableColumns & columns)
     Message *mutable_msg = prototype_msg->New();
     if (nullptr == mutable_msg)
         throw Exception("Failed to create a mutable message"/*, ErrorCodes::TODO*/);
-
+    
+    LOG_DEBUG(log, "payload size " << file_data.size());
+    
     // Deserialize the bytes
     if (!mutable_msg->ParseFromArray(file_data.c_str(), file_data.size()))
         throw Exception("Failed to parse an input protobuf message"/*, ErrorCodes::TODO*/);
 
+    LOG_DEBUG(log, "deserialized");
+
     // Now, flatten the nested structure, and insert.
     insertOneMessage(columns, mutable_msg);
+    LOG_DEBUG(log, "inserted");
 
     // potentially it has to move the position
     return true;

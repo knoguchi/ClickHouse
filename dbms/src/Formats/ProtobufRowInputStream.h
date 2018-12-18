@@ -9,6 +9,8 @@
 
 #include <google/protobuf/compiler/parser.h>
 #include <google/protobuf/dynamic_message.h>
+#include <google/protobuf/compiler/importer.h>
+#include <google/protobuf/io/zero_copy_stream_impl.h>
 
 // TODO: some types require a bigger one to create a Field. Is it really how it should work?
 #define FOR_PROTOBUF_CPP_TYPES(M)                \
@@ -70,6 +72,10 @@ private:
     vector<string> descriptor_set_in_names_;
     vector<pair<string, string>> proto_path_;
 
+    DescriptorPool *descriptor_pool;
+    DescriptorDatabase *descriptor_database;
+    SourceTreeDescriptorDatabase *database;
+    DynamicMessageFactory dynamic_factory;
     const Message *prototype_msg;
 
     unordered_map<string, const FieldDescriptor *> name_to_field;
