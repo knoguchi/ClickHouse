@@ -22,31 +22,35 @@ void ASTAnalyticsClause::formatImpl(const FormatSettings & settings, FormatState
 
     std::string indent_str = settings.one_line ? "" : std::string(4 * frame.indent, ' ');
 
-    settings.ostr << "OVER(";
+    settings.ostr << (settings.hilite ? hilite_function : "") << "OVER(" << (settings.hilite ? hilite_none : "");
 
     if (partition_expression_list)
     {
-        settings.ostr << (settings.hilite ? hilite_keyword : "") << settings.nl_or_ws << indent_str << "PARTITION BY" << (settings.hilite ? hilite_none : "");
-        settings.one_line
-        ? partition_expression_list->formatImpl(settings, state, frame)
-        : partition_expression_list->as<ASTExpressionList &>().formatImplMultiline(settings, state, frame);
+        settings.ostr << (settings.hilite ? hilite_keyword : "") << "PARTITION BY" << (settings.hilite ? hilite_none : "");
+        settings.one_line ? partition_expression_list->formatImpl(settings, state, frame)
+                          : partition_expression_list->as<ASTExpressionList &>().formatImplMultiline(settings, state, frame);
     }
 
     if (order_expression_list)
     {
-        settings.ostr << (settings.hilite ? hilite_keyword : "") << settings.nl_or_ws << indent_str << "ORDER BY" << (settings.hilite ? hilite_none : "");
-        settings.one_line
-        ? order_expression_list->formatImpl(settings, state, frame)
-        : order_expression_list->as<ASTExpressionList &>().formatImplMultiline(settings, state, frame);
+        settings.ostr << (settings.hilite ? hilite_keyword : "") << " ORDER BY" << (settings.hilite ? hilite_none : "");
+        settings.one_line ? order_expression_list->formatImpl(settings, state, frame)
+                          : order_expression_list->as<ASTExpressionList &>().formatImplMultiline(settings, state, frame);
     }
 
-    for (const auto & child : children)
+    if(windowing)
     {
-        settings.ostr << ' ';
-        child->formatImpl(settings, state, frame);
+
+        settings.ostr << (settings.hilite ? hilite_keyword : "");
+        if (is_row)
+            settings.ostr << " ROWS";
+        else if (is_range)
+            settings.ostr << " RANGE";
+        settings.ostr << (settings.hilite ? hilite_none : "");
+        windowing->formatImpl(settings, state, frame);
     }
 
-    settings.ostr << ")";
+    settings.ostr << (settings.hilite ? hilite_function : "") << ")" << (settings.hilite ? hilite_none : "");
 
 }
 

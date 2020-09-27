@@ -10,8 +10,12 @@ class ASTAnalyticsClause : public IAST
 public:
     ASTPtr partition_expression_list;
     ASTPtr order_expression_list;
+    ASTPtr windowing;
 
 public:
+    bool is_row = false;
+    bool is_range = false;
+
     ASTAnalyticsClause() { }
 
     String getID(char) const override { return "analytics_clause"; }
