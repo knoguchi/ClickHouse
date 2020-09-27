@@ -17,6 +17,8 @@ public:
     ASTPtr arguments;
     /// parameters - for parametric aggregate function. Example: quantile(0.9)(x) - what in first parens are 'parameters'.
     ASTPtr parameters;
+    /// analyticClause - for analytic function OVER ( analytic_clause )
+    ASTPtr analyticClause;
 
 public:
     /** Get text identifying the AST node. */

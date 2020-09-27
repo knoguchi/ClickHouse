@@ -100,6 +100,7 @@ protected:
 /** A function, for example, f(x, y + 1, g(z)).
   * Or an aggregate function: sum(x + f(y)), corr(x, y). The syntax is the same as the usual function.
   * Or a parametric aggregate function: quantile(0.9)(x + y).
+  * Or an analytic function: sum(x) OVER (PARTITION BY y)
   *  Syntax - two pairs of parentheses instead of one. The first is for parameters, the second for arguments.
   * For functions, the DISTINCT modifier can be specified, for example, count(DISTINCT x, y).
   */

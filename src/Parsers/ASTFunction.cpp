@@ -50,7 +50,7 @@ ASTPtr ASTFunction::clone() const
 
     if (arguments) { res->arguments = arguments->clone(); res->children.push_back(res->arguments); }
     if (parameters) { res->parameters = parameters->clone(); res->children.push_back(res->parameters); }
-
+    if (analyticClause) {res->analyticClause = analyticClause->clone(); res->children.push_back(res->analyticClause); }
     return res;
 }
 
@@ -398,6 +398,11 @@ void ASTFunction::formatImplWithoutAlias(const FormatSettings & settings, Format
             }
 
             settings.ostr << (settings.hilite ? hilite_function : "") << ')';
+        }
+
+        if(analyticClause) {
+            settings.ostr << " ";
+            analyticClause->formatImpl(settings, state, nested_dont_need_parens);
         }
 
         settings.ostr << (settings.hilite ? hilite_none : "");

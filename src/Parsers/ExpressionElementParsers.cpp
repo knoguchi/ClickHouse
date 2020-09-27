@@ -33,6 +33,8 @@
 #include <Parsers/ExpressionElementParsers.h>
 #include <Parsers/ParserCreateQuery.h>
 
+#include <Parsers/ParserAnalyticsClause.h>
+
 #include <Parsers/queryToString.h>
 #include <boost/algorithm/string.hpp>
 #include "ASTColumnsMatcher.h"
@@ -222,6 +224,8 @@ bool ParserFunction::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
     ParserKeyword distinct("DISTINCT");
     ParserExpressionList contents(false);
     ParserSelectWithUnionQuery select;
+    ParserKeyword over("OVER");
+    ParserAnalyticsClause analytics_clause_parser;
 
     bool has_distinct_modifier = false;
 
@@ -229,6 +233,7 @@ bool ParserFunction::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
     ASTPtr query;
     ASTPtr expr_list_args;
     ASTPtr expr_list_params;
+    ASTPtr analytics_clause;
 
     if (!id_parser.parse(pos, identifier, expected))
         return false;
@@ -340,6 +345,29 @@ bool ParserFunction::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
         function_node->parameters = expr_list_params;
         function_node->children.push_back(function_node->parameters);
     }
+
+    if (over.ignore(pos, expected))
+    {
+        ++pos;
+
+        //auto old_pos = pos;
+        if (pos->type == TokenType::OpeningRoundBracket)
+            return false;
+
+        if(!analytics_clause_parser.parse(pos, analytics_clause, expected))
+            return false;
+
+        if (pos->type != TokenType::ClosingRoundBracket)
+            return false;
+        ++pos;
+    }
+
+    if (analytics_clause)
+    {
+        function_node->analyticClause = analytics_clause;
+//        function_node->children.push_back(function_node->parameters);
+    }
+
 
     node = function_node;
     return true;
