@@ -23,5 +23,12 @@ set(CMAKE_C_STANDARD_LIBRARIES ${DEFAULT_LIBS})
 add_library(Threads::Threads INTERFACE IMPORTED)
 set_target_properties(Threads::Threads PROPERTIES INTERFACE_LINK_LIBRARIES pthread)
 
+# The ClickHouse static-library graph has undeclared circular references
+# (e.g. clickhouse_common_zookeeper_base <-> clickhouse_common_zookeeper).
+# lld tolerates this, but the illumos linker scans archives strictly
+# left-to-right, so make it rescan until no further archive members are
+# pulled in.
+set (CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,-z,rescan")
+
 include (cmake/unwind.cmake)
 include (cmake/cxx.cmake)
