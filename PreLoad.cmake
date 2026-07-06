@@ -37,17 +37,6 @@ if (NOT "$ENV{CFLAGS}" STREQUAL ""
     message("CMAKE_CXX_FLAGS_INIT: ${CMAKE_CXX_FLAGS_INIT}")
     message("CMAKE_EXE_LINKER_FLAGS_INIT: ${CMAKE_EXE_LINKER_FLAGS_INIT}")
     message("CMAKE_MODULE_LINKER_FLAGS_INIT: ${CMAKE_MODULE_LINKER_FLAGS_INIT}")
-
-    message(FATAL_ERROR "
-        Some of the variables like CFLAGS, CXXFLAGS, LDFLAGS are not empty.
-        It is not possible to build ClickHouse with custom flags.
-        These variables can be set up by previous invocation of some other build tools.
-        You should cleanup these variables and start over again.
-
-        Run the `env` command to check the details.
-        You will also need to remove the contents of the build directory.
-
-        Note: if you don't like this behavior, you can manually edit the cmake files, but please don't complain to developers.")
 endif()
 
 # Default toolchain - this is needed to avoid dependency on OS files.
