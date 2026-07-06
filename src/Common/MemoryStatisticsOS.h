@@ -1,5 +1,5 @@
 #pragma once
-#if defined(OS_LINUX) || defined(OS_FREEBSD)
+#if defined(OS_LINUX) || defined(OS_FREEBSD) || defined(OS_SUNOS)
 #include <cstdint>
 #if defined(OS_FREEBSD)
 #include <unistd.h>
@@ -29,8 +29,11 @@ public:
 #if defined(OS_LINUX)
         uint64_t shared;
 #endif
+#if !defined(OS_SUNOS)
+        /// psinfo on illumos provides no code / data-and-stack breakdown.
         uint64_t code;
         uint64_t data_and_stack;
+#endif
     };
 
     MemoryStatisticsOS();
@@ -40,7 +43,7 @@ public:
     Data get() const;
 
 private:
-#if defined(OS_LINUX)
+#if defined(OS_LINUX) || defined(OS_SUNOS)
     int fd;
 #endif
 #if defined(OS_FREEBSD)
