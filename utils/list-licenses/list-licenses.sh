@@ -63,7 +63,7 @@ process_library() {
          echo "Apache") ||
         (${GREP_CMD} -q -F 'Boost' "$LIB_LICENSE" &&
          echo "Boost") ||
-        (${GREP_CMD} -q -i -P 'public\s*domain|CC0 1\.0 Universal' "$LIB_LICENSE" &&
+        (${GREP_CMD} -q -i -E 'public[[:space:]]*domain|CC0 1\.0 Universal' "$LIB_LICENSE" &&
          echo "Public Domain") ||
         (${GREP_CMD} -q -F 'BSD' "$LIB_LICENSE" &&
          echo "BSD") ||
@@ -142,7 +142,7 @@ process_rust_crate() {
     NAME=$(echo "$CRATE" | rev | cut -f2- -d- | rev)
 
     LICENSE_TYPE=$(${GREP_CMD} 'license = "' "$dependency"  | cut -d '"' -f2)
-    if echo "${LICENSE_TYPE}" | ${GREP_CMD} -v -P 'MIT|Apache|MPL|ISC|BSD|Unicode|Zlib|CC0-1.0|CDLA-Permissive|BSL-1.0';
+    if echo "${LICENSE_TYPE}" | ${GREP_CMD} -v -E 'MIT|Apache|MPL|ISC|BSD|Unicode|Zlib|CC0-1.0|CDLA-Permissive|BSL-1.0';
     then
         echo "Fatal error: unrecognized licenses ($LICENSE_TYPE) in the Rust code" >&2
         exit 1
