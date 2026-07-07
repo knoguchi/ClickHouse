@@ -700,7 +700,7 @@ using namespace DB;
 
 TEST(UniqueKeyNoRocksDB, StaticWritersThrowSupportIsDisabled)
 {
-    auto tmp_path = std::filesystem::temp_directory_path()
+    std::filesystem::path tmp_path = std::filesystem::temp_directory_path()
         / ("gtest_unique_key_no_rocksdb_"
            + std::to_string(::testing::UnitTest::GetInstance()->random_seed()));
     std::filesystem::remove_all(tmp_path);
@@ -738,7 +738,7 @@ TEST(UniqueKeyNoRocksDB, StaticWritersThrowSupportIsDisabled)
 
 TEST(UniqueKeyNoRocksDB, ConstructorThrowsSupportIsDisabled)
 {
-    auto tmp_path = std::filesystem::temp_directory_path()
+    std::filesystem::path tmp_path = std::filesystem::temp_directory_path()
         / ("gtest_unique_key_no_rocksdb_ctor_"
            + std::to_string(::testing::UnitTest::GetInstance()->random_seed()));
     std::filesystem::remove_all(tmp_path);
