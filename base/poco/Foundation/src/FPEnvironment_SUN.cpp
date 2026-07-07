@@ -50,7 +50,7 @@ FPEnvironmentImpl& FPEnvironmentImpl::operator = (const FPEnvironmentImpl& env)
 
 bool FPEnvironmentImpl::isInfiniteImpl(float value)
 {
-	int cls = fpclass(value);
+	int cls = fpclass(static_cast<double>(value));
 	return cls == FP_PINF || cls == FP_NINF;
 }
 
@@ -89,13 +89,13 @@ bool FPEnvironmentImpl::isNaNImpl(long double value)
 
 float FPEnvironmentImpl::copySignImpl(float target, float source)
 {
-	return (float) copysign(target, source);
+	return copysignf(target, source);
 }
 
 
 double FPEnvironmentImpl::copySignImpl(double target, double source)
 {
-	return (float) copysign(target, source);
+	return copysign(target, source);
 }
 
 
