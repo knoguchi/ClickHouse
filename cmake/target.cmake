@@ -17,6 +17,9 @@ elseif (CMAKE_SYSTEM_NAME MATCHES "Darwin")
 elseif (CMAKE_SYSTEM_NAME MATCHES "SunOS")
     set (OS_SUNOS 1)
     add_definitions(-D OS_SUNOS)
+    # The bundled OpenLDAP requires pre-generated per-platform configuration
+    # headers (see contrib/openldap-cmake), which do not exist for SunOS yet.
+    set (ENABLE_LDAP OFF CACHE INTERNAL "")
 elseif (CMAKE_SYSTEM_NAME MATCHES "Emscripten")
     # WebAssembly, through the Emscripten toolchain. Configure with `emcmake cmake ...`, which
     # sets CMAKE_SYSTEM_NAME and points CMAKE_TOOLCHAIN_FILE at Emscripten's own toolchain file.
