@@ -1,8 +1,6 @@
 #pragma once
 
 #include <sys/ioctl.h>
-/// For `struct winsize`: glibc defines it in sys/ioctl.h, but on illumos it
-/// comes from termios.h (which is also where POSIX.1-2024 standardizes it).
 #include <termios.h>
 
 
