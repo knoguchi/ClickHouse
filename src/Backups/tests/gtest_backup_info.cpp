@@ -66,7 +66,7 @@ namespace
         }
     }
 
-    [[noreturn]] void checkURLOverrideExpressionWithContext()
+    void checkURLOverrideExpressionWithContext()
     {
         tryRegisterFunctions();
         const auto & context = getContext().context;
@@ -79,7 +79,7 @@ namespace
         std::_Exit(0);
     }
 
-    [[noreturn]] void checkExpressionCredentialKeyWithContext()
+    void checkExpressionCredentialKeyWithContext()
     {
         tryRegisterFunctions();
         const auto & context = getContext().context;
@@ -143,7 +143,7 @@ namespace
         std::_Exit(0);
     }
 
-    [[noreturn]] void checkExpressionURLKeyAndValueWithContext()
+    void checkExpressionURLKeyAndValueWithContext()
     {
         tryRegisterFunctions();
         const auto & context = getContext().context;
