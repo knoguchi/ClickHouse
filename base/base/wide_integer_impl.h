@@ -627,7 +627,9 @@ struct integer<Bits, Signed>::_impl
         // Calculate remainder: t - floor(alpha) * max_int
         // On platforms with >64-bit mantissa, round the multiplication to 64-bit precision
         // to match x86's 80-bit extended behavior
-        T remainder_subtrahend = floor(alpha) * static_cast<T>(max_int);
+        /// floorl instead of floor: older illumos math.h lacks the floor(long double) overload,
+        /// and the bundled libc++ defers to the system overload set on __sun.
+        T remainder_subtrahend = static_cast<T>(floorl(alpha)) * static_cast<T>(max_int);
 #if (LDBL_MANT_DIG > 64)
         if constexpr (std::is_same_v<T, FromDoubleIntermediateType>)
         {
