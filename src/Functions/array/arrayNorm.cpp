@@ -27,7 +27,10 @@ struct L1Norm
     template <typename ResultType>
     static ResultType accumulate(ResultType result, ResultType value, const ConstParams &)
     {
-        return result + fabs(value);
+        if constexpr (std::is_same_v<ResultType, Float32>)
+            return result + fabsf(value);
+        else
+            return result + fabs(value);
     }
 
     template <typename ResultType>
@@ -64,7 +67,10 @@ struct L2Norm
     template <typename ResultType>
     static ResultType finalize(ResultType result, const ConstParams &)
     {
-        return sqrt(result);
+        if constexpr (std::is_same_v<ResultType, Float32>)
+            return sqrtf(result);
+        else
+            return sqrt(result);
     }
 };
 
@@ -93,7 +99,10 @@ struct LpNorm
     template <typename ResultType>
     static ResultType accumulate(ResultType result, ResultType value, const ConstParams & params)
     {
-        return result + static_cast<ResultType>(std::pow(fabs(value), params.power));
+        if constexpr (std::is_same_v<ResultType, Float32>)
+            return result + static_cast<ResultType>(std::pow(fabsf(value), params.power));
+        else
+            return result + static_cast<ResultType>(std::pow(fabs(value), params.power));
     }
 
     template <typename ResultType>
@@ -118,7 +127,10 @@ struct LinfNorm
     template <typename ResultType>
     static ResultType accumulate(ResultType result, ResultType value, const ConstParams &)
     {
-        return fmax(result, fabs(value));
+        if constexpr (std::is_same_v<ResultType, Float32>)
+            return fmax(result, fabsf(value));
+        else
+            return fmax(result, fabs(value));
     }
 
     template <typename ResultType>
