@@ -692,7 +692,7 @@ void LocalObjectStorage::removeObject(const StoredObject & object) const
         std::string dir_str = dir;
         if (0 != rmdir(dir_str.data()))
         {
-            if (errno == ENOTDIR || errno == ENOTEMPTY)
+            if (errno == ENOTDIR || errno == ENOTEMPTY || errno == EEXIST)
                 break;
             ErrnoException::throwFromPath(ErrorCodes::CANNOT_RMDIR, dir_str, "Cannot remove directory {}", dir_str);
         }
