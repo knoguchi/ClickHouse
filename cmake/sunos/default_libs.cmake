@@ -28,7 +28,7 @@ set_target_properties(Threads::Threads PROPERTIES INTERFACE_LINK_LIBRARIES pthre
 # lld tolerates this, but the illumos linker scans archives strictly
 # left-to-right, so make it rescan until no further archive members are
 # pulled in.
-set (CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,-z,rescan")
+set (CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,-z,rescan -Wl,-z,now")
 
 include (cmake/unwind.cmake)
 include (cmake/cxx.cmake)
