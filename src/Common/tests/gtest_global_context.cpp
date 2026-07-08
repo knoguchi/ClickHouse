@@ -17,7 +17,7 @@ ContextHolder::ContextHolder()
     /// Without a config, getConfigRef falls back to Poco::Util::Application::instance(),
     /// which does not exist in test binaries. Tests only pass without this if a test that
     /// calls setConfig happens to be registered earlier, which depends on the link order.
-    context->setConfig(Poco::AutoPtr(new Poco::Util::MapConfiguration()));
+    context->setConfig(Poco::AutoPtr<Poco::Util::AbstractConfiguration>(new Poco::Util::MapConfiguration()));
     context->setPath("./");
     const_cast<DB::Settings &>(context->getSettingsRef())[DB::Setting::local_filesystem_read_method] = "pread";
 }
