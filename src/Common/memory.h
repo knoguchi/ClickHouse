@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <cstdlib>
 #include <new>
 #include <base/defines.h>
@@ -150,6 +151,60 @@ inline ALWAYS_INLINE size_t trackMemoryFromC(std::size_t size, AllocationTrace &
     return actual_size;
 }
 
+#if defined(OS_SUNOS)
+/// libumem does not export malloc_usable_size, but its malloc/memalign adapters store the
+/// requested size in tags placed immediately before the returned pointer. The layout and
+/// magic values follow illumos usr/src/lib/libumem/common/malloc.c (LP64 cases only).
+inline ALWAYS_INLINE size_t umemUsableSize(void * buf_arg) noexcept
+{
+    static constexpr uint32_t MALLOC_MAGIC = 0x3a10c000;
+    static constexpr uint32_t MEMALIGN_MAGIC = 0x3e3a1000;
+    static constexpr uint32_t MALLOC_SECOND_MAGIC = 0x16ba7000;
+    static constexpr uint32_t MALLOC_OVERSIZE_MAGIC = 0x06e47000;
+
+    struct MallocData
+    {
+        uint32_t malloc_size;
+        uint32_t malloc_stat;
+    };
+
+    if (buf_arg == nullptr)
+        return 0;
+
+    const MallocData * buf = static_cast<const MallocData *>(buf_arg) - 1;
+    size_t size = buf->malloc_size;
+
+    /// UMEM_MALLOC_DECODE
+    switch (static_cast<uint32_t>(buf->malloc_stat + size))
+    {
+        case MALLOC_MAGIC:
+            return size - sizeof(MallocData);
+        case MALLOC_SECOND_MAGIC:
+            return size - 2 * sizeof(MallocData);
+        case MALLOC_OVERSIZE_MAGIC:
+        {
+            --buf;
+            size_t high_size = buf->malloc_size;
+            if (static_cast<uint32_t>(buf->malloc_stat + high_size) != MALLOC_MAGIC)
+                return 0;
+            size += high_size << 32;
+            return size - 2 * sizeof(MallocData);
+        }
+        case MEMALIGN_MAGIC:
+        {
+            --buf;
+            size_t high_size = buf->malloc_size;
+            if (static_cast<uint32_t>(buf->malloc_stat + high_size) != MEMALIGN_MAGIC)
+                return 0;
+            size += high_size << 32;
+            return size - 2 * sizeof(MallocData);
+        }
+        default:
+            return 0;
+    }
+}
+#endif
+
 template <std::same_as<std::align_val_t>... TAlign>
 requires DB::OptionalArgument<TAlign...>
 inline ALWAYS_INLINE size_t untrackMemory(void * ptr [[maybe_unused]], AllocationTrace & trace, std::size_t size [[maybe_unused]] = 0, TAlign... align [[maybe_unused]]) noexcept
@@ -171,7 +226,10 @@ inline ALWAYS_INLINE size_t untrackMemory(void * ptr [[maybe_unused]], Allocatio
 #else
         if (size)
             actual_size = size;
-#    if defined(_GNU_SOURCE)
+#    if defined(OS_SUNOS)
+        else
+            actual_size = umemUsableSize(ptr);
+#    elif defined(_GNU_SOURCE)
         /// It's innaccurate resource free for sanitizers. malloc_usable_size() result is greater or equal to allocated size.
         else
             actual_size = malloc_usable_size(ptr);
