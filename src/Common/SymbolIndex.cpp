@@ -477,8 +477,18 @@ int collectSymbols(DynamicLinkingProgramHeaderInfo * info, size_t, void * data_p
 {
     SymbolIndex::Data & data = *reinterpret_cast<SymbolIndex::Data *>(data_ptr);
 
-    collectSymbolsFromProgramHeaders(info, data.symbols);
-    collectSymbolsFromELF(info, data.symbols, data.objects, data.self_build_id);
+    /// dl_iterate_phdr calls this under the dynamic linker's internal lock. An exception
+    /// escaping the callback bypasses the unlock, and every subsequent entry into the
+    /// dynamic linker (dlopen, dlsym, lazy binding, thread exit) deadlocks.
+    try
+    {
+        collectSymbolsFromProgramHeaders(info, data.symbols);
+        collectSymbolsFromELF(info, data.symbols, data.objects, data.self_build_id);
+    }
+    catch (...) /// NOLINT(bugprone-empty-catch)
+    {
+        /// Skip the object; it will be missing from symbolized stack traces.
+    }
 
     /* Continue iterations */
     return 0;
