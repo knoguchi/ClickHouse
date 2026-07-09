@@ -24,10 +24,16 @@ jobs:
         uses: vmactions/omnios-vm@7f2be0b927aad1a78498c8aeeac4c4ce1fabd322 # v1.3.3
         with:
           release: r151058
-          mem: 12288
+          mem: 13312
           prepare: |
             pkg install ooce/developer/clang-21 ooce/developer/llvm-21 ooce/developer/cmake ooce/developer/ninja \
               runtime/python-313 file/gnu-findutils text/gnu-grep
+            # illumos does not overcommit memory: compiler VA peaks must be
+            # backed by RAM+swap, and the image has little swap.
+            swap -sh
+            zfs create -V 8G rpool/swap2
+            swap -a /dev/zvol/dsk/rpool/swap2
+            swap -sh
           # Build outside the workspace so copyback only returns out/.
           run: |
             set -e
