@@ -26,7 +26,7 @@ jobs:
           release: r151058
           mem: 12288
           prepare: |
-            pkg install ooce/developer/llvm-21 ooce/developer/cmake ooce/developer/ninja \
+            pkg install ooce/developer/clang-21 ooce/developer/llvm-21 ooce/developer/cmake ooce/developer/ninja \
               runtime/python-313 file/gnu-findutils text/gnu-grep
           # Build outside the workspace so copyback only returns out/.
           run: |
@@ -38,8 +38,8 @@ jobs:
             mkdir -p /var/tmp/build && cd /var/tmp/build
             cmake -G Ninja \
                 -DCMAKE_BUILD_TYPE=Release \
-                -DCMAKE_C_COMPILER=/opt/ooce/llvm-21/bin/clang \
-                -DCMAKE_CXX_COMPILER=/opt/ooce/llvm-21/bin/clang++ \
+                -DCMAKE_C_COMPILER=/opt/ooce/bin/clang-21 \
+                -DCMAKE_CXX_COMPILER=/opt/ooce/bin/clang++-21 \
                 -DPARALLEL_COMPILE_JOBS=4 \
                 -DPARALLEL_LINK_JOBS=1 \
                 -DENABLE_LIBRARIES=OFF \
