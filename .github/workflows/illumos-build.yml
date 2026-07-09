@@ -2,9 +2,9 @@ name: illumos-build
 
 on:
   push:
-    branches: [ 'smartos/**' ]
+    branches: [ 'illumos/**' ]
     # release tags are prefixed to stay clear of upstream ClickHouse version tags.
-    tags: [ 'smartos-v*' ]
+    tags: [ 'illumos-v*' ]
   workflow_dispatch:
 
 permissions:
@@ -73,7 +73,7 @@ jobs:
           if-no-files-found: error
 
       - name: Attach to release (tags)
-        if: startsWith(github.ref, 'refs/tags/smartos-v')
+        if: startsWith(github.ref, 'refs/tags/illumos-v')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
