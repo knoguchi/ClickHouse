@@ -14,6 +14,13 @@ jobs:
   build-illumos:
     runs-on: ubuntu-latest
     steps:
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/share/swift /opt/hostedtoolcache/CodeQL
+          sudo mkdir -p /mnt/vmactions
+          sudo chown "$(whoami)" /mnt/vmactions
+          df -h / /mnt
+
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # 5.0.1
         with:
@@ -24,14 +31,21 @@ jobs:
         uses: vmactions/omnios-vm@7f2be0b927aad1a78498c8aeeac4c4ce1fabd322 # v1.3.3
         with:
           release: r151058
-          mem: 13312
+          # Leave the 16GB host real headroom: the runner dies silently when
+          # qemu RSS plus the agent exhaust it.
+          mem: 11264
+          cache-dir: /mnt/vmactions/cache
+          data-dir: /mnt/vmactions/data
           prepare: |
             pkg install ooce/developer/clang-21 ooce/developer/llvm-21 ooce/developer/cmake ooce/developer/ninja \
               runtime/python-313 file/gnu-findutils text/gnu-grep
+            # Cap the guest ZFS ARC at 1G so guest memory goes to the
+            # compilers rather than cache (which also balloons qemu RSS).
+            echo 'zfs_arc_max/Z 0x40000000' | mdb -kw
             # illumos does not overcommit memory: compiler VA peaks must be
             # backed by RAM+swap, and the image has little swap.
             swap -sh
-            zfs create -V 8G rpool/swap2
+            zfs create -V 12G rpool/swap2
             swap -a /dev/zvol/dsk/rpool/swap2
             swap -sh
           # Build outside the workspace so copyback only returns out/.
@@ -47,17 +61,11 @@ jobs:
                 -DCOMPILER_CACHE=disabled \
                 -DCMAKE_C_COMPILER=/opt/ooce/bin/clang-21 \
                 -DCMAKE_CXX_COMPILER=/opt/ooce/bin/clang++-21 \
-                -DPARALLEL_COMPILE_JOBS=4 \
+                -DPARALLEL_COMPILE_JOBS=3 \
                 -DPARALLEL_LINK_JOBS=1 \
                 -DENABLE_LIBRARIES=OFF \
                 -DENABLE_RUST=OFF \
                 -DENABLE_TESTS=OFF \
-                -DENABLE_YAML_CPP=ON \
-                -DENABLE_ICU=ON \
-                -DENABLE_DATASKETCHES=ON \
-                -DENABLE_ANTLR4_CPP_RUNTIME=ON \
-                -DENABLE_ANTLR4_GRAMMARS=ON \
-                -DENABLE_NURAFT=ON \
                 "$SRC"
             ninja clickhouse
 
