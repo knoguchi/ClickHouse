@@ -10,9 +10,17 @@ else
     GREP_CMD='grep'
 fi
 
-ROOT_PATH="${1:-}"
-if [[ -z "$ROOT_PATH" ]]; then
-    ROOT_PATH="$(git rev-parse --show-toplevel)"
+# Parallel workers re-execute this script with "--call <function> <argument>";
+# they inherit ROOT_PATH and LIBS_PATH from the environment. This avoids
+# "export -f", which bash builds with import hardening refuse to honor.
+if [[ "${1:-}" == "--call" ]]; then
+    worker_call="$2"
+    worker_arg="$3"
+else
+    ROOT_PATH="${1:-}"
+    if [[ -z "$ROOT_PATH" ]]; then
+        ROOT_PATH="$(git rev-parse --show-toplevel)"
+    fi
 fi
 
 LIBS_PATH="${ROOT_PATH}/contrib"
@@ -213,9 +221,13 @@ process_rust_crate() {
     echo -e "$NAME\t$LICENSE_TYPE\t$RELATIVE_PATH"
 }
 
-# Export functions and variables for parallel execution
-export -f to_relative_path process_library process_rust_crate
-export GREP_CMD FIND_CMD ROOT_PATH LIBS_PATH
+if [[ -n "${worker_call:-}" ]]; then
+    "$worker_call" "$worker_arg"
+    exit $?
+fi
+
+# Export variables for parallel workers
+export ROOT_PATH LIBS_PATH
 
 # Process C/C++ libraries in parallel
 libs=$(echo "${ROOT_PATH}/base/poco"; (${FIND_CMD} "${LIBS_PATH}" -mindepth 1 -maxdepth 1 -type d -not -name '*-cmake' -not -name 'rust_vendor' | LC_ALL=C sort) )
@@ -224,7 +236,7 @@ libs=$(echo "${ROOT_PATH}/base/poco"; (${FIND_CMD} "${LIBS_PATH}" -mindepth 1 -m
 JOBS=$(nproc 2>/dev/null || echo 4)
 
 # Process in parallel and preserve deterministic output.
-c_cpp_output=$(printf '%s\n' "$libs" | xargs -P "${JOBS}" -I {} bash -c 'process_library "$@"' _ {})
+c_cpp_output=$(printf '%s\n' "$libs" | xargs -P "${JOBS}" -I {} "$0" --call process_library {})
 c_cpp_status=$?
 if [ "${c_cpp_status}" -ne 0 ]
 then
@@ -235,7 +247,7 @@ then
     printf '%s\n' "${c_cpp_output}" | LC_ALL=C sort
 fi
 
-rust_output=$(${FIND_CMD} "${LIBS_PATH}/rust_vendor/" -name 'Cargo.toml' | xargs -P "${JOBS}" -I {} bash -c 'process_rust_crate "$@"' _ {})
+rust_output=$(${FIND_CMD} "${LIBS_PATH}/rust_vendor/" -name 'Cargo.toml' | xargs -P "${JOBS}" -I {} "$0" --call process_rust_crate {})
 rust_status=$?
 if [ "${rust_status}" -ne 0 ]
 then
