@@ -4,10 +4,6 @@ add_library(_zlib)
 add_library(ch_contrib::zlib ALIAS _zlib)
 
 target_compile_definitions(_zlib PUBLIC -DZLIB_COMPAT)
-if(NOT ARCH_S390X)
-    target_compile_definitions(_zlib PRIVATE -DUNALIGNED_OK)
-    target_compile_definitions(_zlib PRIVATE -DUNALIGNED64_OK)
-endif()
 
 set (HAVE_UNISTD_H 1)
 add_definitions(-D_LARGEFILE64_SOURCE=1 -D__USE_LARGEFILE64)
@@ -168,7 +164,7 @@ configure_file(${SOURCE_DIR}/gzread.c.in ${CMAKE_CURRENT_BINARY_DIR}/gzread.c @O
 # We should use same defines when including zlib.h as used when zlib compiled
 target_compile_definitions (_zlib PUBLIC ZLIB_COMPAT WITH_GZFILEOP)
 if (ARCH_AMD64 OR ARCH_AARCH64)
-    target_compile_definitions (_zlib PUBLIC X86_64 UNALIGNED_OK)
+    target_compile_definitions (_zlib PUBLIC X86_64)
 endif ()
 
 target_include_directories(_zlib SYSTEM BEFORE PUBLIC ${SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR})
