@@ -1036,3 +1036,90 @@ def test_alter_requiring_data_rewrite_throws_not_implemented(cluster):
     with pytest.raises(QueryRuntimeException) as exc:
         node1.query(f"ALTER TABLE {TABLE_NAME} MODIFY COLUMN data UInt64")
     assert "NOT_IMPLEMENTED" in str(exc.value)
+
+
+def test_attach_with_mismatched_columns_throws_incompatible_columns(cluster):
+    node1 = cluster.instances["node1"]
+    node2 = cluster.instances["node2"]
+
+    node1.query(f"CREATE TABLE {TABLE_NAME} {TABLE_DDL}")
+    table_uuid = node1.query(
+        f"SELECT uuid FROM system.tables WHERE table = '{TABLE_NAME}'"
+    ).strip()
+
+    # A stale/wrong ATTACH statement (extra column not present in Keeper's canonical schema)
+    # must be rejected at startup, mirroring StorageReplicatedMergeTree's own
+    # checkTableStructureAttempt behavior, rather than silently taking over with the wrong schema.
+    mismatched_ddl = """
+        (id UInt64, data String, extra UInt64)
+        ENGINE = CloudMergeTree
+        ORDER BY id
+        SETTINGS storage_policy = 's3'
+        """
+    with pytest.raises(QueryRuntimeException) as exc:
+        node2.query(f"ATTACH TABLE {TABLE_NAME} UUID '{table_uuid}' {mismatched_ddl}")
+    assert "INCOMPATIBLE_COLUMNS" in str(exc.value)
+
+
+def test_attach_with_comment_only_difference_succeeds(cluster):
+    node1 = cluster.instances["node1"]
+    node2 = cluster.instances["node2"]
+
+    node1.query(f"CREATE TABLE {TABLE_NAME} {TABLE_DDL}")
+    table_uuid = node1.query(
+        f"SELECT uuid FROM system.tables WHERE table = '{TABLE_NAME}'"
+    ).strip()
+
+    # ColumnsDescription::operator== excludes comments from equality (matches
+    # StorageReplicatedMergeTree's own comparison semantics), so an ATTACH whose columns differ
+    # only in a COMMENT clause must be accepted, not rejected.
+    commented_ddl = """
+        (id UInt64, data String COMMENT 'some comment')
+        ENGINE = CloudMergeTree
+        ORDER BY id
+        SETTINGS storage_policy = 's3'
+        """
+    node2.query(f"ATTACH TABLE {TABLE_NAME} UUID '{table_uuid}' {commented_ddl}")
+
+    node1.query(f"INSERT INTO {TABLE_NAME} VALUES (1, 'a')")
+    assert_eq_with_retry(
+        node2, f"SELECT count() FROM {TABLE_NAME}", "1"
+    )
+
+
+def test_attach_after_alter_adopts_new_schema_and_metadata_version(cluster):
+    node1 = cluster.instances["node1"]
+    node2 = cluster.instances["node2"]
+
+    node1.query(f"CREATE TABLE {TABLE_NAME} {TABLE_DDL}")
+    node1.query(f"ALTER TABLE {TABLE_NAME} ADD COLUMN extra UInt64 DEFAULT 7")
+    table_uuid = node1.query(
+        f"SELECT uuid FROM system.tables WHERE table = '{TABLE_NAME}'"
+    ).strip()
+
+    # node2's ATTACH uses the post-ALTER column list -- it must be accepted (matches Keeper's
+    # canonical schema, which is already at metadata_version 1, not 0) and node2's in-memory
+    # metadata_version must be stamped correctly so parts it writes/merges stamp
+    # metadata_version.txt correctly and don't spuriously conflict with a later ALTER.
+    altered_ddl = """
+        (id UInt64, data String, extra UInt64 DEFAULT 7)
+        ENGINE = CloudMergeTree
+        ORDER BY id
+        SETTINGS storage_policy = 's3'
+        """
+    node2.query(f"ATTACH TABLE {TABLE_NAME} UUID '{table_uuid}' {altered_ddl}")
+
+    node2.query(f"INSERT INTO {TABLE_NAME} (id, data) VALUES (1, 'a')")
+    assert_eq_with_retry(
+        node1, f"SELECT extra FROM {TABLE_NAME} WHERE id = 1", "7"
+    )
+
+    # A further ALTER issued from node2 (the just-attached replica) must not conflict with its
+    # own adopted version -- proves metadata_version was stamped from Keeper, not left at the
+    # ATTACH statement's own default of 0.
+    node2.query(f"ALTER TABLE {TABLE_NAME} ADD COLUMN another UInt64 DEFAULT 9")
+    assert_eq_with_retry(
+        node1,
+        f"SELECT count() FROM system.columns WHERE table = '{TABLE_NAME}' AND name = 'another'",
+        "1",
+    )

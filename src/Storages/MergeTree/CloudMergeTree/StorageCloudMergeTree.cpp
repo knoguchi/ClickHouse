@@ -54,6 +54,7 @@ namespace ErrorCodes
     extern const int NO_SUCH_DATA_PART;
     extern const int LOGICAL_ERROR;
     extern const int SUPPORT_IS_DISABLED;
+    extern const int INCOMPATIBLE_COLUMNS;
 }
 
 namespace MergeTreeSetting
@@ -123,15 +124,31 @@ StorageCloudMergeTree::StorageCloudMergeTree(
         coordination.createRootNodes(zk);
 
         /// Idempotent: the first replica to CREATE (or ATTACH) wins and establishes version 0;
-        /// every later replica's call is a no-op. Deliberately does NOT reconcile this replica's
-        /// own metadata_ (from its own CREATE/ATTACH statement) against whatever Keeper already
-        /// holds if it lost this race -- see the Phase 4 Step D plan's documented gap: a replica
-        /// always trusts its own statement's column list at startup, only later ALTERs are picked
-        /// up via the watcher below. current_metadata_version is seeded from Keeper's actual
-        /// current version regardless of who won, so that watcher correctly treats only *future*
-        /// changes as new.
+        /// every later replica's call is a no-op. Every replica -- winner or not -- then validates
+        /// its own metadata_ (from its own CREATE/ATTACH statement) against whatever Keeper actually
+        /// holds, mirroring StorageReplicatedMergeTree::checkTableStructureAttempt: a mismatch is a
+        /// real error (stale copy-pasted ATTACH, or one written before another replica's ALTER), not
+        /// something to silently paper over. current_metadata_version is stamped from Keeper's actual
+        /// current version regardless of who won the initial race, and this replica's in-memory
+        /// metadata_version is corrected to match so parts it writes stamp metadata_version.txt
+        /// correctly. Only later ALTERs are picked up incrementally via the watcher below.
         coordination.ensureInitialMetadata(zk, metadata_.getColumns().toString(/*include_comments=*/ true));
-        current_metadata_version.store(coordination.getMetadataVersion(zk));
+
+        auto [canonical_columns_text, canonical_metadata_version] = coordination.getMetadata(zk);
+        auto canonical_columns = ColumnsDescription::parse(canonical_columns_text);
+        if (!(canonical_columns == metadata_.getColumns()))
+            throw Exception(ErrorCodes::INCOMPATIBLE_COLUMNS,
+                "Table columns structure in Keeper is different from local table structure for table {}. "
+                "Local columns:\n{}\nKeeper columns:\n{}",
+                table_id_.getNameForLogs(), metadata_.getColumns().toString(/*include_comments=*/ true), canonical_columns_text);
+
+        current_metadata_version.store(canonical_metadata_version);
+        if (canonical_metadata_version != metadata_.getMetadataVersion())
+        {
+            auto fixed_metadata = metadata_;
+            fixed_metadata.setMetadataVersion(canonical_metadata_version);
+            setInMemoryMetadata(fixed_metadata);
+        }
 
         int32_t loaded_version = 0;
         Strings active_names = coordination.loadActivePartNames(zk, loaded_version);
