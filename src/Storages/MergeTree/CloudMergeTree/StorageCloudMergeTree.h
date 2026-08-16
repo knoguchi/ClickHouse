@@ -231,8 +231,32 @@ private:
     /// lease check already relies on for exactly-once materialization. Returns the number of parts removed.
     size_t removeActivePartsMatching(const std::function<bool(const String &)> & predicate);
 
+    /// DETACH counterpart of removeActivePartsMatching: same bounded-retry shape, but deactivates
+    /// via coordination.tryDetachParts() (records detached_parts/, not dropped_parts/) so the
+    /// parts-killer GC task never touches these parts' shared-storage objects while detached. No
+    /// local disk I/O -- unlike StorageReplicatedMergeTree's DETACH, there is nothing to clone or
+    /// rename: CloudMergeTree parts have exactly one shared copy, already at its final path, and it
+    /// simply stays there until ATTACH re-registers the same name in Keeper. Returns the number of
+    /// parts detached.
+    size_t detachActivePartsMatching(const std::function<bool(const String &)> & predicate);
+
     /// Serialize a part's columns+checksums into the header stored in its znode.
     String serializePartHeader(const DataPartPtr & part) const;
+
+    /// Build a DataPart object from an on-disk directory that is already correctly named (no
+    /// rename needed), without admitting it into the working set yet. Factored out of
+    /// updatePartSetFromKeeper()'s adoption loop so attachPartition() can also use it -- it needs
+    /// the built part's header (via serializePartHeader) to re-register the part in Keeper *before*
+    /// admitting it locally. Returns nullptr if the directory isn't visible on this disk yet, or if
+    /// loading fails -- see the extensive comments on the two checks this preserves, originally
+    /// written for updatePartSetFromKeeper's try_adopt_part lambda.
+    MutableDataPartPtr buildPartFromDisk(const String & name);
+
+    /// Admit a part built by buildPartFromDisk() into the local working set (addTempPart +
+    /// Transaction::commit). Caller must hold lock. Never fails: if something already active
+    /// locally covers this part (e.g. a later merge result adopted earlier in the same batch), this
+    /// name is already effectively satisfied and there is nothing more to do.
+    void admitPartLocally(MutableDataPartPtr part, DataPartsLock & lock);
 
     // --- MergeTreeData pure virtuals ---
     // Phase 0: implemented minimally or stubbed (NOT_IMPLEMENTED) until later phases.

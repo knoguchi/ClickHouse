@@ -50,6 +50,14 @@ namespace DB
   *                                 has elapsed, then removes the tombstone.
   *     .../claim                -> ephemeral, held only while a replica is actively deleting that
   *                                 part's objects; self-heals on crash via session death.
+  *   detached_parts/<part_name> -> DETACH marker (value = ms-since-epoch when detached), written
+  *                                 atomically with its parts/<part_name> removal, same shape as
+  *                                 dropped_parts/ but a deliberately separate namespace: the
+  *                                 parts-killer GC task only ever scans dropped_parts/, so a
+  *                                 detached part's shared-storage objects are never touched by GC.
+  *                                 The part's directory itself never moves (there is only ever one
+  *                                 shared copy) -- ATTACH re-creates parts/<part_name> with the same
+  *                                 name and removes the marker, atomically, via tryReattachPart().
   *   deduplication_hashes/<id>  -> insert dedup: value = the part name that won this content hash.
   *                                 Written atomically with parts/<part_name> on INSERT when
   *                                 insert_deduplicate is enabled (see DeduplicationHash in
@@ -79,6 +87,8 @@ public:
     String droppedPartsPath() const { return root_path + "/dropped_parts"; }
     String droppedPartPath(const String & part_name) const { return droppedPartsPath() + "/" + part_name; }
     String droppedPartClaimPath(const String & part_name) const { return droppedPartPath(part_name) + "/claim"; }
+    String detachedPartsPath() const { return root_path + "/detached_parts"; }
+    String detachedPartPath(const String & part_name) const { return detachedPartsPath() + "/" + part_name; }
 
     /// Idempotently create the root node hierarchy. Safe to call from every replica on startup.
     void createRootNodes(const zkutil::ZooKeeperPtr & zk) const;
@@ -143,6 +153,21 @@ public:
 
     /// DROP: atomically deactivate parts. Object data is left for GC, never deleted inline.
     Coordination::Error tryRemoveParts(const zkutil::ZooKeeperPtr & zk, const Strings & part_names) const;
+
+    /// DETACH: atomically deactivate parts, same as tryRemoveParts, but records the removal under
+    /// detached_parts/ instead of dropped_parts/ -- the parts-killer GC task never scans that
+    /// namespace, so the parts' shared-storage objects are never deleted while detached.
+    Coordination::Error tryDetachParts(const zkutil::ZooKeeperPtr & zk, const Strings & part_names) const;
+
+    /// ATTACH: the reverse of tryDetachParts for one part -- atomically removes
+    /// detached_parts/<part_name> and re-creates parts/<part_name> with the given header. ZNONODE
+    /// (the detached marker is already gone) or ZNODEEXISTS (parts/<part_name> already exists)
+    /// both mean another replica's concurrent ATTACH of the same part already won; the caller
+    /// should treat that as success (the part is active in Keeper either way), not an error.
+    Coordination::Error tryReattachPart(const zkutil::ZooKeeperPtr & zk, const String & part_name, const String & part_header) const;
+
+    /// List the names of every part currently recorded under detached_parts/.
+    Strings listDetachedPartNames(const zkutil::ZooKeeperPtr & zk) const;
 
     /// DROP: marks that DROP TABLE was issued for this table. Every replica gets its own
     /// independent DROP TABLE query and may call this concurrently -- idempotent, ZNODEEXISTS

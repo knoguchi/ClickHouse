@@ -43,6 +43,7 @@ void CloudMergeTreeCoordination::createRootNodes(const zkutil::ZooKeeperPtr & zk
     zk->createIfNotExists(root_path + "/replicas", "");
     zk->createIfNotExists(tempPath(), "");
     zk->createIfNotExists(droppedPartsPath(), "");
+    zk->createIfNotExists(detachedPartsPath(), "");
     /// Must match DeduplicationHash::HashType::UNIFIED's directory name literally (see
     /// Interpreters/InsertDeduplication.cpp) -- createUnifiedHash()'s produced paths land here.
     zk->createIfNotExists(root_path + "/deduplication_hashes", "");
@@ -169,6 +170,37 @@ Coordination::Error CloudMergeTreeCoordination::tryRemoveParts(
 
     Coordination::Responses responses;
     return zk->tryMultiNoThrow(ops, responses);
+}
+
+Coordination::Error CloudMergeTreeCoordination::tryDetachParts(
+    const zkutil::ZooKeeperPtr & zk, const Strings & part_names) const
+{
+    Coordination::Requests ops;
+    const String detached_ts = toString(nowMilliseconds());
+    for (const auto & part_name : part_names)
+    {
+        ops.emplace_back(zkutil::makeRemoveRequest(partPath(part_name), -1));
+        ops.emplace_back(zkutil::makeCreateRequest(detachedPartPath(part_name), detached_ts, zkutil::CreateMode::Persistent));
+    }
+
+    Coordination::Responses responses;
+    return zk->tryMultiNoThrow(ops, responses);
+}
+
+Coordination::Error CloudMergeTreeCoordination::tryReattachPart(
+    const zkutil::ZooKeeperPtr & zk, const String & part_name, const String & part_header) const
+{
+    Coordination::Requests ops;
+    ops.emplace_back(zkutil::makeRemoveRequest(detachedPartPath(part_name), -1));
+    ops.emplace_back(zkutil::makeCreateRequest(partPath(part_name), part_header, zkutil::CreateMode::Persistent));
+
+    Coordination::Responses responses;
+    return zk->tryMultiNoThrow(ops, responses);
+}
+
+Strings CloudMergeTreeCoordination::listDetachedPartNames(const zkutil::ZooKeeperPtr & zk) const
+{
+    return zk->getChildren(detachedPartsPath());
 }
 
 Coordination::Error CloudMergeTreeCoordination::markTableDropped(const zkutil::ZooKeeperPtr & zk) const

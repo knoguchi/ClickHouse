@@ -7,6 +7,7 @@
 #include <Storages/MergeTree/ReplicatedMergeTreeMutationEntry.h>
 #include <Storages/AlterCommands.h>
 #include <Storages/ColumnsDescription.h>
+#include <Parsers/ASTLiteral.h>
 #include <Interpreters/DatabaseCatalog.h>
 
 #include <Storages/MergeTree/MergeTreeDataSelectExecutor.h>
@@ -198,6 +199,73 @@ zkutil::ZooKeeperPtr StorageCloudMergeTree::getZooKeeper() const
 String StorageCloudMergeTree::serializePartHeader(const DataPartPtr & part) const
 {
     return ReplicatedMergeTreePartHeader::fromColumnsAndChecksums(part->getColumns(), part->checksums).toString();
+}
+
+StorageCloudMergeTree::MutableDataPartPtr StorageCloudMergeTree::buildPartFromDisk(const String & name)
+{
+    auto disks = getStoragePolicy()->getDisks();
+    const auto & disk = disks.front();
+
+    /// Must check existence here, before touching anything else: loadPartAndFixMetadataImpl()
+    /// does NOT fail closed for an absent directory. It unconditionally calls
+    /// writeInvalidatedSystemColumnsFile() first, which *writes* into the part's directory --
+    /// and for plain_rewritable storage, writing into a directory this replica's local metadata
+    /// snapshot doesn't know about yet silently creates it, with a fresh random remote key, at
+    /// the shared logical path. That races the real writer's concurrent rename-into-place: two
+    /// physical directories briefly both claim the same logical part path, and a later
+    /// disk->refresh() can rebuild the in-memory tree with the bogus empty one winning,
+    /// permanently orphaning the real data behind FILE_DOESNT_EXIST. Reproduced end-to-end via
+    /// concurrent multi-replica INSERT. Checking existence first keeps this path read-only
+    /// when the part genuinely isn't visible yet, so the caller's refresh-and-retry has nothing
+    /// destructive to undo.
+    if (!disk->existsDirectory(std::filesystem::path(getRelativeDataPath()) / name))
+        return nullptr;
+
+    /// Defensive: if the writer ever persists a txn_version.txt for this part (e.g. because
+    /// it ran under a real transaction), drop it before building the part object below --
+    /// DataPartBuilder would otherwise read that foreign creation TID into memory, and
+    /// loadPartAndFixMetadataImpl()'s own txn_version.txt cleanup runs too late to undo it.
+    /// Matches the same ordering MergeTreeData uses for its own attach-from-disk path.
+    disk->removeFileIfExists(std::filesystem::path(getRelativeDataPath()) / name / VersionMetadata::TXN_VERSION_METADATA_FILE_NAME);
+
+    auto single_disk_volume = std::make_shared<SingleDiskVolume>("volume_" + name, disk, 0);
+    auto part = getDataPartBuilder(name, single_disk_volume, name, getReadSettings(), PartDirIntent::OpenExisting)
+        .withPartFormatFromDisk()
+        .build();
+
+    try
+    {
+        loadPartAndFixMetadataImpl(part, getContext());
+    }
+    catch (const Exception &)
+    {
+        return nullptr;
+    }
+
+    /// A freshly-built part's in-memory VersionMetadata is never lazily loaded from disk --
+    /// IMergeTreeDataPart::version::getInfo() just returns whatever's already in memory, which
+    /// for a brand-new DataPartBuilder object is a zero-initialized (all-default) TransactionID,
+    /// not Tx::NonTransactionalTID. That default fails isNonTransactional(), so the commit/rollback
+    /// path below tries to resolve it via the global TransactionLog -- which this replica may
+    /// never have touched before and can fail to construct. CloudMergeTree has no MVCC
+    /// transactions anywhere (writers already stamp every part Tx::NonTransactionalTID; see
+    /// MergeTreeDataWriter), so make the adopted part consistent with that before it's committed.
+    part->version->setAndStoreCreationTID(Tx::NonTransactionalTID, nullptr);
+
+    return part;
+}
+
+void StorageCloudMergeTree::admitPartLocally(MutableDataPartPtr part, DataPartsLock & lock)
+{
+    Transaction transaction(*this, nullptr);
+    if (!addTempPart(part, transaction, lock, /*out_covered_parts=*/ nullptr))
+    {
+        /// Something already active locally covers this part -- e.g. a later merge result
+        /// adopted earlier in this same batch already supersedes it. Not an error: this name
+        /// is already effectively satisfied, nothing more to do for it.
+        return;
+    }
+    transaction.commit(lock);
 }
 
 UInt32 StorageCloudMergeTree::getMaxLevelInBetween(const PartProperties & left, const PartProperties & right) const
@@ -1108,6 +1176,73 @@ size_t StorageCloudMergeTree::removeActivePartsMatching(const std::function<bool
         getStorageID().getNameForLogs());
 }
 
+size_t StorageCloudMergeTree::detachActivePartsMatching(const std::function<bool(const String &)> & predicate)
+{
+    auto component_guard = Coordination::setCurrentComponent("StorageCloudMergeTree::detachActivePartsMatching");
+    auto zk = getZooKeeper();
+
+    /// Same bounded-retry shape as removeActivePartsMatching -- see its comment.
+    for (int attempt = 0; attempt < 20; ++attempt)
+    {
+        int32_t version = 0;
+        Strings active_names = coordination.loadActivePartNames(zk, version);
+
+        Strings matched;
+        for (const auto & name : active_names)
+            if (predicate(name))
+                matched.push_back(name);
+
+        if (matched.empty())
+            return 0;
+
+        auto code = coordination.tryDetachParts(zk, matched);
+        if (code == Coordination::Error::ZNONODE)
+            continue; /// lost a race against a concurrent merge/DROP/DETACH on one of these names -- retry
+
+        if (code != Coordination::Error::ZOK)
+            throw zkutil::KeeperException(code, "Cannot detach parts in Keeper for table {}", getStorageID().getNameForLogs());
+
+        std::unordered_set<std::string> matched_set(matched.begin(), matched.end());
+        DataPartsVector to_remove;
+        {
+            auto lock = lockParts();
+            auto known = getDataPartsVectorForInternalUsage({DataPartState::Active}, {DataPartKind::Regular}, lock);
+            for (const auto & part : known)
+                if (matched_set.contains(part->name))
+                    to_remove.push_back(part);
+
+            if (!to_remove.empty())
+            {
+                /// Unlike a permanent DROP (where the same part name is never reused, so leaving it
+                /// Outdated pending the generic old-parts cleanup timer is harmless), DETACH followed
+                /// immediately by ATTACH re-registers the *same* part name. MergeTreeData's ordinary
+                /// Outdated-part retention would otherwise leave a stale in-memory entry blocking that
+                /// re-add (checkPartDuplicate() rejects any name still present as Outdated/Deleting) --
+                /// and CloudMergeTree never runs the generic local-disk old-parts cleanup thread that
+                /// would eventually erase it (physical deletion is exclusively owned by the Keeper-driven
+                /// parts-killer, gated on dropped_parts/ tombstones, which DETACH deliberately never
+                /// writes), so nothing would ever erase it on its own. Transition straight to Deleting
+                /// here (still under this lock); removePartsFinally() -- called just below, after this
+                /// lock is released, since it takes its own -- then erases the in-memory bookkeeping
+                /// immediately. This only forgets the DataPart *object*, it does not touch anything on
+                /// the shared disk -- the directory stays exactly where it is, found again by
+                /// buildPartFromDisk() on a later ATTACH.
+                removePartsFromWorkingSet(/*txn=*/ nullptr, to_remove, /*clear_without_timeout=*/ true, lock);
+                for (const auto & part : to_remove)
+                    modifyPartState(part, DataPartState::Deleting, lock);
+            }
+        }
+        if (!to_remove.empty())
+            removePartsFinally(to_remove);
+
+        return matched.size();
+    }
+
+    throw Exception(ErrorCodes::LOGICAL_ERROR,
+        "Failed to detach parts in Keeper for table {} after repeated concurrent-modification retries",
+        getStorageID().getNameForLogs());
+}
+
 void StorageCloudMergeTree::dropPartNoWaitNoThrow(const String & part_name)
 try
 {
@@ -1121,29 +1256,88 @@ catch (...)
 
 void StorageCloudMergeTree::dropPart(const String & part_name, bool detach, ContextPtr)
 {
-    if (detach)
-        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "DETACH PART is not implemented for CloudMergeTree yet");
-
-    size_t removed = removeActivePartsMatching([&](const String & name) { return name == part_name; });
+    size_t removed = detach
+        ? detachActivePartsMatching([&](const String & name) { return name == part_name; })
+        : removeActivePartsMatching([&](const String & name) { return name == part_name; });
     if (removed == 0)
         throw Exception(ErrorCodes::NO_SUCH_DATA_PART, "Part {} not found, won't try to drop it.", part_name);
 }
 
 void StorageCloudMergeTree::dropPartition(const ASTPtr & partition, bool detach, ContextPtr local_context)
 {
-    if (detach)
-        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "DETACH PARTITION is not implemented for CloudMergeTree yet");
-
     String partition_id = getPartitionIDFromQuery(partition, local_context);
-    removeActivePartsMatching([&](const String & name)
+    auto predicate = [&](const String & name)
     {
         return MergeTreePartInfo::fromPartName(name, format_version).getPartitionId() == partition_id;
-    });
+    };
+    if (detach)
+        detachActivePartsMatching(predicate);
+    else
+        removeActivePartsMatching(predicate);
 }
 
-PartitionCommandsResultInfo StorageCloudMergeTree::attachPartition(const PartitionCommand &, const StorageMetadataPtr &, ContextPtr)
+PartitionCommandsResultInfo StorageCloudMergeTree::attachPartition(
+    const PartitionCommand & command, const StorageMetadataPtr &, ContextPtr local_context)
 {
-    throw Exception(ErrorCodes::NOT_IMPLEMENTED, "ATTACH PARTITION is not implemented for CloudMergeTree yet");
+    auto component_guard = Coordination::setCurrentComponent("StorageCloudMergeTree::attachPartition");
+    auto zk = getZooKeeper();
+
+    Strings detached_names = coordination.listDetachedPartNames(zk);
+    Strings candidates;
+    if (command.part)
+    {
+        /// Same literal-string extraction MergeTreeData's static (internal-linkage)
+        /// getPartNameFromAST() does -- inlined here since that helper isn't reachable from this file.
+        const auto * literal = command.partition->as<ASTLiteral>();
+        if (!literal)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Expected a string literal for part name, got: {}", command.partition->formatForErrorMessage());
+        String part_name = literal->value.safeGet<String>();
+        if (std::ranges::find(detached_names, part_name) != detached_names.end())
+            candidates.push_back(part_name);
+    }
+    else
+    {
+        String partition_id = getPartitionIDFromQuery(command.partition, local_context);
+        for (const auto & name : detached_names)
+            if (MergeTreePartInfo::fromPartName(name, format_version).getPartitionId() == partition_id)
+                candidates.push_back(name);
+    }
+
+    if (candidates.empty())
+        throw Exception(ErrorCodes::NO_SUCH_DATA_PART, "No detached part(s) found to attach for table {}", getStorageID().getNameForLogs());
+
+    PartitionCommandsResultInfo results;
+    for (const auto & name : candidates)
+    {
+        auto part = buildPartFromDisk(name);
+        if (!part)
+            throw Exception(ErrorCodes::NO_SUCH_DATA_PART,
+                "Detached part {} is registered in Keeper but not found on the shared disk", name);
+
+        String header = serializePartHeader(part);
+        auto code = coordination.tryReattachPart(zk, name, header);
+        /// ZNONODE (detached_parts/<name> already gone) or ZNODEEXISTS (parts/<name> already
+        /// there) both mean another replica's concurrent ATTACH of the same name already won --
+        /// not an error, the part is active in Keeper either way, so just admit it locally too.
+        if (code != Coordination::Error::ZOK
+            && code != Coordination::Error::ZNONODE
+            && code != Coordination::Error::ZNODEEXISTS)
+            throw zkutil::KeeperException(code, "Cannot reattach part {} in Keeper for table {}", name, getStorageID().getNameForLogs());
+
+        auto lock = lockParts();
+        admitPartLocally(part, lock);
+
+        results.push_back(PartitionCommandResultInfo{
+            .command_type = command.part ? "ATTACH PART" : "ATTACH PARTITION",
+            .partition_id = part->info.getPartitionId(),
+            .part_name = name,
+            .old_part_name = name, /// no rename occurs -- CloudMergeTree's shared part directory
+                                    /// never moved while detached, so the reattached part keeps
+                                    /// its original name (unlike StorageReplicatedMergeTree, which
+                                    /// reallocates a fresh block number on ATTACH).
+        });
+    }
+    return results;
 }
 
 void StorageCloudMergeTree::replacePartitionFrom(const StoragePtr &, const ASTPtr &, bool, ContextPtr)
@@ -1181,6 +1375,11 @@ try
         }
     }
 
+    /// Populated below, under lock; removePartsFinally() (after the lock-scoping block ends) needs
+    /// its own internal lockParts() call, so it must run once `lock` itself has been released --
+    /// see the comment where to_remove is filled in.
+    DataPartsVector to_remove;
+    {
     auto lock = lockParts();
     /// lockParts() already holds the exclusive lock; the no-argument overload would try to take
     /// its own shared lock on the same non-recursive data_parts_mutex and deadlock this thread
@@ -1224,67 +1423,15 @@ try
     /// Try to build and admit one adopted part. Returns false (instead of throwing) for the
     /// "not visible on this disk's in-memory listing yet" case specifically, so the caller can
     /// refresh and retry without losing track of every *other* name still pending in this batch.
+    /// Another replica registered this part in Keeper and wrote it to the shared disk;
+    /// buildPartFromDisk() builds the part object from the on-disk directory (already named
+    /// exactly `name`, no rename needed) and admitPartLocally() adds it to the active set.
     auto try_adopt_part = [&](const String & name) -> bool
     {
-        /// Another replica registered this part in Keeper and wrote it to the shared disk; build
-        /// the part object from the on-disk directory (already named exactly `name`, no rename
-        /// needed) and admit it into the active set.
-        ///
-        /// Must check existence here, before touching anything else: loadPartAndFixMetadataImpl()
-        /// does NOT fail closed for an absent directory. It unconditionally calls
-        /// writeInvalidatedSystemColumnsFile() first, which *writes* into the part's directory --
-        /// and for plain_rewritable storage, writing into a directory this replica's local metadata
-        /// snapshot doesn't know about yet silently creates it, with a fresh random remote key, at
-        /// the shared logical path. That races the real writer's concurrent rename-into-place: two
-        /// physical directories briefly both claim the same logical part path, and a later
-        /// disk->refresh() can rebuild the in-memory tree with the bogus empty one winning,
-        /// permanently orphaning the real data behind FILE_DOESNT_EXIST. Reproduced end-to-end via
-        /// concurrent multi-replica INSERT. Checking existence first keeps this path read-only
-        /// when the part genuinely isn't visible yet, so the caller's refresh-and-retry has nothing
-        /// destructive to undo.
-        if (!disk->existsDirectory(std::filesystem::path(getRelativeDataPath()) / name))
+        auto part = buildPartFromDisk(name);
+        if (!part)
             return false;
-
-        /// Defensive: if the writer ever persists a txn_version.txt for this part (e.g. because
-        /// it ran under a real transaction), drop it before building the part object below --
-        /// DataPartBuilder would otherwise read that foreign creation TID into memory, and
-        /// loadPartAndFixMetadataImpl()'s own txn_version.txt cleanup runs too late to undo it.
-        /// Matches the same ordering MergeTreeData uses for its own attach-from-disk path.
-        disk->removeFileIfExists(std::filesystem::path(getRelativeDataPath()) / name / VersionMetadata::TXN_VERSION_METADATA_FILE_NAME);
-
-        auto single_disk_volume = std::make_shared<SingleDiskVolume>("volume_" + name, disk, 0);
-        auto part = getDataPartBuilder(name, single_disk_volume, name, getReadSettings(), PartDirIntent::OpenExisting)
-            .withPartFormatFromDisk()
-            .build();
-
-        try
-        {
-            loadPartAndFixMetadataImpl(part, getContext());
-        }
-        catch (const Exception &)
-        {
-            return false;
-        }
-
-        /// A freshly-built part's in-memory VersionMetadata is never lazily loaded from disk --
-        /// IMergeTreeDataPart::version::getInfo() just returns whatever's already in memory, which
-        /// for a brand-new DataPartBuilder object is a zero-initialized (all-default) TransactionID,
-        /// not Tx::NonTransactionalTID. That default fails isNonTransactional(), so the commit/rollback
-        /// path below tries to resolve it via the global TransactionLog -- which this replica may
-        /// never have touched before and can fail to construct. CloudMergeTree has no MVCC
-        /// transactions anywhere (writers already stamp every part Tx::NonTransactionalTID; see
-        /// MergeTreeDataWriter), so make the adopted part consistent with that before it's committed.
-        part->version->setAndStoreCreationTID(Tx::NonTransactionalTID, nullptr);
-
-        Transaction transaction(*this, nullptr);
-        if (!addTempPart(part, transaction, lock, /*out_covered_parts=*/ nullptr))
-        {
-            /// Something already active locally covers this part -- e.g. a later merge result
-            /// adopted earlier in this same batch already supersedes it. Not an error: this name
-            /// is already effectively satisfied, nothing more to do for it.
-            return true;
-        }
-        transaction.commit(lock);
+        admitPartLocally(part, lock);
         return true;
     };
 
@@ -1337,18 +1484,31 @@ try
         /// that adoption's own Transaction::commit(), so it can't appear here. Whatever remains
         /// has no replacement coming this cycle and can be dropped outright.
         auto still_known = getDataPartsVectorForInternalUsage({DataPartState::Active}, {DataPartKind::Regular}, lock);
-        DataPartsVector to_remove;
         for (const auto & part : still_known)
             if (!active_set.contains(part->name))
                 to_remove.push_back(part);
 
         if (!to_remove.empty())
-            removePartsFromWorkingSet(/*txn=*/ nullptr, to_remove, /*clear_without_timeout=*/ false, lock);
+        {
+            /// Same reasoning as detachActivePartsMatching's identical pattern: a name removed
+            /// here (merge-superseded source, permanent DROP, or -- since this loop can't tell
+            /// which -- a DETACH run on another replica) must not linger as a stale Outdated
+            /// entry, since a DETACH's name can be reused by an immediately-following ATTACH.
+            /// Transition to Deleting now, under lock; removePartsFinally() actually erases it
+            /// from data_parts_indexes, called below once this lock-scoping block has ended (it
+            /// takes its own lockParts() internally).
+            removePartsFromWorkingSet(/*txn=*/ nullptr, to_remove, /*clear_without_timeout=*/ true, lock);
+            for (const auto & part : to_remove)
+                modifyPartState(part, DataPartState::Deleting, lock);
+        }
 
         current_parts_version.store(new_version);
     }
     else
         part_set_updating_task->scheduleAfter(1000);
+    }
+    if (!to_remove.empty())
+        removePartsFinally(to_remove);
 }
 catch (const Coordination::Exception & e)
 {

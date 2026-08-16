@@ -1123,3 +1123,141 @@ def test_attach_after_alter_adopts_new_schema_and_metadata_version(cluster):
         f"SELECT count() FROM system.columns WHERE table = '{TABLE_NAME}' AND name = 'another'",
         "1",
     )
+
+
+def test_detach_and_attach_partition_roundtrip(cluster):
+    node1 = cluster.instances["node1"]
+
+    node1.query(f"CREATE TABLE {TABLE_NAME} {TABLE_DDL}")
+    node1.query(f"INSERT INTO {TABLE_NAME} VALUES (1, 'a'), (2, 'b')")
+    assert node1.query(f"SELECT count() FROM {TABLE_NAME}").strip() == "2"
+
+    # TABLE_DDL has no PARTITION BY, so the table's single partition id is the constant "all".
+    node1.query(f"ALTER TABLE {TABLE_NAME} DETACH PARTITION ID 'all'")
+    assert node1.query(f"SELECT count() FROM {TABLE_NAME}").strip() == "0"
+
+    node1.query(f"ALTER TABLE {TABLE_NAME} ATTACH PARTITION ID 'all'")
+    assert node1.query(f"SELECT count() FROM {TABLE_NAME}").strip() == "2"
+    assert node1.query(f"SELECT sum(id) FROM {TABLE_NAME}").strip() == "3"
+
+
+def test_detach_and_attach_part_by_name(cluster):
+    node1 = cluster.instances["node1"]
+
+    node1.query(f"CREATE TABLE {TABLE_NAME} {TABLE_DDL}")
+    node1.query(f"INSERT INTO {TABLE_NAME} VALUES (1, 'a')")
+    node1.query(f"INSERT INTO {TABLE_NAME} VALUES (2, 'b')")
+    assert node1.query(f"SELECT count() FROM {TABLE_NAME}").strip() == "2"
+
+    part_name = node1.query(
+        f"SELECT name FROM system.parts WHERE table = '{TABLE_NAME}' AND active ORDER BY name LIMIT 1"
+    ).strip()
+
+    node1.query(f"ALTER TABLE {TABLE_NAME} DETACH PART '{part_name}'")
+    assert node1.query(f"SELECT count() FROM {TABLE_NAME}").strip() == "1"
+
+    node1.query(f"ALTER TABLE {TABLE_NAME} ATTACH PART '{part_name}'")
+    assert node1.query(f"SELECT count() FROM {TABLE_NAME}").strip() == "2"
+    assert node1.query(f"SELECT sum(id) FROM {TABLE_NAME}").strip() == "3"
+
+
+def test_detach_on_one_replica_visible_on_other(cluster):
+    node1 = cluster.instances["node1"]
+    node2 = cluster.instances["node2"]
+
+    node1.query(f"CREATE TABLE {TABLE_NAME} {TABLE_DDL}")
+    table_uuid = node1.query(
+        f"SELECT uuid FROM system.tables WHERE table = '{TABLE_NAME}'"
+    ).strip()
+    node2.query(f"ATTACH TABLE {TABLE_NAME} UUID '{table_uuid}' {TABLE_DDL}")
+
+    node1.query(f"INSERT INTO {TABLE_NAME} VALUES (1, 'a')")
+    assert_eq_with_retry(node2, f"SELECT count() FROM {TABLE_NAME}", "1")
+
+    node1.query(f"ALTER TABLE {TABLE_NAME} DETACH PARTITION ID 'all'")
+
+    # No explicit action on node2 -- the watcher-driven part-set diff already treats "znode gone
+    # from parts/" uniformly regardless of cause (DROP, merge-source removal, or DETACH), so
+    # DETACH becomes visible here for free, with no DETACH-specific code in the watcher.
+    assert_eq_with_retry(node2, f"SELECT count() FROM {TABLE_NAME}", "0")
+
+
+def test_attach_from_replica_that_did_not_detach(cluster):
+    node1 = cluster.instances["node1"]
+    node2 = cluster.instances["node2"]
+
+    node1.query(f"CREATE TABLE {TABLE_NAME} {TABLE_DDL}")
+    table_uuid = node1.query(
+        f"SELECT uuid FROM system.tables WHERE table = '{TABLE_NAME}'"
+    ).strip()
+    node2.query(f"ATTACH TABLE {TABLE_NAME} UUID '{table_uuid}' {TABLE_DDL}")
+
+    node1.query(f"INSERT INTO {TABLE_NAME} VALUES (1, 'a')")
+    assert_eq_with_retry(node2, f"SELECT count() FROM {TABLE_NAME}", "1")
+
+    node1.query(f"ALTER TABLE {TABLE_NAME} DETACH PARTITION ID 'all'")
+    assert_eq_with_retry(node2, f"SELECT count() FROM {TABLE_NAME}", "0")
+
+    # ATTACH issued from node2 -- the replica that did *not* run the DETACH -- proves the
+    # detached-parts registry is Keeper-native state, not per-replica-local.
+    node2.query(f"ALTER TABLE {TABLE_NAME} ATTACH PARTITION ID 'all'")
+    assert node2.query(f"SELECT count() FROM {TABLE_NAME}").strip() == "1"
+    assert_eq_with_retry(node1, f"SELECT count() FROM {TABLE_NAME}", "1")
+
+
+def test_attach_without_detach_throws_no_such_data_part(cluster):
+    node1 = cluster.instances["node1"]
+
+    node1.query(f"CREATE TABLE {TABLE_NAME} {TABLE_DDL}")
+    node1.query(f"INSERT INTO {TABLE_NAME} VALUES (1, 'a')")
+
+    # Nothing was ever detached -- there is no detached_parts/ entry for partition "all" to attach.
+    with pytest.raises(QueryRuntimeException) as exc:
+        node1.query(f"ALTER TABLE {TABLE_NAME} ATTACH PARTITION ID 'all'")
+    assert "NO_SUCH_DATA_PART" in str(exc.value)
+
+
+def test_detached_part_survives_grace_period_and_can_be_reattached(cluster):
+    node1 = cluster.instances["node1"]
+    table = "cloud_test_detach_gc"
+
+    node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
+    node1.query(
+        f"CREATE TABLE {table} (id UInt64, data String) ENGINE = CloudMergeTree "
+        f"ORDER BY id SETTINGS {GC_TABLE_DDL_SETTINGS}"
+    )
+    try:
+        node1.query(f"INSERT INTO {table} VALUES (1, 'a')")
+        table_uuid = node1.query(
+            f"SELECT uuid FROM system.tables WHERE table = '{table}'"
+        ).strip()
+
+        objects_before = list_objects(cluster)
+        assert len(objects_before) > 0
+
+        node1.query(f"ALTER TABLE {table} DETACH PARTITION ID 'all'")
+
+        # Well past grace_period_seconds + gc_interval_ms (see GC_TABLE_DDL_SETTINGS) and several
+        # parts-killer cycles -- the detached part's objects must never be touched, since they're
+        # recorded under detached_parts/, a namespace the GC scan never reads. This is the core
+        # invariant this whole feature exists to protect.
+        time.sleep(20)
+        objects_after_grace_period = list_objects(cluster)
+        assert len(objects_after_grace_period) == len(objects_before)
+
+        # No tombstone was ever created for it either -- detach uses a separate namespace from drop.
+        assert (
+            int(
+                node1.query(
+                    f"SELECT count() FROM system.zookeeper WHERE path = "
+                    f"'/clickhouse/cloud_tables/{table_uuid}/dropped_parts'"
+                ).strip()
+            )
+            == 0
+        )
+
+        node1.query(f"ALTER TABLE {table} ATTACH PARTITION ID 'all'")
+        assert node1.query(f"SELECT count() FROM {table}").strip() == "1"
+        assert node1.query(f"SELECT data FROM {table} WHERE id = 1").strip() == "a"
+    finally:
+        node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
