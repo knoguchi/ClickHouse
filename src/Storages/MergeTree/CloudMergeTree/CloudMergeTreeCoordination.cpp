@@ -1,6 +1,8 @@
 #include <Storages/MergeTree/CloudMergeTree/CloudMergeTreeCoordination.h>
 
 #include <Common/ZooKeeper/KeeperException.h>
+#include <Storages/MergeTree/EphemeralLockInZooKeeper.h>
+#include <Common/ZooKeeper/ZooKeeperWithFaultInjection.h>
 #include <IO/ReadHelpers.h>
 #include <IO/WriteHelpers.h>
 #include <chrono>
@@ -41,6 +43,9 @@ void CloudMergeTreeCoordination::createRootNodes(const zkutil::ZooKeeperPtr & zk
     zk->createIfNotExists(root_path + "/replicas", "");
     zk->createIfNotExists(tempPath(), "");
     zk->createIfNotExists(droppedPartsPath(), "");
+    /// Must match DeduplicationHash::HashType::UNIFIED's directory name literally (see
+    /// Interpreters/InsertDeduplication.cpp) -- createUnifiedHash()'s produced paths land here.
+    zk->createIfNotExists(root_path + "/deduplication_hashes", "");
 }
 
 void CloudMergeTreeCoordination::ensureBlockNumbersPartition(const zkutil::ZooKeeperPtr & zk, const String & partition_id) const
@@ -50,15 +55,14 @@ void CloudMergeTreeCoordination::ensureBlockNumbersPartition(const zkutil::ZooKe
 
 Coordination::Error CloudMergeTreeCoordination::tryCommitInsert(
     const zkutil::ZooKeeperPtr & zk, const String & part_name, const String & part_header,
-    Coordination::Requests extra_ops) const
+    Coordination::Requests extra_ops, Coordination::Responses & out_responses) const
 {
     Coordination::Requests ops;
     ops.emplace_back(zkutil::makeCreateRequest(partPath(part_name), part_header, zkutil::CreateMode::Persistent));
     for (auto & op : extra_ops)
         ops.emplace_back(std::move(op));
 
-    Coordination::Responses responses;
-    return zk->tryMultiNoThrow(ops, responses);
+    return zk->tryMultiNoThrow(ops, out_responses);
 }
 
 Coordination::Error CloudMergeTreeCoordination::tryCommitMerge(
@@ -239,10 +243,83 @@ int32_t CloudMergeTreeCoordination::getPartsVersion(const zkutil::ZooKeeperPtr &
     return stat.cversion;
 }
 
+std::map<String, Int64> CloudMergeTreeCoordination::snapshotBlockNumbers(
+    const zkutil::ZooKeeperPtr & zk, const std::set<String> & partition_ids) const
+{
+    auto zk_fault = std::make_shared<ZooKeeperWithFaultInjection>(zk);
+    std::map<String, Int64> result;
+    for (const auto & partition_id : partition_ids)
+    {
+        zk->createIfNotExists(blockNumbersPartitionPath(partition_id), "");
+        auto lock = createEphemeralLockInZooKeeper(
+            blockNumbersPartitionPath(partition_id) + "/block-", tempPath(), zk_fault, /*deduplication_paths=*/{}, /*znode_data=*/std::nullopt);
+        result[partition_id] = static_cast<Int64>(lock.getNumber());
+        lock.unlock();
+    }
+    return result;
+}
+
+String CloudMergeTreeCoordination::createMutation(const zkutil::ZooKeeperPtr & zk, const String & entry_text) const
+{
+    String created_path = zk->create(mutationsPath() + "/", entry_text, zkutil::CreateMode::PersistentSequential);
+    return created_path.substr(mutationsPath().size() + 1);
+}
+
+std::vector<std::pair<String, String>> CloudMergeTreeCoordination::listMutations(const zkutil::ZooKeeperPtr & zk) const
+{
+    std::vector<std::pair<String, String>> result;
+    Strings names = zk->getChildren(mutationsPath());
+    result.reserve(names.size());
+    for (const auto & name : names)
+    {
+        String text;
+        if (zk->tryGet(mutationPath(name), text))
+            result.emplace_back(name, std::move(text));
+    }
+    return result;
+}
+
 bool CloudMergeTreeCoordination::tryGetPartHeader(
     const zkutil::ZooKeeperPtr & zk, const String & part_name, String & out_header) const
 {
     return zk->tryGet(partPath(part_name), out_header);
+}
+
+void CloudMergeTreeCoordination::ensureInitialMetadata(const zkutil::ZooKeeperPtr & zk, const String & initial_columns_text) const
+{
+    zk->createIfNotExists(metadataPath(), initial_columns_text);
+}
+
+int32_t CloudMergeTreeCoordination::getMetadataVersion(const zkutil::ZooKeeperPtr & zk) const
+{
+    Coordination::Stat stat;
+    zk->exists(metadataPath(), &stat);
+    return stat.version;
+}
+
+std::pair<String, int32_t> CloudMergeTreeCoordination::getMetadata(const zkutil::ZooKeeperPtr & zk) const
+{
+    Coordination::Stat stat;
+    String text = zk->get(metadataPath(), &stat);
+    return {text, stat.version};
+}
+
+std::pair<String, int32_t> CloudMergeTreeCoordination::getMetadata(
+    const zkutil::ZooKeeperPtr & zk, Coordination::WatchCallbackPtr watch_callback) const
+{
+    Coordination::Stat stat;
+    String text = zk->getWatch(metadataPath(), &stat, watch_callback);
+    return {text, stat.version};
+}
+
+Coordination::Error CloudMergeTreeCoordination::trySetMetadata(
+    const zkutil::ZooKeeperPtr & zk, const String & new_columns_text, int32_t expected_version, int32_t & out_new_version) const
+{
+    Coordination::Stat stat;
+    auto code = zk->trySet(metadataPath(), new_columns_text, expected_version, &stat);
+    if (code == Coordination::Error::ZOK)
+        out_new_version = stat.version;
+    return code;
 }
 
 }

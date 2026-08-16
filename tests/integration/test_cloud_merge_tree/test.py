@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
+from helpers.client import QueryRuntimeException
 from helpers.cluster import ClickHouseCluster
 from helpers.test_tools import assert_eq_with_retry
 
@@ -237,12 +238,16 @@ def test_optimize_merges_all_parts_and_propagates_to_second_replica(cluster):
     ).strip()
     assert len(active_names.splitlines()) == 1
 
-    # No merge-in-progress lease should survive a completed merge.
-    leases = node1.query(
+    # No merge-in-progress lease should survive a completed merge. releaseLease() is best-effort
+    # and runs just after the winning multi() succeeds, not inside it -- a background merge that
+    # produced the just-observed single-part state can still be a few instructions away from
+    # calling it, so this needs a retry like every other post-merge check here, not a bare assert.
+    assert_eq_with_retry(
+        node1,
         f"SELECT count() FROM system.zookeeper WHERE path = "
-        f"'/clickhouse/cloud_tables/{table_uuid}/leases'"
-    ).strip()
-    assert leases == "0"
+        f"'/clickhouse/cloud_tables/{table_uuid}/leases'",
+        "0",
+    )
 
     # node2 never ran the merge itself -- it must pick up the merged part (and the sources'
     # removal) purely from the Keeper part-set watcher, same mechanism as cross-replica INSERT
@@ -306,11 +311,15 @@ def test_concurrent_optimize_race_exactly_one_winner(cluster):
         "1",
     )
 
-    leases = node1.query(
+    # Same reasoning as test_optimize_merges_all_parts_and_propagates_to_second_replica's lease
+    # check: releaseLease() is best-effort and runs just after the winning multi() succeeds, not
+    # inside it, so this needs a retry rather than a bare assert.
+    assert_eq_with_retry(
+        node1,
         f"SELECT count() FROM system.zookeeper WHERE path = "
-        f"'/clickhouse/cloud_tables/{table_uuid}/leases'"
-    ).strip()
-    assert leases == "0"
+        f"'/clickhouse/cloud_tables/{table_uuid}/leases'",
+        "0",
+    )
 
 
 def test_merge_source_objects_survive_grace_period_then_get_collected(cluster):
@@ -468,3 +477,562 @@ def test_drop_table_objects_survive_grace_period_then_get_collected(cluster):
         # drop_table autouse fixture, and node2's copy must not outlive the test (its
         # parts_killer_task would otherwise keep running for the rest of the suite).
         node2.query(f"DROP TABLE IF EXISTS {table} SYNC")
+
+
+def test_drop_partition_removes_only_target_partition_and_gets_collected(cluster):
+    node1 = cluster.instances["node1"]
+    node2 = cluster.instances["node2"]
+
+    partitioned_ddl = (
+        "(id UInt64, data String) ENGINE = CloudMergeTree "
+        f"PARTITION BY id % 2 ORDER BY id SETTINGS {GC_TABLE_DDL_SETTINGS}"
+    )
+    # TABLE_NAME here (not a dedicated name): the drop_table autouse fixture cleans up by name
+    # regardless of which DDL created the table, so no try/finally is needed just for that -- same
+    # as the plain-DDL tests above.
+    node1.query(f"CREATE TABLE {TABLE_NAME} {partitioned_ddl}")
+    table_uuid = node1.query(
+        f"SELECT uuid FROM system.tables WHERE table = '{TABLE_NAME}'"
+    ).strip()
+    node2.query(f"ATTACH TABLE {TABLE_NAME} UUID '{table_uuid}' {partitioned_ddl}")
+
+    for i in range(1, 11):
+        node1.query(f"INSERT INTO {TABLE_NAME} VALUES ({i}, 'v{i}')")
+    assert_eq_with_retry(node2, f"SELECT count() FROM {TABLE_NAME}", "10")
+
+    # system.parts has no per-row data (it's part-level metadata) -- look up the even group's
+    # partition_id via its `partition` column (the formatted partition-key value, "0" for the
+    # even-id group under `PARTITION BY id % 2`) rather than assuming CloudMergeTree/MergeTree's
+    # partition-ID string hashing/formatting; DROP PARTITION ID takes that value directly.
+    even_partition_id = node1.query(
+        f"SELECT DISTINCT partition_id FROM system.parts "
+        f"WHERE table = '{TABLE_NAME}' AND active AND partition = '0'"
+    ).strip()
+    assert even_partition_id != ""
+
+    node1.query(f"ALTER TABLE {TABLE_NAME} DROP PARTITION ID '{even_partition_id}'")
+
+    # Only the even-id group is gone; the odd-id group (sum = 1+3+5+7+9 = 25) is untouched.
+    assert node1.query(f"SELECT count() FROM {TABLE_NAME}").strip() == "5"
+    assert node1.query(f"SELECT sum(id) FROM {TABLE_NAME}").strip() == "25"
+    assert (
+        node1.query(f"SELECT count() FROM {TABLE_NAME} WHERE id % 2 = 0").strip()
+        == "0"
+    )
+
+    # Keeper-driven visibility: node2 never ran the DROP PARTITION itself.
+    assert_eq_with_retry(node2, f"SELECT count() FROM {TABLE_NAME}", "5")
+    assert_eq_with_retry(node2, f"SELECT sum(id) FROM {TABLE_NAME}", "25")
+
+    # The dropped partition's parts are tombstoned (not deleted inline -- same lazy-GC path as
+    # DROP TABLE and merge sources), then physically reclaimed after the grace period.
+    assert_eq_with_retry(
+        node1,
+        f"SELECT count() FROM system.zookeeper WHERE path = "
+        f"'/clickhouse/cloud_tables/{table_uuid}/dropped_parts'",
+        "0",
+        retry_count=30,
+        sleep_time=1,
+    )
+
+
+def test_drop_part_removes_single_part_and_no_such_part_throws(cluster):
+    node1 = cluster.instances["node1"]
+    node2 = cluster.instances["node2"]
+
+    node1.query(f"CREATE TABLE {TABLE_NAME} {TABLE_DDL}")
+    table_uuid = node1.query(
+        f"SELECT uuid FROM system.tables WHERE table = '{TABLE_NAME}'"
+    ).strip()
+    node2.query(f"ATTACH TABLE {TABLE_NAME} UUID '{table_uuid}' {TABLE_DDL}")
+
+    for i in range(1, 4):
+        node1.query(f"INSERT INTO {TABLE_NAME} VALUES ({i}, 'v{i}')")
+    assert_eq_with_retry(node2, f"SELECT count() FROM {TABLE_NAME}", "3")
+
+    active_parts = node1.query(
+        f"SELECT name FROM system.parts WHERE table = '{TABLE_NAME}' AND active"
+    ).strip().splitlines()
+    assert len(active_parts) >= 1
+    victim = active_parts[0]
+    # Not assuming one row per part: background merging could have already consolidated some of
+    # the 3 inserts into a single part by the time active_parts was read above (same reasoning as
+    # test_concurrent_multi_writer_insert_no_collision_or_loss's active-part-count comment) -- read
+    # the victim's own row count via the `_part` virtual column instead of assuming 1.
+    victim_rows = int(
+        node1.query(
+            f"SELECT count() FROM {TABLE_NAME} WHERE _part = '{victim}'"
+        ).strip()
+    )
+
+    node1.query(f"ALTER TABLE {TABLE_NAME} DROP PART '{victim}'")
+
+    assert (
+        node1.query(
+            f"SELECT count() FROM system.parts WHERE table = '{TABLE_NAME}' "
+            f"AND active AND name = '{victim}'"
+        ).strip()
+        == "0"
+    )
+    remaining = str(3 - victim_rows)
+    assert node1.query(f"SELECT count() FROM {TABLE_NAME}").strip() == remaining
+    assert_eq_with_retry(node2, f"SELECT count() FROM {TABLE_NAME}", remaining)
+
+    with pytest.raises(QueryRuntimeException) as exc:
+        node1.query(f"ALTER TABLE {TABLE_NAME} DROP PART 'all_9999_9999_0'")
+    assert "NO_SUCH_DATA_PART" in str(exc.value)
+
+
+def test_truncate_empties_table_and_allows_further_inserts(cluster):
+    node1 = cluster.instances["node1"]
+    node2 = cluster.instances["node2"]
+
+    node1.query(f"CREATE TABLE {TABLE_NAME} {TABLE_DDL}")
+    table_uuid = node1.query(
+        f"SELECT uuid FROM system.tables WHERE table = '{TABLE_NAME}'"
+    ).strip()
+    node2.query(f"ATTACH TABLE {TABLE_NAME} UUID '{table_uuid}' {TABLE_DDL}")
+
+    for i in range(1, 6):
+        node1.query(f"INSERT INTO {TABLE_NAME} VALUES ({i}, 'v{i}')")
+    assert_eq_with_retry(node2, f"SELECT count() FROM {TABLE_NAME}", "5")
+
+    node1.query(f"TRUNCATE TABLE {TABLE_NAME}")
+
+    assert node1.query(f"SELECT count() FROM {TABLE_NAME}").strip() == "0"
+    assert_eq_with_retry(node2, f"SELECT count() FROM {TABLE_NAME}", "0")
+
+    # The table itself, and its Keeper root, must still be usable -- TRUNCATE is not DROP TABLE.
+    node1.query(f"INSERT INTO {TABLE_NAME} VALUES (100, 'z')")
+    assert_eq_with_retry(node2, f"SELECT count() FROM {TABLE_NAME}", "1")
+    assert node1.query(f"SELECT sum(id) FROM {TABLE_NAME}").strip() == "100"
+
+
+def test_concurrent_optimize_and_drop_partition_no_corruption(cluster):
+    node1 = cluster.instances["node1"]
+
+    node1.query(f"CREATE TABLE {TABLE_NAME} {TABLE_DDL}")
+
+    row_count = 8
+    for i in range(1, row_count + 1):
+        node1.query(f"INSERT INTO {TABLE_NAME} VALUES ({i}, 'v{i}')")
+
+    partition_id = node1.query(
+        f"SELECT DISTINCT partition_id FROM system.parts WHERE table = '{TABLE_NAME}' AND active"
+    ).strip()
+    assert partition_id != ""
+
+    # A merge consolidating the partition's parts races DROP PARTITION removing the whole
+    # partition. Whichever wins, removeActivePartsMatching()'s retry loop always re-reads the live
+    # active set before each attempt, so it either removes the original sources (if it beats the
+    # merge) or the merged part that superseded them (if the merge won first) -- either way the
+    # partition ends up empty with no exception escaping either side, mirroring how
+    # commitMergedPart's lease-fenced multi() already fails closed against a concurrent DROP today.
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(node1.query, f"OPTIMIZE TABLE {TABLE_NAME}"),
+            executor.submit(
+                node1.query,
+                f"ALTER TABLE {TABLE_NAME} DROP PARTITION ID '{partition_id}'",
+            ),
+        ]
+        for future in futures:
+            future.result()
+
+    assert node1.query(f"SELECT count() FROM {TABLE_NAME}").strip() == "0"
+    assert (
+        node1.query(
+            f"SELECT count() FROM system.parts WHERE table = '{TABLE_NAME}' AND active"
+        ).strip()
+        == "0"
+    )
+
+
+def test_insert_deduplication_identical_content_is_noop(cluster):
+    node1 = cluster.instances["node1"]
+
+    node1.query(f"CREATE TABLE {TABLE_NAME} {TABLE_DDL}")
+    table_uuid = node1.query(
+        f"SELECT uuid FROM system.tables WHERE table = '{TABLE_NAME}'"
+    ).strip()
+
+    node1.query(f"INSERT INTO {TABLE_NAME} VALUES (1, 'a')")
+    assert node1.query(f"SELECT count() FROM {TABLE_NAME}").strip() == "1"
+
+    # insert_deduplicate defaults to 1: the exact same block content (same values) inserted again
+    # must be a silent no-op, not a duplicate row -- matches ReplicatedMergeTree's own semantics
+    # for a client retry after a timeout.
+    node1.query(f"INSERT INTO {TABLE_NAME} VALUES (1, 'a')")
+    assert node1.query(f"SELECT count() FROM {TABLE_NAME}").strip() == "1"
+
+    # Different content is not deduplicated -- proves the hash is content-sensitive, not just
+    # "any repeat insert is dropped".
+    node1.query(f"INSERT INTO {TABLE_NAME} VALUES (2, 'b')")
+    assert node1.query(f"SELECT count() FROM {TABLE_NAME}").strip() == "2"
+
+    # One dedup hash node per surviving distinct content, not per INSERT call.
+    assert (
+        node1.query(
+            f"SELECT count() FROM system.zookeeper WHERE path = "
+            f"'/clickhouse/cloud_tables/{table_uuid}/deduplication_hashes'"
+        ).strip()
+        == "2"
+    )
+
+
+def test_insert_deduplication_can_be_disabled(cluster):
+    node1 = cluster.instances["node1"]
+
+    node1.query(f"CREATE TABLE {TABLE_NAME} {TABLE_DDL}")
+
+    # deduplicate_insert defaults to 'enable', which overrides insert_deduplicate outright (see
+    # its own doc in Core/Settings.cpp) -- that's the setting that actually has to be flipped to
+    # genuinely disable dedup, not insert_deduplicate on its own.
+    node1.query(
+        f"INSERT INTO {TABLE_NAME} VALUES (1, 'a')",
+        settings={"deduplicate_insert": "disable"},
+    )
+    node1.query(
+        f"INSERT INTO {TABLE_NAME} VALUES (1, 'a')",
+        settings={"deduplicate_insert": "disable"},
+    )
+
+    # With dedup genuinely off (not just defaulting to on), both identical-content inserts land as
+    # separate rows.
+    assert node1.query(f"SELECT count() FROM {TABLE_NAME}").strip() == "2"
+
+
+def test_concurrent_identical_insert_from_both_replicas_deduplicates_to_one(cluster):
+    node1 = cluster.instances["node1"]
+    node2 = cluster.instances["node2"]
+
+    node1.query(f"CREATE TABLE {TABLE_NAME} {TABLE_DDL}")
+    table_uuid = node1.query(
+        f"SELECT uuid FROM system.tables WHERE table = '{TABLE_NAME}'"
+    ).strip()
+    node2.query(f"ATTACH TABLE {TABLE_NAME} UUID '{table_uuid}' {TABLE_DDL}")
+
+    # Both replicas race to insert the exact same content at once: the dedup path's Keeper CAS
+    # (bundled into the same multi() as the part-znode create, see commitInsertedPart) must let
+    # only one land, regardless of which replica's multi() commits first.
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(
+                node1.query,
+                f"INSERT INTO {TABLE_NAME} VALUES (42, 'same')",
+                settings={"async_insert": 0},
+            ),
+            executor.submit(
+                node2.query,
+                f"INSERT INTO {TABLE_NAME} VALUES (42, 'same')",
+                settings={"async_insert": 0},
+            ),
+        ]
+        for future in futures:
+            future.result()
+
+    assert_eq_with_retry(node1, f"SELECT count() FROM {TABLE_NAME}", "1")
+    assert_eq_with_retry(node2, f"SELECT count() FROM {TABLE_NAME}", "1")
+
+
+def test_alter_update_and_delete_apply_correctly_and_gc_source(cluster):
+    node1 = cluster.instances["node1"]
+    node2 = cluster.instances["node2"]
+    table = "cloud_test_mutations"
+
+    node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
+    node2.query(f"DROP TABLE IF EXISTS {table} SYNC")
+    ddl = f"(id UInt64, data String) ENGINE = CloudMergeTree ORDER BY id SETTINGS {GC_TABLE_DDL_SETTINGS}"
+    node1.query(f"CREATE TABLE {table} {ddl}")
+    table_uuid = node1.query(
+        f"SELECT uuid FROM system.tables WHERE table = '{table}'"
+    ).strip()
+    node2.query(f"ATTACH TABLE {table} UUID '{table_uuid}' {ddl}")
+    try:
+        for i in range(1, 6):
+            node1.query(f"INSERT INTO {table} VALUES ({i}, 'v{i}')")
+        assert_eq_with_retry(node2, f"SELECT count() FROM {table}", "5")
+
+        node1.query(f"ALTER TABLE {table} UPDATE data = 'updated' WHERE id = 3")
+        assert_eq_with_retry(node1, f"SELECT data FROM {table} WHERE id = 3", "updated")
+        # Keeper-driven visibility: node2 never ran the mutation itself.
+        assert_eq_with_retry(node2, f"SELECT data FROM {table} WHERE id = 3", "updated")
+
+        node1.query(f"ALTER TABLE {table} DELETE WHERE id = 2")
+        assert_eq_with_retry(node1, f"SELECT count() FROM {table}", "4")
+        assert_eq_with_retry(node2, f"SELECT count() FROM {table}", "4")
+
+        assert_eq_with_retry(
+            node1,
+            f"SELECT count() FROM system.mutations WHERE table = '{table}' AND is_done = 1",
+            "2",
+        )
+
+        # Each mutation's source part is tombstoned (not deleted inline) and reclaimed after the
+        # grace period, exactly the same lazy-GC path as merge sources and DROP TABLE/PARTITION.
+        assert_eq_with_retry(
+            node1,
+            f"SELECT count() FROM system.zookeeper WHERE path = "
+            f"'/clickhouse/cloud_tables/{table_uuid}/dropped_parts'",
+            "0",
+            retry_count=30,
+            sleep_time=1,
+        )
+
+        # Rows untouched by either mutation survive throughout.
+        assert node1.query(f"SELECT data FROM {table} WHERE id = 1").strip() == "v1"
+        assert node1.query(f"SELECT data FROM {table} WHERE id = 5").strip() == "v5"
+    finally:
+        node2.query(f"DROP TABLE IF EXISTS {table} SYNC")
+
+
+def test_mutation_does_not_affect_parts_inserted_after_snapshot(cluster):
+    node1 = cluster.instances["node1"]
+    table = "cloud_test_mutation_snapshot"
+
+    node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
+    node1.query(
+        f"CREATE TABLE {table} (id UInt64, data String) ENGINE = CloudMergeTree "
+        f"ORDER BY id SETTINGS storage_policy = 's3'"
+    )
+    try:
+        for i in range(1, 4):
+            node1.query(f"INSERT INTO {table} VALUES ({i}, 'orig')")
+
+        # Submits a mutation whose predicate would match every row -- including one inserted right
+        # after submission. The block-number snapshot CloudMergeTreeCoordination::snapshotBlockNumbers
+        # takes at submission time is what must exclude that later insert, not query timing.
+        node1.query(f"ALTER TABLE {table} UPDATE data = 'mutated' WHERE 1")
+        node1.query(f"INSERT INTO {table} VALUES (100, 'orig')")
+
+        assert_eq_with_retry(
+            node1,
+            f"SELECT count() FROM system.mutations WHERE table = '{table}' AND is_done = 1",
+            "1",
+        )
+
+        assert node1.query(f"SELECT data FROM {table} WHERE id = 100").strip() == "orig"
+        assert (
+            node1.query(f"SELECT count() FROM {table} WHERE data = 'mutated'").strip()
+            == "3"
+        )
+    finally:
+        node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
+
+
+def test_two_sequential_mutations_both_apply(cluster):
+    node1 = cluster.instances["node1"]
+    table = "cloud_test_two_mutations"
+
+    node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
+    node1.query(
+        f"CREATE TABLE {table} (id UInt64, data String) ENGINE = CloudMergeTree "
+        f"ORDER BY id SETTINGS storage_policy = 's3'"
+    )
+    try:
+        node1.query(f"INSERT INTO {table} VALUES (1, 'a')")
+
+        # The second mutation targets a part that doesn't exist yet at submission time (the first
+        # mutation hasn't run) -- selectPartsToMutate() must converge across multiple background
+        # cycles, applying the lowest-id pending mutation to whatever part currently carries the
+        # row each time, not just fire once.
+        node1.query(f"ALTER TABLE {table} UPDATE data = 'b' WHERE id = 1")
+        node1.query(f"ALTER TABLE {table} UPDATE data = 'c' WHERE id = 1")
+
+        assert_eq_with_retry(
+            node1,
+            f"SELECT count() FROM system.mutations WHERE table = '{table}' AND is_done = 1",
+            "2",
+            retry_count=40,
+            sleep_time=1,
+        )
+        assert node1.query(f"SELECT data FROM {table} WHERE id = 1").strip() == "c"
+    finally:
+        node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
+
+
+def test_concurrent_mutation_and_optimize_no_corruption(cluster):
+    node1 = cluster.instances["node1"]
+    table = "cloud_test_mutation_race"
+
+    node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
+    node1.query(
+        f"CREATE TABLE {table} (id UInt64, data String) ENGINE = CloudMergeTree "
+        f"ORDER BY id SETTINGS storage_policy = 's3'"
+    )
+    try:
+        row_count = 8
+        for i in range(1, row_count + 1):
+            node1.query(f"INSERT INTO {table} VALUES ({i}, 'v{i}')")
+
+        # A background merge and a submitted mutation race over overlapping parts:
+        # currently_merging_mutating_parts (shared between selectPartsToMerge and
+        # selectPartsToMutate) makes them mutually exclusive on any single part, but not on which
+        # one reaches a given row first -- either interleaving must still converge to the same
+        # correct end state, with neither side throwing.
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [
+                executor.submit(node1.query, f"OPTIMIZE TABLE {table}"),
+                executor.submit(node1.query, f"ALTER TABLE {table} DELETE WHERE id = 4"),
+            ]
+            for future in futures:
+                future.result()
+
+        assert_eq_with_retry(
+            node1,
+            f"SELECT count() FROM system.mutations WHERE table = '{table}' AND is_done = 1",
+            "1",
+            retry_count=40,
+            sleep_time=1,
+        )
+        assert node1.query(f"SELECT count() FROM {table}").strip() == str(row_count - 1)
+        assert node1.query(f"SELECT count() FROM {table} WHERE id = 4").strip() == "0"
+    finally:
+        node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
+
+
+def test_add_column_default_applies_to_old_and_new_parts_cross_replica(cluster):
+    node1 = cluster.instances["node1"]
+    node2 = cluster.instances["node2"]
+
+    node1.query(f"CREATE TABLE {TABLE_NAME} {TABLE_DDL}")
+    table_uuid = node1.query(
+        f"SELECT uuid FROM system.tables WHERE table = '{TABLE_NAME}'"
+    ).strip()
+    node2.query(f"ATTACH TABLE {TABLE_NAME} UUID '{table_uuid}' {TABLE_DDL}")
+
+    node1.query(f"INSERT INTO {TABLE_NAME} VALUES (1, 'a')")
+    assert_eq_with_retry(node2, f"SELECT count() FROM {TABLE_NAME}", "1")
+
+    node1.query(f"ALTER TABLE {TABLE_NAME} ADD COLUMN extra UInt64 DEFAULT 42")
+
+    # The row written before the ALTER has no `extra` in its own part -- the shared reader-path
+    # default-materialization machinery (IMergeTreeReader::fillMissingColumns(), unmodified for
+    # CloudMergeTree) must produce the default on the fly, on both replicas.
+    assert node1.query(f"SELECT extra FROM {TABLE_NAME} WHERE id = 1").strip() == "42"
+    assert_eq_with_retry(node2, f"SELECT extra FROM {TABLE_NAME} WHERE id = 1", "42")
+
+    # A row inserted after the ALTER is written under the new schema and carries its real value.
+    node1.query(f"INSERT INTO {TABLE_NAME} VALUES (2, 'b', 100)")
+    assert node1.query(f"SELECT extra FROM {TABLE_NAME} WHERE id = 2").strip() == "100"
+    assert_eq_with_retry(node2, f"SELECT extra FROM {TABLE_NAME} WHERE id = 2", "100")
+
+
+def test_comment_column_cross_replica(cluster):
+    # Not DROP COLUMN: upstream ClickHouse's own AlterCommand::getMutationStageDecision()
+    # classifies DROP COLUMN (like RENAME COLUMN/DROP INDEX/DROP PROJECTION/DROP STATISTICS) as
+    # unconditionally requiring a mutation -- it's not actually metadata-only even on ordinary
+    # MergeTree, since existing parts' on-disk column data needs an eventual cleanup pass. That
+    # correctly falls under this step's NOT_IMPLEMENTED scope cut (see
+    # test_alter_requiring_data_rewrite_throws_not_implemented) rather than being a supported
+    # cross-replica case. COMMENT COLUMN is genuinely metadata-only (AlterCommand::isCommentAlter()),
+    # so it exercises the same cross-replica propagation this step actually promises.
+    node1 = cluster.instances["node1"]
+    node2 = cluster.instances["node2"]
+
+    node1.query(f"CREATE TABLE {TABLE_NAME} {TABLE_DDL}")
+    table_uuid = node1.query(
+        f"SELECT uuid FROM system.tables WHERE table = '{TABLE_NAME}'"
+    ).strip()
+    node2.query(f"ATTACH TABLE {TABLE_NAME} UUID '{table_uuid}' {TABLE_DDL}")
+
+    node1.query(f"INSERT INTO {TABLE_NAME} VALUES (1, 'a')")
+    assert_eq_with_retry(node2, f"SELECT count() FROM {TABLE_NAME}", "1")
+
+    node1.query(f"ALTER TABLE {TABLE_NAME} COMMENT COLUMN data 'a comment'")
+
+    assert (
+        node1.query(
+            f"SELECT comment FROM system.columns WHERE table = '{TABLE_NAME}' AND name = 'data'"
+        ).strip()
+        == "a comment"
+    )
+    assert_eq_with_retry(
+        node2,
+        f"SELECT comment FROM system.columns WHERE table = '{TABLE_NAME}' AND name = 'data'",
+        "a comment",
+    )
+    # The table itself and its data are untouched.
+    assert node1.query(f"SELECT data FROM {TABLE_NAME}").strip() == "a"
+
+
+def test_alter_issued_on_second_replica_is_picked_up_by_first(cluster):
+    node1 = cluster.instances["node1"]
+    node2 = cluster.instances["node2"]
+
+    node1.query(f"CREATE TABLE {TABLE_NAME} {TABLE_DDL}")
+    table_uuid = node1.query(
+        f"SELECT uuid FROM system.tables WHERE table = '{TABLE_NAME}'"
+    ).strip()
+    node2.query(f"ATTACH TABLE {TABLE_NAME} UUID '{table_uuid}' {TABLE_DDL}")
+
+    # Symmetry check: node1 never runs this ALTER itself -- only its own watcher-driven pickup
+    # (piggybacked on part_set_updating_task, see StorageCloudMergeTree.h) can make it appear here.
+    node2.query(f"ALTER TABLE {TABLE_NAME} ADD COLUMN extra UInt64 DEFAULT 7")
+
+    assert_eq_with_retry(
+        node1,
+        f"SELECT count() FROM system.columns WHERE table = '{TABLE_NAME}' AND name = 'extra'",
+        "1",
+    )
+
+
+def test_concurrent_alter_add_column_from_both_replicas_both_land(cluster):
+    node1 = cluster.instances["node1"]
+    node2 = cluster.instances["node2"]
+
+    node1.query(f"CREATE TABLE {TABLE_NAME} {TABLE_DDL}")
+    table_uuid = node1.query(
+        f"SELECT uuid FROM system.tables WHERE table = '{TABLE_NAME}'"
+    ).strip()
+    node2.query(f"ATTACH TABLE {TABLE_NAME} UUID '{table_uuid}' {TABLE_DDL}")
+
+    # Both replicas race to ADD a different column at once: trySetMetadata()'s CAS-fenced retry
+    # (reload the latest columns, reapply on top, retry) must let both land, not silently drop one.
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(
+                node1.query, f"ALTER TABLE {TABLE_NAME} ADD COLUMN col_a UInt64 DEFAULT 1"
+            ),
+            executor.submit(
+                node2.query, f"ALTER TABLE {TABLE_NAME} ADD COLUMN col_b UInt64 DEFAULT 2"
+            ),
+        ]
+        for future in futures:
+            future.result()
+
+    # Whichever replica's CAS lost the race (ZBADVERSION) only reflects the merged result in its
+    # own memory once its retry lands; the *other* replica (which may have already returned from
+    # its own successful, non-retried alter() call before that retry even started) only picks up
+    # the second column later, via its background watcher -- an extra hop beyond a plain single
+    # ALTER, so a longer window than the default is warranted here, same reasoning as this file's
+    # other background-propagation-driven waits (e.g. the GC tests' 30x1s windows).
+    assert_eq_with_retry(
+        node1,
+        f"SELECT count() FROM system.columns WHERE table = '{TABLE_NAME}' AND name IN ('col_a', 'col_b')",
+        "2",
+        retry_count=40,
+        sleep_time=1,
+    )
+    assert_eq_with_retry(
+        node2,
+        f"SELECT count() FROM system.columns WHERE table = '{TABLE_NAME}' AND name IN ('col_a', 'col_b')",
+        "2",
+        retry_count=40,
+        sleep_time=1,
+    )
+
+
+def test_alter_requiring_data_rewrite_throws_not_implemented(cluster):
+    node1 = cluster.instances["node1"]
+
+    node1.query(f"CREATE TABLE {TABLE_NAME} {TABLE_DDL}")
+    node1.query(f"INSERT INTO {TABLE_NAME} VALUES (1, 'a')")
+
+    # String -> UInt64 is a valid conversion (passes checkAlterIsPossible) but is not free -- it
+    # requires reparsing and rewriting every existing part, so AlterCommands::getMutationCommands()
+    # returns non-empty and StorageCloudMergeTree::alter() must reject it for now (Phase 4 Step D's
+    # documented scope cut), not silently mishandle it.
+    with pytest.raises(QueryRuntimeException) as exc:
+        node1.query(f"ALTER TABLE {TABLE_NAME} MODIFY COLUMN data UInt64")
+    assert "NOT_IMPLEMENTED" in str(exc.value)

@@ -8,6 +8,7 @@
 #include <Common/ZooKeeper/ZooKeeper.h>
 #include <Core/BackgroundSchedulePool.h>
 #include <expected>
+#include <functional>
 
 namespace DB
 {
@@ -17,6 +18,11 @@ namespace DB
 /// so including it back would be circular.
 struct CloudMergeMutateSelectedEntry;
 using CloudMergeMutateSelectedEntryPtr = std::shared_ptr<CloudMergeMutateSelectedEntry>;
+
+/// Defined in CloudMergeMutateTask.h, forward-declared here for the same circular-include reason
+/// as CloudMergeMutateSelectedEntry above.
+struct CloudMutateSelectedEntry;
+using CloudMutateSelectedEntryPtr = std::shared_ptr<CloudMutateSelectedEntry>;
 
 /** CloudMergeTree: a stateless-replica MergeTree whose authoritative active part
   * set lives in Keeper and whose part data lives on a shared object-storage disk.
@@ -93,7 +99,11 @@ public:
 
     /// Commit a freshly written part: register it in Keeper, then flip it Active in the cache.
     /// Throws on a Keeper failure so the INSERT fails closed (no silent local-only commit).
-    void commitInsertedPart(MutableDataPartPtr & part, ContextPtr context);
+    /// Returns false (part discarded via removeIfNeeded(), nothing touched in Keeper's active set
+    /// or the local cache) if insert_deduplicate is enabled and this exact block content was
+    /// already committed by some part -- same silent-no-op contract as ReplicatedMergeTreeSink,
+    /// not a query failure. Returns true once the part is genuinely active.
+    bool commitInsertedPart(MutableDataPartPtr & part, ContextPtr context);
 
     /// Returns the maximum level of all outdated parts strictly between left and right, or 0 for
     /// an empty range. Used by the merge predicate to reject a merge that would paper over a gap
@@ -124,6 +134,52 @@ public:
         bool cleanup,
         ContextPtr context) override;
 
+    /// ALTER TABLE ... UPDATE/DELETE: snapshots the current block-number watermark for every
+    /// affected partition (a part with min_block below the snapshot existed before this call and
+    /// needs the mutation; a later INSERT's part does not -- see CloudMergeTreeCoordination's
+    /// class doc comment) and persists a Keeper-allocated mutations/<id> entry. Returns once
+    /// durably recorded; does not wait for completion (mutations_sync is not implemented -- see
+    /// DESIGN.md/the Phase 4 Step C plan for why this is a deliberate, documented scope cut, not
+    /// an oversight).
+    void mutate(const MutationCommands & commands, ContextPtr context) override;
+
+    /// The base MergeTreeData::checkMutationIsPossible() unconditionally rejects mutations on any
+    /// disk with supportsHardLinks() == false -- true for every CloudMergeTree disk, since it's
+    /// always plain_rewritable object storage. That check exists only to guard MutateTask's
+    /// "reuse untouched columns via a real hardlink" optimization; getDefaultSettings() above
+    /// forces always_use_copy_instead_of_hardlinks on for every CloudMergeTree table, which routes
+    /// MutateTask to copy instead unconditionally, making the disk-capability check moot. No-op:
+    /// CloudMergeTree does not yet support unique-key dedup-bypass rejection either (no unique key
+    /// support at all yet), so there is nothing else from the base check to preserve.
+    void checkMutationIsPossible(const MutationCommands & commands, const Settings & settings) const override;
+
+    /// MergeTreeData::checkAlterIsPossible() (~1000 lines: subscription checks, type-conversion
+    /// legality, primary-key/partition-key column restrictions, statistics, indices, TTL -- all
+    /// genuinely reusable and NOT reimplemented here) contains exactly one clause that doesn't
+    /// apply to CloudMergeTree: it rejects any non-settings/comment ALTER outright on a disk with
+    /// supportsHardLinks() == false (true for every CloudMergeTree disk), the same disk-capability
+    /// guard checkMutationIsPossible() has above -- except unlike mutations, there is no
+    /// MergeTreeSettings knob to route around it, because CloudMergeTree's ALTER (see alter()
+    /// below) never touches part files at all for a metadata-only command: it's a pure Keeper CAS
+    /// + local catalog update, so the restriction this guards against structurally cannot apply.
+    /// With no seam to skip just that one clause inside a function this large, calls the base
+    /// unchanged and swallows only that specific, narrowly-identified exception (matched by both
+    /// error code and message substring, not code alone -- SUPPORT_IS_DISABLED is also used
+    /// earlier in the same function for an unrelated text-index check that must still propagate).
+    void checkAlterIsPossible(const AlterCommands & commands, ContextPtr context) const override;
+
+    /// ALTER TABLE ... ADD/DROP/MODIFY/RENAME COLUMN (metadata-only): CAS-writes the new column
+    /// list to Keeper's metadata znode (fenced on the version this replica last saw), reloading
+    /// and reapplying `params` on top of the latest columns text if another replica's ALTER won
+    /// the race first. checkAlterIsPossible() above already validated `params` by this point --
+    /// invoked automatically by the standard AlterCommands validation path before this is ever
+    /// called, same as every other MergeTree engine. A command requiring an actual data rewrite
+    /// (checked via
+    /// AlterCommands::getMutationCommands() returning non-empty) throws NOT_IMPLEMENTED -- see the
+    /// Phase 4 Step D plan's scope cut; splitting such a command into a metadata part plus an
+    /// auto-submitted mutation is a fast-follow, not this step.
+    void alter(const AlterCommands & params, ContextPtr context, AlterLockHolder & alter_lock_holder) override;
+
 private:
     MergeTreeDataWriter writer;
     CloudMergeTreeCoordination coordination;
@@ -141,8 +197,17 @@ private:
     /// Set from the initial Keeper-driven load in the constructor, advanced by the watcher.
     std::atomic<int32_t> current_parts_version{0};
 
+    /// The Keeper `metadata` znode version (its own Stat.version, doubling as metadata_version --
+    /// see CloudMergeTreeCoordination's class doc comment) this replica's in-memory metadata
+    /// currently reflects. Seeded in the constructor from whatever Keeper already holds (not
+    /// necessarily 0 -- see the constructor's comment on the documented ATTACH-doesn't-reconcile
+    /// gap), advanced by alter() and by the watcher below.
+    std::atomic<int32_t> current_metadata_version{0};
+
     /// Watches the Keeper `parts` set and reconciles data_parts_indexes against it, so parts
-    /// inserted by another replica become visible here without a restart.
+    /// inserted by another replica become visible here without a restart. Also watches the
+    /// `metadata` znode (Phase 4 Step D) on the same cycle/callback -- see its doc comment for why
+    /// this piggybacks on the existing task rather than adding a second one.
     BackgroundSchedulePoolTaskHolder part_set_updating_task;
     void updatePartSetFromKeeper();
 
@@ -154,6 +219,17 @@ private:
     /// the grace period regardless, unlike part_set_updating_task's correctness-critical immediacy.
     BackgroundSchedulePoolTaskHolder parts_killer_task;
     void runPartsKillerCycle();
+
+    /// Shared primitive behind dropPartition/dropPart/truncate (Phase 4 Step A): removes every
+    /// currently-active part whose name matches `predicate` via one or more coordination.tryRemoveParts()
+    /// multi()s (each atomically deactivates + tombstones its parts, same as drop() already does for
+    /// the whole table), then immediately reflects the removal in data_parts_indexes -- same
+    /// removePartsFromWorkingSet() pattern updatePartSetFromKeeper() uses -- rather than waiting for
+    /// the watcher's next cycle. Retries against a concurrent merge/DROP racing on an overlapping part:
+    /// the multi() fails closed (ZNONODE on a source already removed elsewhere) and this reloads the
+    /// live active set and rebuilds before trying again, same fail-closed/retry shape commitMergedPart's
+    /// lease check already relies on for exactly-once materialization. Returns the number of parts removed.
+    size_t removeActivePartsMatching(const std::function<bool(const String &)> & predicate);
 
     /// Serialize a part's columns+checksums into the header stored in its znode.
     String serializePartHeader(const DataPartPtr & part) const;
@@ -187,9 +263,20 @@ private:
     std::expected<CloudMergeMutateSelectedEntryPtr, SelectMergeFailure> selectPartsToMerge(
         const StorageMetadataPtr & metadata_snapshot, std::unique_lock<std::mutex> & lock, bool aggressive = false);
 
+    /// Mutation counterpart of selectPartsToMerge(), tried by scheduleDataProcessingJob() only when
+    /// merge selection found nothing this cycle (same two-phase shape StorageMergeTree's own
+    /// scheduleDataProcessingJob already uses). One mutation version applied per selected part per
+    /// call -- see the Phase 4 Step C plan's "explicit scope cut" on batching. Reuses
+    /// CloudCurrentlyMergingPartsTagger unchanged: it only ever tags/untags future_part->parts, with
+    /// no merge-specific assumption baked in, so a part already claimed by a merge (or vice versa) is
+    /// correctly rejected by both selectors sharing the one currently_merging_mutating_parts set.
+    std::expected<CloudMutateSelectedEntryPtr, SelectMergeFailure> selectPartsToMutate(
+        const StorageMetadataPtr & metadata_snapshot, std::unique_lock<std::mutex> & lock);
+
     friend class CloudMergeTreeSink;
     friend class CloudMergeTreeMergePredicate;
     friend class CloudMergePlainMergeTreeTask;
+    friend class CloudMergeMutateTask;
     friend struct CloudCurrentlyMergingPartsTagger;
 
     struct MutationsSnapshot;

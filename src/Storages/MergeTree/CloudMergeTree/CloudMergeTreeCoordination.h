@@ -4,6 +4,8 @@
 #include <Common/ZooKeeper/Types.h>
 #include <base/types.h>
 #include <expected>
+#include <map>
+#include <set>
 #include <vector>
 
 namespace DB
@@ -16,10 +18,28 @@ namespace DB
   * stateless caches of this set; they never own parts.
   *
   * The layout under <root>:
+  *   metadata                   -> the table's current column list, serialized via
+  *                                 ColumnsDescription::toString()/parse(). The znode's own Keeper
+  *                                 version *is* the table's metadata_version (same trick `parts`
+  *                                 plays with its cversion) -- no separate counter in the payload.
+  *                                 CAS-updated by ALTER ADD/DROP/MODIFY/RENAME COLUMN (metadata-only
+  *                                 commands; a command requiring an actual data rewrite is rejected,
+  *                                 see StorageCloudMergeTree::alter()). Parts stamp this version into
+  *                                 their own metadata_version.txt at write time (upstream MergeTree
+  *                                 machinery, unmodified); the shared reader path already
+  *                                 materializes defaults on the fly for a part missing a newer
+  *                                 column, so old parts need no rewrite when a column is added.
   *   parts/<part_name>          -> part header (columns + checksums). The cversion
   *                                 of the parts parent is the part-set version.
   *   block_numbers/<partition>  -> block-number allocation
-  *   mutations/<id>             -> mutation commands
+  *   mutations/<id>             -> mutation commands, serialized as a ReplicatedMergeTreeMutationEntry
+  *                                 (source_replica/alter_version unused, kept only because the
+  *                                 struct is shared). id is Keeper-allocated (PersistentSequential).
+  *                                 block_numbers in the entry is a per-partition snapshot taken via
+  *                                 the same barrier-lock primitive INSERT uses for block_numbers/ --
+  *                                 a part with min_block below the snapshot existed before the
+  *                                 mutation was submitted and needs it applied; a part created after
+  *                                 does not.
   *   leases/<range>             -> merge/mutation assignment leases (ephemeral)
   *   replicas/<session>         -> replica liveness (ephemeral, owns no parts)
   *   temp/                      -> in-flight registrations for crash cleanup
@@ -30,6 +50,11 @@ namespace DB
   *                                 has elapsed, then removes the tombstone.
   *     .../claim                -> ephemeral, held only while a replica is actively deleting that
   *                                 part's objects; self-heals on crash via session death.
+  *   deduplication_hashes/<id>  -> insert dedup: value = the part name that won this content hash.
+  *                                 Written atomically with parts/<part_name> on INSERT when
+  *                                 insert_deduplicate is enabled (see DeduplicationHash in
+  *                                 Interpreters/InsertDeduplication.h, whose HashType::UNIFIED
+  *                                 directory name this must match literally).
   *
   * All methods take the ZooKeeperPtr per call so a session reconnect cannot leave
   * the object holding a dead handle (mirrors StorageReplicatedMergeTree).
@@ -47,6 +72,9 @@ public:
     String tempPath() const { return root_path + "/temp"; }
     String leasesPath() const { return root_path + "/leases"; }
     String leasePath(const String & merged_part_name) const { return leasesPath() + "/" + merged_part_name; }
+    String mutationsPath() const { return root_path + "/mutations"; }
+    String mutationPath(const String & mutation_id) const { return mutationsPath() + "/" + mutation_id; }
+    String metadataPath() const { return root_path + "/metadata"; }
     String dropMarkerPath() const { return root_path + "/dropped"; }
     String droppedPartsPath() const { return root_path + "/dropped_parts"; }
     String droppedPartPath(const String & part_name) const { return droppedPartsPath() + "/" + part_name; }
@@ -60,13 +88,16 @@ public:
     void ensureBlockNumbersPartition(const zkutil::ZooKeeperPtr & zk, const String & partition_id) const;
 
     /// INSERT commit: atomically register a freshly written part as active. extra_ops (e.g. the
-    /// block-number lock's unlock op) ride along in the same multi() so allocation and commit are
-    /// atomic together.
-    /// Returns ZOK on success, ZNODEEXISTS if a part with that name is already active.
+    /// block-number lock's unlock op, or an insert-dedup path's create request) ride along in the
+    /// same multi() so allocation and commit are atomic together.
+    /// Returns ZOK on success, ZNODEEXISTS if a part with that name -- or one of extra_ops's own
+    /// create requests, e.g. a dedup path -- already exists. out_responses lets the caller use
+    /// zkutil::getFailedOpIndex() to tell which op collided (index 0 is always the part znode
+    /// itself; extra_ops occupy the following indices in the order given).
     /// The caller must only flip the part Active in its in-memory cache after ZOK.
     Coordination::Error tryCommitInsert(
         const zkutil::ZooKeeperPtr & zk, const String & part_name, const String & part_header,
-        Coordination::Requests extra_ops = {}) const;
+        Coordination::Requests extra_ops, Coordination::Responses & out_responses) const;
 
     /// MERGE/MUTATE commit: atomically add the result and remove its sources, fenced by a lease.
     /// The whole thing is a single multi(): create parts/<merged>, remove parts/<source_i>,
@@ -168,6 +199,51 @@ public:
     /// doesn't actually fully own (the merge predicate's gap check only sees locally-known parts,
     /// so it can't catch this). See StorageCloudMergeTree::selectPartsToMerge().
     int32_t getPartsVersion(const zkutil::ZooKeeperPtr & zk) const;
+
+    /// Snapshot the current block-number watermark for each given partition: for each, acquires
+    /// and immediately releases an ephemeral-sequential lock under block_numbers/<partition>/ (the
+    /// same primitive INSERT uses to allocate a part's own block number) and records its number.
+    /// Since that counter only ever advances, any part already active with min_block below the
+    /// returned number is guaranteed to have existed before this call -- the barrier a mutation
+    /// needs to know which parts it must apply to versus which post-date it. Creates
+    /// block_numbers/<partition> first if not already present (mirrors ensureBlockNumbersPartition).
+    std::map<String, Int64> snapshotBlockNumbers(const zkutil::ZooKeeperPtr & zk, const std::set<String> & partition_ids) const;
+
+    /// Persist a new mutation entry (caller-serialized text, see the class doc comment) under
+    /// mutations/, Keeper-allocating its id. Returns the allocated znode name (the mutation id).
+    String createMutation(const zkutil::ZooKeeperPtr & zk, const String & entry_text) const;
+
+    /// List every mutation entry currently recorded, as (znode_name, raw text) pairs -- the caller
+    /// (which already depends on MutationCommands/ReplicatedMergeTreeMutationEntry) parses them;
+    /// this class deliberately stays decoupled from those types, same as everywhere else here.
+    std::vector<std::pair<String, String>> listMutations(const zkutil::ZooKeeperPtr & zk) const;
+
+    /// Idempotently establish the table's initial schema in Keeper on first CREATE/ATTACH -- a
+    /// no-op if already present (an earlier CREATE, or a faster-starting replica, already wrote
+    /// it). Every replica calls this on startup; whichever wins establishes version 0 for
+    /// getMetadataVersion()/trySetMetadata() below to CAS against.
+    void ensureInitialMetadata(const zkutil::ZooKeeperPtr & zk, const String & initial_columns_text) const;
+
+    /// Cheap freshness check: the metadata znode's own Keeper version, reused directly as the
+    /// table's metadata_version (same trick getPartsVersion() plays with the parts parent's
+    /// cversion) -- no separate counter needed in the payload.
+    int32_t getMetadataVersion(const zkutil::ZooKeeperPtr & zk) const;
+
+    /// Read the current columns text plus its version in one round trip -- for a fresh CAS
+    /// baseline after losing a race (see StorageCloudMergeTree::alter()) or a watcher refresh.
+    /// The watch_callback overload additionally arms a one-shot watch so watch_callback fires the
+    /// next time the schema changes -- used by the part-set watcher to notice an ALTER run by
+    /// another replica without polling.
+    std::pair<String, int32_t> getMetadata(const zkutil::ZooKeeperPtr & zk) const;
+    std::pair<String, int32_t> getMetadata(const zkutil::ZooKeeperPtr & zk, Coordination::WatchCallbackPtr watch_callback) const;
+
+    /// CAS-write new columns text, fenced on expected_version (from a prior getMetadataVersion()/
+    /// getMetadata() call). ZBADVERSION means someone else's ALTER landed first -- the caller must
+    /// reload via getMetadata() and reapply its own commands on top of the fresh baseline, not
+    /// retry blindly with the same text. On success, out_new_version is the version to store as
+    /// the table's new metadata_version (see StorageInMemoryMetadata::withMetadataVersion).
+    Coordination::Error trySetMetadata(
+        const zkutil::ZooKeeperPtr & zk, const String & new_columns_text, int32_t expected_version, int32_t & out_new_version) const;
 
 private:
     const String root_path;

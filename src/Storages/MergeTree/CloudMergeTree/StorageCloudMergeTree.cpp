@@ -3,6 +3,11 @@
 #include <Storages/MergeTree/CloudMergeTree/CloudMergeTreeMergePredicate.h>
 #include <Storages/MergeTree/CloudMergeTree/CloudMergeTreePartsCollector.h>
 #include <Storages/MergeTree/CloudMergeTree/CloudMergePlainMergeTreeTask.h>
+#include <Storages/MergeTree/CloudMergeTree/CloudMergeMutateTask.h>
+#include <Storages/MergeTree/ReplicatedMergeTreeMutationEntry.h>
+#include <Storages/AlterCommands.h>
+#include <Storages/ColumnsDescription.h>
+#include <Interpreters/DatabaseCatalog.h>
 
 #include <Storages/MergeTree/MergeTreeDataSelectExecutor.h>
 #include <Storages/MergeTree/ReplicatedMergeTreePartHeader.h>
@@ -22,9 +27,13 @@
 #include <Interpreters/MergeTreeTransaction/VersionMetadata.h>
 #include <Storages/MergeTree/EphemeralLockInZooKeeper.h>
 #include <Common/ZooKeeper/ZooKeeperWithFaultInjection.h>
+#include <Interpreters/InsertDeduplication.h>
+#include <Core/DeduplicateInsert.h>
 #include <Core/UUID.h>
 #include <Core/ServerUUID.h>
+#include <IO/ReadHelpers.h>
 #include <base/defines.h>
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
 
@@ -44,6 +53,7 @@ namespace ErrorCodes
     extern const int BAD_ARGUMENTS;
     extern const int NO_SUCH_DATA_PART;
     extern const int LOGICAL_ERROR;
+    extern const int SUPPORT_IS_DISABLED;
 }
 
 namespace MergeTreeSetting
@@ -111,6 +121,17 @@ StorageCloudMergeTree::StorageCloudMergeTree(
         /// only the parts Keeper knows about, not whatever a local directory listing turns up.
         auto zk = getZooKeeper();
         coordination.createRootNodes(zk);
+
+        /// Idempotent: the first replica to CREATE (or ATTACH) wins and establishes version 0;
+        /// every later replica's call is a no-op. Deliberately does NOT reconcile this replica's
+        /// own metadata_ (from its own CREATE/ATTACH statement) against whatever Keeper already
+        /// holds if it lost this race -- see the Phase 4 Step D plan's documented gap: a replica
+        /// always trusts its own statement's column list at startup, only later ALTERs are picked
+        /// up via the watcher below. current_metadata_version is seeded from Keeper's actual
+        /// current version regardless of who won, so that watcher correctly treats only *future*
+        /// changes as new.
+        coordination.ensureInitialMetadata(zk, metadata_.getColumns().toString(/*include_comments=*/ true));
+        current_metadata_version.store(coordination.getMetadataVersion(zk));
 
         int32_t loaded_version = 0;
         Strings active_names = coordination.loadActivePartNames(zk, loaded_version);
@@ -249,7 +270,7 @@ SinkToStoragePtr StorageCloudMergeTree::write(const ASTPtr & /*query*/, const St
         *this, metadata_snapshot, settings[MergeTreeSetting::parts_to_throw_insert], local_context);
 }
 
-void StorageCloudMergeTree::commitInsertedPart(MutableDataPartPtr & part, ContextPtr local_context)
+bool StorageCloudMergeTree::commitInsertedPart(MutableDataPartPtr & part, ContextPtr local_context)
 {
     auto component_guard = Coordination::setCurrentComponent("StorageCloudMergeTree::commitInsertedPart");
     auto zk = getZooKeeper();
@@ -262,19 +283,49 @@ void StorageCloudMergeTree::commitInsertedPart(MutableDataPartPtr & part, Contex
     const String partition_id = part->info.getPartitionId();
     coordination.ensureBlockNumbersPartition(zk, partition_id);
 
+    /// Whole-part-content insert dedup, same semantics as insert_deduplicate on
+    /// ReplicatedMergeTree: identical block content (e.g. a client retry after a timeout) becomes
+    /// a silent no-op rather than a duplicate row. Reuses the exact same hash and Keeper CAS
+    /// primitives ReplicatedMergeTreeSink does (see DeduplicationHash, Interpreters/InsertDeduplication.h).
+    const bool dedup_enabled = isDeduplicationEnabledForInsert(/*is_async_insert=*/ false, local_context->getSettingsRef());
+    std::optional<DeduplicationHash> dedup_hash;
+    std::vector<String> deduplication_paths;
+    if (dedup_enabled)
+    {
+        dedup_hash.emplace(DeduplicationHash::createUnifiedHash(part->checksums.getTotalChecksumUInt128(), partition_id));
+        deduplication_paths.push_back(dedup_hash->getPath(coordination.getRootPath()));
+    }
+
     auto block_lock = createEphemeralLockInZooKeeper(
         coordination.blockNumbersPartitionPath(partition_id) + "/block-",
         coordination.tempPath(),
         zk_fault,
-        /*deduplication_paths=*/{},
+        deduplication_paths,
         /*znode_data=*/std::nullopt);
+
+    if (!block_lock.isLocked())
+    {
+        /// Pre-check found this content hash already committed by some other part -- discard
+        /// ours. Never registered in Keeper or the local cache, so there's nothing to unwind
+        /// beyond the on-disk temp directory (same situation CloudMergePlainMergeTreeTask uses
+        /// removeIfNeeded() for: a part that lost its race to ever become active).
+        LOG_DEBUG(getLogger("StorageCloudMergeTree"), "INSERT of part {} was deduplicated (pre-check): {}",
+            part->name, block_lock.getConflictPath());
+        part->removeIfNeeded();
+        return false;
+    }
 
     part->info.min_block = part->info.max_block = block_lock.getNumber();
     part->setName(part->getNewName(part->info));
 
-    /// The lock's unlock op rides along in the same multi() as the part commit below, so
-    /// allocation and commit land atomically together (mirrors ReplicatedMergeTreeSink::commitPart).
+    /// The dedup-path create (if any) always goes first, so its index within tryCommitInsert's
+    /// full multi() is fixed at 1 (index 0 is always the part znode itself) -- required to tell a
+    /// dedup collision apart from a genuine part-name collision below. The lock's unlock op rides
+    /// along in the same multi() as the part commit, so allocation and commit land atomically
+    /// together (mirrors ReplicatedMergeTreeSink::commitPart).
     Coordination::Requests extra_ops;
+    if (dedup_enabled)
+        extra_ops.emplace_back(zkutil::makeCreateRequest(deduplication_paths.front(), part->name, zkutil::CreateMode::Persistent));
     block_lock.getUnlockOp(extra_ops);
 
     Transaction transaction(*this, local_context->getCurrentTransaction().get());
@@ -282,9 +333,24 @@ void StorageCloudMergeTree::commitInsertedPart(MutableDataPartPtr & part, Contex
         auto lock = lockParts();
 
         /// Keeper-first: the part is only active once its znode exists in the canonical set.
-        auto code = coordination.tryCommitInsert(zk, part->name, serializePartHeader(part), extra_ops);
+        Coordination::Responses responses;
+        auto code = coordination.tryCommitInsert(zk, part->name, serializePartHeader(part), extra_ops, responses);
         if (code == Coordination::Error::ZNODEEXISTS)
+        {
+            if (dedup_enabled && zkutil::getFailedOpIndex(code, responses) == 1)
+            {
+                /// Lost a race against another replica's concurrent insert of the same content
+                /// between our pre-check above and this commit -- same outcome as the pre-check
+                /// branch, not an error.
+                LOG_DEBUG(getLogger("StorageCloudMergeTree"), "INSERT of part {} was deduplicated (commit race)", part->name);
+                /// The failed multi() means the lock's own unlock op (bundled into extra_ops
+                /// above) never ran either -- release it explicitly via the normal unlock() path.
+                block_lock.unlock();
+                part->removeIfNeeded();
+                return false;
+            }
             throw Exception(ErrorCodes::INCORRECT_DATA, "Part {} already exists in the Keeper part set", part->name);
+        }
         if (code != Coordination::Error::ZOK)
             throw zkutil::KeeperException(code, "Cannot register part {} in Keeper", part->name);
         block_lock.assumeUnlocked();
@@ -293,6 +359,7 @@ void StorageCloudMergeTree::commitInsertedPart(MutableDataPartPtr & part, Contex
         renameTempPartAndAdd(part, transaction, lock, /*rename_in_transaction=*/ false);
         transaction.commit(lock);
     }
+    return true;
 }
 
 bool StorageCloudMergeTree::commitMergedPart(
@@ -316,6 +383,16 @@ bool StorageCloudMergeTree::commitMergedPart(
     if (code != Coordination::Error::ZOK)
     {
         LOG_DEBUG(getLogger("StorageCloudMergeTree"), "Lost the merge commit race for {}: {}", new_part->name, code);
+        /// We may still validly hold this lease (e.g. code == ZNODEEXISTS means our lease check
+        /// itself passed and only the result-part create lost to a faster winner -- a real,
+        /// reproducible window: the winner's own releaseLease() below can free the path in time
+        /// for us to acquire a *fresh* lease there before our own commit attempt runs). Release it
+        /// unconditionally rather than only on the success path below -- otherwise a losing
+        /// replica's lease sits as a permanently-dangling ephemeral node, forever blocking the
+        /// parts-killer GC task's defensive live-lease check for the tombstoned source part with
+        /// the same name (see runPartsKillerCycle). If we'd instead lost the lease itself (someone
+        /// stole it), this call just no-ops on a version mismatch -- safe either way.
+        coordination.releaseLease(zk, lease_path, lease_version);
         return false;
     }
 
@@ -384,7 +461,11 @@ void StorageCloudMergeTree::drop()
 
 void StorageCloudMergeTree::truncate(const ASTPtr &, const StorageMetadataPtr &, ContextPtr, TableExclusiveLockHolder &)
 {
-    throw Exception(ErrorCodes::NOT_IMPLEMENTED, "TRUNCATE is not implemented for CloudMergeTree yet");
+    /// Unlike drop(), the table itself stays alive: no markTableDropped(), no root-directory
+    /// teardown. The GC task's trailing-teardown check is gated specifically on the `dropped`
+    /// marker, so a plain TRUNCATE correctly leaves the table's Keeper root nodes and directory
+    /// intact for future inserts -- only the parts themselves are deactivated and tombstoned.
+    removeActivePartsMatching([](const String &) { return true; });
 }
 
 StorageCloudMergeTree::MutationsSnapshotPtr StorageCloudMergeTree::getMutationsSnapshot(const IMutationsSnapshot::Params & /*params*/) const
@@ -403,7 +484,16 @@ CursorPromotersMap StorageCloudMergeTree::buildPromoters()
 
 std::unique_ptr<MergeTreeSettings> StorageCloudMergeTree::getDefaultSettings() const
 {
-    return std::make_unique<MergeTreeSettings>(getContext()->getMergeTreeSettings());
+    auto settings = std::make_unique<MergeTreeSettings>(getContext()->getMergeTreeSettings());
+
+    /// CloudMergeTree's disk is always plain_rewritable object storage (DiskObjectStorage::
+    /// supportsHardLinks() returns false for it -- see metadata_storage->isPlain()), so mutations
+    /// must never try the real-hardlink "reuse untouched columns" optimization MutateTask
+    /// otherwise takes by default; this setting routes it to copy instead, which works
+    /// unconditionally on any disk. See checkMutationIsPossible() below, which skips the disk
+    /// hard-link check this same setting exists to make unnecessary.
+    settings->set("always_use_copy_instead_of_hardlinks", true);
+    return settings;
 }
 
 std::expected<CloudMergeMutateSelectedEntryPtr, SelectMergeFailure> StorageCloudMergeTree::selectPartsToMerge(
@@ -516,6 +606,253 @@ std::expected<CloudMergeMutateSelectedEntryPtr, SelectMergeFailure> StorageCloud
     }
 }
 
+namespace
+{
+    /// A part needs mutation_id applied iff it hasn't already (its own .mutation field is behind)
+    /// and it existed before that mutation's per-partition block-number snapshot boundary -- see
+    /// CloudMergeTreeCoordination's class doc comment on deduplication_hashes/mutations for the
+    /// same barrier-lock reasoning applied here. Shared by selectPartsToMutate() and the
+    /// system.mutations-visibility methods below so the two can't drift apart.
+    bool partNeedsMutation(const IMergeTreeDataPart & part, Int64 mutation_id, const ReplicatedMergeTreeMutationEntry & entry)
+    {
+        if (part.info.mutation >= mutation_id)
+            return false;
+        auto it = entry.block_numbers.find(part.info.getPartitionId());
+        return it != entry.block_numbers.end() && part.info.min_block < it->second;
+    }
+
+    /// Every mutation entry currently recorded, parsed and sorted by numeric id ascending -- so a
+    /// part needing several pending mutations always picks up the lowest-id one first (one
+    /// mutation applied per selected part per selectPartsToMutate() call, see the Phase 4 Step C
+    /// plan's explicit scope cut on batching). A corrupt entry is logged and skipped rather than
+    /// failing the whole scan.
+    ///
+    /// The numeric id used here is the znode's raw Keeper sequential number PLUS ONE, not the raw
+    /// number itself: Keeper's PersistentSequential counter starts at 0, which would collide with
+    /// MergeTreePartInfo::mutation's own default (0 == "never mutated") -- an unmutated part would
+    /// then look like it already had mutation 0 applied, permanently hiding the very first
+    /// mutation from every part. +1 keeps real mutation ids strictly positive, matching the
+    /// "0 is the sentinel" invariant partNeedsMutation() and new_part_info.mutation assignment
+    /// below both rely on.
+    std::vector<std::pair<Int64, ReplicatedMergeTreeMutationEntry>> loadSortedMutations(
+        const CloudMergeTreeCoordination & coordination, const zkutil::ZooKeeperPtr & zk)
+    {
+        std::vector<std::pair<Int64, ReplicatedMergeTreeMutationEntry>> mutations;
+        for (auto & [name, text] : coordination.listMutations(zk))
+        {
+            try
+            {
+                mutations.emplace_back(parse<Int64>(name) + 1, ReplicatedMergeTreeMutationEntry::parse(text, name));
+            }
+            catch (...)
+            {
+                tryLogCurrentException(getLogger("StorageCloudMergeTree"),
+                    fmt::format("Failed to parse mutation entry {}, skipping", name));
+            }
+        }
+        std::sort(mutations.begin(), mutations.end(), [](const auto & a, const auto & b) { return a.first < b.first; });
+        return mutations;
+    }
+}
+
+std::expected<CloudMutateSelectedEntryPtr, SelectMergeFailure> StorageCloudMergeTree::selectPartsToMutate(
+    const StorageMetadataPtr & /*metadata_snapshot*/, std::unique_lock<std::mutex> & /*lock*/)
+{
+    auto component_guard = Coordination::setCurrentComponent("StorageCloudMergeTree::selectPartsToMutate");
+    auto zk = getZooKeeper();
+
+    auto mutations = loadSortedMutations(coordination, zk);
+    if (mutations.empty())
+        return std::unexpected(SelectMergeFailure{
+            .reason = SelectMergeFailure::Reason::NOTHING_TO_MERGE,
+            .explanation = PreformattedMessage::create("No pending mutations"),
+        });
+
+    for (const auto & part : getDataPartsVectorForInternalUsage({DataPartState::Active}, {DataPartKind::Regular}))
+    {
+        if (currently_merging_mutating_parts.contains(part))
+            continue;
+
+        for (const auto & [id, entry] : mutations)
+        {
+            if (!partNeedsMutation(*part, id, entry))
+                continue;
+
+            auto new_part_info = part->info;
+            new_part_info.mutation = id;
+
+            auto future_part = std::make_shared<FutureMergedMutatedPart>();
+            future_part->parts.push_back(part);
+            future_part->part_info = new_part_info;
+            future_part->name = part->getNewName(new_part_info);
+            future_part->part_format = part->getFormat();
+
+            /// Same lease namespace merges use -- a mutated part's name (bumped .mutation field)
+            /// never collides with any concurrent merge's result name, so no separate namespace
+            /// is needed. Losing this race is NOTHING_TO_MERGE for this part, not fatal -- try the
+            /// next part instead of giving up the whole selection cycle.
+            const String lease_path = coordination.leasePath(future_part->name);
+            const String holder_data = toString(ServerUUID::get());
+            const Int64 staleness_ms = static_cast<Int64>((*getSettings())[MergeTreeSetting::cloud_merge_tree_lease_staleness_ms]);
+
+            auto lease = coordination.acquireOrStealLease(zk, lease_path, holder_data, staleness_ms);
+            if (!lease)
+                continue;
+
+            try
+            {
+                uint64_t needed_disk_space = CompactionStatistics::estimateNeededDiskSpace({part}, false);
+                auto tagger = std::make_unique<CloudCurrentlyMergingPartsTagger>(future_part, needed_disk_space, *this);
+
+                auto selected = std::make_shared<CloudMutateSelectedEntry>();
+                selected->future_part = future_part;
+                selected->tagger = std::move(tagger);
+                selected->lease_path = lease->path;
+                selected->lease_version = lease->version;
+                selected->commands = std::make_shared<MutationCommands>(entry.commands);
+                selected->mutation_id = entry.znode_name;
+                return selected;
+            }
+            catch (...)
+            {
+                coordination.releaseLease(zk, lease->path, lease->version);
+                throw;
+            }
+        }
+    }
+
+    return std::unexpected(SelectMergeFailure{
+        .reason = SelectMergeFailure::Reason::NOTHING_TO_MERGE,
+        .explanation = PreformattedMessage::create("No active part currently needs a pending mutation applied"),
+    });
+}
+
+void StorageCloudMergeTree::checkAlterIsPossible(const AlterCommands & commands, ContextPtr local_context) const
+{
+    try
+    {
+        MergeTreeData::checkAlterIsPossible(commands, local_context);
+    }
+    catch (const Exception & e)
+    {
+        /// See this method's doc comment in StorageCloudMergeTree.h: the one clause of the base
+        /// validator that doesn't apply to CloudMergeTree. Matched by message substring, not error
+        /// code alone -- SUPPORT_IS_DISABLED is also thrown earlier in the same base function for
+        /// an unrelated text-index check, which must still propagate.
+        if (e.code() == ErrorCodes::SUPPORT_IS_DISABLED && e.message().contains("immutable disk"))
+            return;
+        throw;
+    }
+}
+
+void StorageCloudMergeTree::mutate(const MutationCommands & commands, ContextPtr local_context)
+{
+    auto component_guard = Coordination::setCurrentComponent("StorageCloudMergeTree::mutate");
+    auto zk = getZooKeeper();
+
+    std::set<String> affected_partition_ids = getPartitionIdsAffectedByCommands(commands, local_context);
+    if (affected_partition_ids.empty())
+    {
+        /// No command carried an explicit PARTITION clause: applies table-wide, to every partition
+        /// with currently-active parts.
+        for (const auto & part : getDataPartsVectorForInternalUsage({DataPartState::Active}, {DataPartKind::Regular}))
+            affected_partition_ids.insert(part->info.getPartitionId());
+    }
+
+    ReplicatedMergeTreeMutationEntry entry;
+    entry.create_time = time(nullptr);
+    entry.source_replica = toString(ServerUUID::get());
+    entry.commands = commands;
+    /// alter_version stays -1 (its "not an ALTER-metadata-driven mutation" default): CloudMergeTree
+    /// has no ALTER ADD/DROP/MODIFY COLUMN yet (DESIGN.md Phase 4 Step D, not built), so there is no
+    /// metadata-alter-vs-mutation ordering to record.
+    if (!affected_partition_ids.empty())
+        entry.block_numbers = coordination.snapshotBlockNumbers(zk, affected_partition_ids);
+
+    coordination.createMutation(zk, entry.toString());
+}
+
+void StorageCloudMergeTree::checkMutationIsPossible(const MutationCommands &, const Settings &) const
+{
+    /// See the declaration's doc comment in StorageCloudMergeTree.h: deliberately not calling
+    /// MergeTreeData::checkMutationIsPossible() here, since its disk hard-link check would reject
+    /// every CloudMergeTree table outright.
+}
+
+void StorageCloudMergeTree::alter(const AlterCommands & params, ContextPtr local_context, AlterLockHolder &)
+{
+    auto component_guard = Coordination::setCurrentComponent("StorageCloudMergeTree::alter");
+
+    auto table_id = getStorageID();
+    auto metadata_snapshot = getInMemoryMetadataPtr(local_context, false);
+    StorageInMemoryMetadata new_metadata = *metadata_snapshot;
+
+    /// A command needing an actual data rewrite (e.g. a genuine type conversion) is out of scope
+    /// for this step -- see the Phase 4 Step D plan's scope cut. Detected the same way
+    /// StorageMergeTree::alter() does: getMutationCommands() returns non-empty only for commands
+    /// that can't be satisfied by a metadata-only change. Called before apply() below, against the
+    /// still-unmodified metadata, matching upstream's own ordering.
+    auto mutation_commands = params.getMutationCommands(new_metadata, /*materialize_ttl=*/ false, local_context, /*with_alters=*/ false);
+    if (!mutation_commands.empty())
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+            "ALTER commands requiring a data rewrite are not yet implemented for CloudMergeTree");
+
+    auto zk = getZooKeeper();
+
+    /// The very first CAS attempt must be just as content-consistent with its fenced version as
+    /// every retry is: build new_metadata's columns from the SAME Keeper read that produced
+    /// expected_version, not from our separately-taken (and possibly already-stale, if another
+    /// replica's ALTER landed in between) in-memory metadata_snapshot. Getting this wrong is a
+    /// silent-clobber bug, not just a missed optimization -- if expected_version happens to
+    /// already match Keeper's actual current version on the first try (another replica's change
+    /// already landed there), the CAS succeeds immediately since Keeper only checks the version
+    /// number, not that our payload actually derives from that version's content -- overwriting
+    /// the other replica's change instead of stacking on top of it, with no ZBADVERSION to catch
+    /// it. Reproduced reliably under two concurrent ALTERs from different replicas.
+    auto [initial_columns_text, expected_version] = coordination.getMetadata(zk);
+    new_metadata.columns = ColumnsDescription::parse(initial_columns_text);
+    params.apply(new_metadata, local_context);
+
+    /// Bounded retry against a concurrent ALTER from another replica: trySetMetadata()'s CAS fails
+    /// closed (ZBADVERSION) if the version we fenced on is stale, same fail-closed/retry shape
+    /// removeActivePartsMatching() and commitMergedPart() already rely on elsewhere in this file.
+    for (int attempt = 0; attempt < 20; ++attempt)
+    {
+        int32_t new_version = 0;
+        auto code = coordination.trySetMetadata(
+            zk, new_metadata.getColumns().toString(/*include_comments=*/ true), expected_version, new_version);
+
+        if (code == Coordination::Error::ZOK)
+        {
+            new_metadata.setMetadataVersion(new_version);
+            /// Safe because checkAlterIsPossible() already validated this metadata (invoked
+            /// automatically by the standard AlterCommands validation path before alter() is
+            /// called, same as every other MergeTree engine).
+            DatabaseCatalog::instance().getDatabase(table_id.database_name)
+                ->alterTable(local_context, table_id, new_metadata, /*validate_new_create_query=*/ true);
+            setInMemoryMetadata(new_metadata);
+            current_metadata_version.store(new_version);
+            return;
+        }
+
+        if (code != Coordination::Error::ZBADVERSION)
+            throw zkutil::KeeperException(code, "Cannot update metadata in Keeper for table {}", table_id.getNameForLogs());
+
+        /// Someone else's ALTER landed first: reload the actual current columns and rebuild our
+        /// target metadata on top of THAT fresh baseline, not our now-stale snapshot, before
+        /// retrying -- otherwise we'd silently clobber their change instead of stacking on it.
+        auto [latest_columns_text, latest_version] = coordination.getMetadata(zk);
+        expected_version = latest_version;
+        new_metadata = *metadata_snapshot;
+        new_metadata.columns = ColumnsDescription::parse(latest_columns_text);
+        params.apply(new_metadata, local_context);
+    }
+
+    throw Exception(ErrorCodes::LOGICAL_ERROR,
+        "Failed to update metadata in Keeper for table {} after repeated concurrent-modification retries",
+        table_id.getNameForLogs());
+}
+
 bool StorageCloudMergeTree::scheduleDataProcessingJob(BackgroundJobsAssignee & assignee)
 {
     if (shutdown_called)
@@ -525,6 +862,7 @@ bool StorageCloudMergeTree::scheduleDataProcessingJob(BackgroundJobsAssignee & a
     auto metadata_snapshot = getInMemoryMetadataPtr(getContext(), false);
 
     CloudMergeMutateSelectedEntryPtr merge_entry;
+    CloudMutateSelectedEntryPtr mutate_entry;
     {
         std::unique_lock lock(currently_processing_in_background_mutex);
         auto merge_select_result = selectPartsToMerge(metadata_snapshot, lock);
@@ -532,14 +870,34 @@ bool StorageCloudMergeTree::scheduleDataProcessingJob(BackgroundJobsAssignee & a
             merge_entry = std::move(merge_select_result.value());
         else
             LOG_TRACE(getLogger("StorageCloudMergeTree"), "Didn't start merge: {}", merge_select_result.error().explanation.text);
+
+        /// Only tried when merge selection found nothing this cycle -- same two-phase shape
+        /// StorageMergeTree's own scheduleDataProcessingJob already uses upstream.
+        if (!merge_entry)
+        {
+            auto mutate_select_result = selectPartsToMutate(metadata_snapshot, lock);
+            if (mutate_select_result)
+                mutate_entry = std::move(mutate_select_result.value());
+            else
+                LOG_TRACE(getLogger("StorageCloudMergeTree"), "Didn't start mutation: {}", mutate_select_result.error().explanation.text);
+        }
     }
 
-    if (!merge_entry)
-        return false;
+    if (merge_entry)
+    {
+        auto task = std::make_shared<CloudMergePlainMergeTreeTask>(
+            *this, metadata_snapshot, merge_entry, table_lock_holder, common_assignee_trigger);
+        return assignee.scheduleMergeMutateTask(task);
+    }
 
-    auto task = std::make_shared<CloudMergePlainMergeTreeTask>(
-        *this, metadata_snapshot, merge_entry, table_lock_holder, common_assignee_trigger);
-    return assignee.scheduleMergeMutateTask(task);
+    if (mutate_entry)
+    {
+        auto task = std::make_shared<CloudMergeMutateTask>(
+            *this, metadata_snapshot, mutate_entry, table_lock_holder, common_assignee_trigger);
+        return assignee.scheduleMergeMutateTask(task);
+    }
+
+    return false;
 }
 
 bool StorageCloudMergeTree::optimize(
@@ -607,17 +965,73 @@ void StorageCloudMergeTree::startBackgroundMovesIfNeeded()
 
 MutationCounters StorageCloudMergeTree::getMutationCounters() const
 {
-    return {};
+    auto component_guard = Coordination::setCurrentComponent("StorageCloudMergeTree::getMutationCounters");
+    MutationCounters counters;
+    auto zk = getZooKeeper();
+    auto mutations = loadSortedMutations(coordination, zk);
+    if (mutations.empty())
+        return counters;
+
+    auto active_parts = getDataPartsVectorForInternalUsage({DataPartState::Active}, {DataPartKind::Regular});
+    for (const auto & [id, entry] : mutations)
+    {
+        bool pending = std::any_of(active_parts.begin(), active_parts.end(),
+            [&](const auto & part) { return partNeedsMutation(*part, id, entry); });
+        if (pending)
+            ++counters.num_data;
+    }
+    /// CloudMergeTree has no ALTER ADD/DROP/MODIFY COLUMN yet (Phase 4 Step D), so every mutation
+    /// recorded here is a plain data mutation -- num_alter/num_metadata stay 0.
+    return counters;
 }
 
 std::map<std::string, MutationCommands> StorageCloudMergeTree::getUnfinishedMutationCommands() const
 {
-    return {};
+    auto component_guard = Coordination::setCurrentComponent("StorageCloudMergeTree::getUnfinishedMutationCommands");
+    std::map<std::string, MutationCommands> result;
+    auto zk = getZooKeeper();
+    auto mutations = loadSortedMutations(coordination, zk);
+    if (mutations.empty())
+        return result;
+
+    auto active_parts = getDataPartsVectorForInternalUsage({DataPartState::Active}, {DataPartKind::Regular});
+    for (const auto & [id, entry] : mutations)
+    {
+        bool pending = std::any_of(active_parts.begin(), active_parts.end(),
+            [&](const auto & part) { return partNeedsMutation(*part, id, entry); });
+        if (pending)
+            result.emplace(entry.znode_name, entry.commands);
+    }
+    return result;
 }
 
 std::vector<MergeTreeMutationStatus> StorageCloudMergeTree::getMutationsStatus() const
 {
-    return {};
+    auto component_guard = Coordination::setCurrentComponent("StorageCloudMergeTree::getMutationsStatus");
+    std::vector<MergeTreeMutationStatus> result;
+    auto zk = getZooKeeper();
+    auto mutations = loadSortedMutations(coordination, zk);
+    if (mutations.empty())
+        return result;
+
+    auto active_parts = getDataPartsVectorForInternalUsage({DataPartState::Active}, {DataPartKind::Regular});
+    result.reserve(mutations.size());
+    for (const auto & [id, entry] : mutations)
+    {
+        MergeTreeMutationStatus status;
+        status.id = entry.znode_name;
+        status.command = entry.commands.toString(/*with_pure_metadata_commands=*/ false);
+        status.create_time = entry.create_time;
+        status.block_numbers = entry.block_numbers;
+
+        for (const auto & part : active_parts)
+            if (partNeedsMutation(*part, id, entry))
+                status.parts_to_do_names.push_back(part->name);
+
+        status.is_done = status.parts_to_do_names.empty();
+        result.push_back(std::move(status));
+    }
+    return result;
 }
 
 bool StorageCloudMergeTree::partIsAssignedToBackgroundOperation(const DataPartPtr &) const
@@ -630,19 +1044,84 @@ void StorageCloudMergeTree::attachRestoredParts(MutableDataPartsVector &&, const
     throw Exception(ErrorCodes::NOT_IMPLEMENTED, "RESTORE is not implemented for CloudMergeTree yet");
 }
 
-void StorageCloudMergeTree::dropPartNoWaitNoThrow(const String &)
+size_t StorageCloudMergeTree::removeActivePartsMatching(const std::function<bool(const String &)> & predicate)
 {
-    throw Exception(ErrorCodes::NOT_IMPLEMENTED, "DROP PART is not implemented for CloudMergeTree yet");
+    auto component_guard = Coordination::setCurrentComponent("StorageCloudMergeTree::removeActivePartsMatching");
+    auto zk = getZooKeeper();
+
+    /// Bounded retry against a concurrent merge/DROP racing on an overlapping part: tryRemoveParts()'s
+    /// multi() fails closed (ZNONODE) if any matched name was already deactivated elsewhere between
+    /// our read and our commit, same as commitMergedPart()'s lease check fails closed against us.
+    for (int attempt = 0; attempt < 20; ++attempt)
+    {
+        int32_t version = 0;
+        Strings active_names = coordination.loadActivePartNames(zk, version);
+
+        Strings matched;
+        for (const auto & name : active_names)
+            if (predicate(name))
+                matched.push_back(name);
+
+        if (matched.empty())
+            return 0;
+
+        auto code = coordination.tryRemoveParts(zk, matched);
+        if (code == Coordination::Error::ZNONODE)
+            continue; /// lost a race against a concurrent merge/DROP on one of these names -- retry
+
+        if (code != Coordination::Error::ZOK)
+            throw zkutil::KeeperException(code, "Cannot remove parts from Keeper for table {}", getStorageID().getNameForLogs());
+
+        std::unordered_set<std::string> matched_set(matched.begin(), matched.end());
+        auto lock = lockParts();
+        auto known = getDataPartsVectorForInternalUsage({DataPartState::Active}, {DataPartKind::Regular}, lock);
+        DataPartsVector to_remove;
+        for (const auto & part : known)
+            if (matched_set.contains(part->name))
+                to_remove.push_back(part);
+
+        if (!to_remove.empty())
+            removePartsFromWorkingSet(/*txn=*/ nullptr, to_remove, /*clear_without_timeout=*/ false, lock);
+
+        return matched.size();
+    }
+
+    throw Exception(ErrorCodes::LOGICAL_ERROR,
+        "Failed to remove parts from Keeper for table {} after repeated concurrent-modification retries",
+        getStorageID().getNameForLogs());
 }
 
-void StorageCloudMergeTree::dropPart(const String &, bool, ContextPtr)
+void StorageCloudMergeTree::dropPartNoWaitNoThrow(const String & part_name)
+try
 {
-    throw Exception(ErrorCodes::NOT_IMPLEMENTED, "DROP PART is not implemented for CloudMergeTree yet");
+    removeActivePartsMatching([&](const String & name) { return name == part_name; });
+}
+catch (...)
+{
+    tryLogCurrentException(getLogger("StorageCloudMergeTree"),
+        fmt::format("dropPartNoWaitNoThrow failed for part {}, ignoring (best-effort)", part_name));
 }
 
-void StorageCloudMergeTree::dropPartition(const ASTPtr &, bool, ContextPtr)
+void StorageCloudMergeTree::dropPart(const String & part_name, bool detach, ContextPtr)
 {
-    throw Exception(ErrorCodes::NOT_IMPLEMENTED, "DROP PARTITION is not implemented for CloudMergeTree yet");
+    if (detach)
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "DETACH PART is not implemented for CloudMergeTree yet");
+
+    size_t removed = removeActivePartsMatching([&](const String & name) { return name == part_name; });
+    if (removed == 0)
+        throw Exception(ErrorCodes::NO_SUCH_DATA_PART, "Part {} not found, won't try to drop it.", part_name);
+}
+
+void StorageCloudMergeTree::dropPartition(const ASTPtr & partition, bool detach, ContextPtr local_context)
+{
+    if (detach)
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "DETACH PARTITION is not implemented for CloudMergeTree yet");
+
+    String partition_id = getPartitionIDFromQuery(partition, local_context);
+    removeActivePartsMatching([&](const String & name)
+    {
+        return MergeTreePartInfo::fromPartName(name, format_version).getPartitionId() == partition_id;
+    });
 }
 
 PartitionCommandsResultInfo StorageCloudMergeTree::attachPartition(const PartitionCommand &, const StorageMetadataPtr &, ContextPtr)
@@ -665,6 +1144,25 @@ try
 {
     auto component_guard = Coordination::setCurrentComponent("StorageCloudMergeTree::updatePartSetFromKeeper");
     auto zk = getZooKeeper();
+
+    /// Phase 4 Step D: piggyback the metadata watch on this same task/callback rather than adding
+    /// a second background task -- see current_metadata_version's doc comment in the header.
+    /// Checked unconditionally, before the parts-version early-return below, so an ALTER issued on
+    /// another replica (no part-set change of its own) still gets picked up this cycle instead of
+    /// being skipped. setInMemoryMetadata() is a lock-free MultiVersion swap, safe to call from
+    /// this background thread concurrently with query threads reading getInMemoryMetadataPtr().
+    {
+        auto [columns_text, new_metadata_version] = coordination.getMetadata(zk, part_set_updating_task->getWatchCallback());
+        if (new_metadata_version != current_metadata_version.load())
+        {
+            auto metadata_snapshot = getInMemoryMetadataPtr(getContext(), false);
+            StorageInMemoryMetadata new_metadata = *metadata_snapshot;
+            new_metadata.columns = ColumnsDescription::parse(columns_text);
+            new_metadata.setMetadataVersion(new_metadata_version);
+            setInMemoryMetadata(new_metadata);
+            current_metadata_version.store(new_metadata_version);
+        }
+    }
 
     auto lock = lockParts();
     /// lockParts() already holds the exclusive lock; the no-argument overload would try to take
