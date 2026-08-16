@@ -22,9 +22,11 @@ namespace DB
   *                                 ColumnsDescription::toString()/parse(). The znode's own Keeper
   *                                 version *is* the table's metadata_version (same trick `parts`
   *                                 plays with its cversion) -- no separate counter in the payload.
-  *                                 CAS-updated by ALTER ADD/DROP/MODIFY/RENAME COLUMN (metadata-only
-  *                                 commands; a command requiring an actual data rewrite is rejected,
-  *                                 see StorageCloudMergeTree::alter()). Parts stamp this version into
+  *                                 CAS-updated by ALTER ADD/DROP/MODIFY/RENAME COLUMN. A command
+  *                                 requiring an actual data rewrite (e.g. a type-changing MODIFY
+  *                                 COLUMN) additionally submits a mutations/<id> entry atomically in
+  *                                 the same multi(), see trySetMetadataAndCreateMutation() and
+  *                                 StorageCloudMergeTree::alter(). Parts stamp this version into
   *                                 their own metadata_version.txt at write time (upstream MergeTree
   *                                 machinery, unmodified); the shared reader path already
   *                                 materializes defaults on the fly for a part missing a newer
@@ -33,8 +35,12 @@ namespace DB
   *                                 of the parts parent is the part-set version.
   *   block_numbers/<partition>  -> block-number allocation
   *   mutations/<id>             -> mutation commands, serialized as a ReplicatedMergeTreeMutationEntry
-  *                                 (source_replica/alter_version unused, kept only because the
-  *                                 struct is shared). id is Keeper-allocated (PersistentSequential).
+  *                                 (source_replica unused, kept only because the struct is shared).
+  *                                 alter_version is -1 for a manually-submitted mutation, or the
+  *                                 metadata znode's resulting version for one submitted atomically
+  *                                 alongside an ALTER requiring a data rewrite (see
+  *                                 trySetMetadataAndCreateMutation() below). id is Keeper-allocated
+  *                                 (PersistentSequential).
   *                                 block_numbers in the entry is a per-partition snapshot taken via
   *                                 the same barrier-lock primitive INSERT uses for block_numbers/ --
   *                                 a part with min_block below the snapshot existed before the
@@ -269,6 +275,26 @@ public:
     /// the table's new metadata_version (see StorageInMemoryMetadata::withMetadataVersion).
     Coordination::Error trySetMetadata(
         const zkutil::ZooKeeperPtr & zk, const String & new_columns_text, int32_t expected_version, int32_t & out_new_version) const;
+
+    struct MetadataAndMutationResult
+    {
+        int32_t new_metadata_version;
+        String mutation_id;
+    };
+
+    /// ALTER commands requiring a data rewrite (e.g. a type-changing MODIFY COLUMN): commit the
+    /// metadata change and the mutation that migrates existing parts to it atomically together, in
+    /// one multi() -- mirrors StorageReplicatedMergeTree::alter()'s own atomic-together shape. A
+    /// crash between two *separate* writes would otherwise leave either a live schema change with
+    /// no mutation to ever rewrite old-typed data, or an orphaned mutation naming a metadata state
+    /// that was never actually published. ZBADVERSION means someone else's ALTER landed first --
+    /// same reload-and-retry contract as trySetMetadata(). On success, new_metadata_version is
+    /// always expected_metadata_version + 1 (Keeper znode versions increment by exactly 1 per
+    /// successful write) -- computed without a second round trip, same precomputation
+    /// StorageReplicatedMergeTree::alter() itself relies on before its own multi().
+    std::expected<MetadataAndMutationResult, Coordination::Error> trySetMetadataAndCreateMutation(
+        const zkutil::ZooKeeperPtr & zk, const String & new_columns_text, int32_t expected_metadata_version,
+        const String & mutation_entry_text) const;
 
 private:
     const String root_path;

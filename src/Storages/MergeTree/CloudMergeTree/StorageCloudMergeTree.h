@@ -24,6 +24,10 @@ using CloudMergeMutateSelectedEntryPtr = std::shared_ptr<CloudMergeMutateSelecte
 struct CloudMutateSelectedEntry;
 using CloudMutateSelectedEntryPtr = std::shared_ptr<CloudMutateSelectedEntry>;
 
+/// Defined in ReplicatedMergeTreeMutationEntry.h. Only forward-declared here since it's only used
+/// by value in one private method's signature, not stored as a member.
+struct ReplicatedMergeTreeMutationEntry;
+
 /** CloudMergeTree: a stateless-replica MergeTree whose authoritative active part
   * set lives in Keeper and whose part data lives on a shared object-storage disk.
   *
@@ -168,16 +172,17 @@ public:
     /// earlier in the same function for an unrelated text-index check that must still propagate).
     void checkAlterIsPossible(const AlterCommands & commands, ContextPtr context) const override;
 
-    /// ALTER TABLE ... ADD/DROP/MODIFY/RENAME COLUMN (metadata-only): CAS-writes the new column
-    /// list to Keeper's metadata znode (fenced on the version this replica last saw), reloading
-    /// and reapplying `params` on top of the latest columns text if another replica's ALTER won
-    /// the race first. checkAlterIsPossible() above already validated `params` by this point --
-    /// invoked automatically by the standard AlterCommands validation path before this is ever
-    /// called, same as every other MergeTree engine. A command requiring an actual data rewrite
-    /// (checked via
-    /// AlterCommands::getMutationCommands() returning non-empty) throws NOT_IMPLEMENTED -- see the
-    /// Phase 4 Step D plan's scope cut; splitting such a command into a metadata part plus an
-    /// auto-submitted mutation is a fast-follow, not this step.
+    /// ALTER TABLE ... ADD/DROP/MODIFY/RENAME COLUMN: CAS-writes the new column list to Keeper's
+    /// metadata znode (fenced on the version this replica last saw), reloading and reapplying
+    /// `params` on top of the latest columns text if another replica's ALTER won the race first.
+    /// checkAlterIsPossible() above already validated `params` by this point -- invoked
+    /// automatically by the standard AlterCommands validation path before this is ever called, same
+    /// as every other MergeTree engine. A command requiring an actual data rewrite (checked via
+    /// AlterCommands::getMutationCommands() returning non-empty, recomputed fresh on every retry
+    /// attempt against that attempt's own Keeper read) additionally submits a mutations/<id> entry,
+    /// committed atomically together with the metadata change via
+    /// coordination.trySetMetadataAndCreateMutation() -- mirrors
+    /// StorageReplicatedMergeTree::alter()'s own atomic-together shape (DESIGN.md invariant 3).
     void alter(const AlterCommands & params, ContextPtr context, AlterLockHolder & alter_lock_holder) override;
 
 private:
@@ -257,6 +262,15 @@ private:
     /// locally covers this part (e.g. a later merge result adopted earlier in the same batch), this
     /// name is already effectively satisfied and there is nothing more to do.
     void admitPartLocally(MutableDataPartPtr part, DataPartsLock & lock);
+
+    /// Build a mutation entry ready to serialize into a mutations/<id> znode -- shared by mutate()
+    /// (alter_version = -1, a manually-submitted mutation) and alter() (alter_version = the metadata
+    /// znode's resulting version, for a mutation submitted atomically alongside an ALTER requiring a
+    /// data rewrite). Snapshots the current block-number watermark for every partition `commands`
+    /// affects (or every partition with active parts, if none named explicitly) via
+    /// coordination.snapshotBlockNumbers() -- see CloudMergeTreeCoordination's class doc comment.
+    ReplicatedMergeTreeMutationEntry buildMutationEntry(
+        const MutationCommands & commands, ContextPtr local_context, int32_t alter_version);
 
     // --- MergeTreeData pure virtuals ---
     // Phase 0: implemented minimally or stubbed (NOT_IMPLEMENTED) until later phases.

@@ -923,10 +923,11 @@ def test_comment_column_cross_replica(cluster):
     # classifies DROP COLUMN (like RENAME COLUMN/DROP INDEX/DROP PROJECTION/DROP STATISTICS) as
     # unconditionally requiring a mutation -- it's not actually metadata-only even on ordinary
     # MergeTree, since existing parts' on-disk column data needs an eventual cleanup pass. That
-    # correctly falls under this step's NOT_IMPLEMENTED scope cut (see
-    # test_alter_requiring_data_rewrite_throws_not_implemented) rather than being a supported
-    # cross-replica case. COMMENT COLUMN is genuinely metadata-only (AlterCommand::isCommentAlter()),
-    # so it exercises the same cross-replica propagation this step actually promises.
+    # now goes through the mutation-carrying ALTER path (see
+    # test_alter_modify_column_rewrites_existing_data and friends) rather than the purely
+    # metadata-only, immediate-propagation case this test is actually about. COMMENT COLUMN is
+    # genuinely metadata-only (AlterCommand::isCommentAlter()), so it exercises that promise
+    # cleanly.
     node1 = cluster.instances["node1"]
     node2 = cluster.instances["node2"]
 
@@ -1023,20 +1024,127 @@ def test_concurrent_alter_add_column_from_both_replicas_both_land(cluster):
     )
 
 
-def test_alter_requiring_data_rewrite_throws_not_implemented(cluster):
+def test_alter_modify_column_rewrites_existing_data(cluster):
     node1 = cluster.instances["node1"]
 
     node1.query(f"CREATE TABLE {TABLE_NAME} {TABLE_DDL}")
-    node1.query(f"INSERT INTO {TABLE_NAME} VALUES (1, 'a')")
+    node1.query(f"INSERT INTO {TABLE_NAME} VALUES (1, '10'), (2, '20')")
 
-    # String -> UInt64 is a valid conversion (passes checkAlterIsPossible) but is not free -- it
-    # requires reparsing and rewriting every existing part, so AlterCommands::getMutationCommands()
-    # returns non-empty and StorageCloudMergeTree::alter() must reject it for now (Phase 4 Step D's
-    # documented scope cut), not silently mishandle it.
-    with pytest.raises(QueryRuntimeException) as exc:
-        node1.query(f"ALTER TABLE {TABLE_NAME} MODIFY COLUMN data UInt64")
-    assert "NOT_IMPLEMENTED" in str(exc.value)
+    node1.query(f"ALTER TABLE {TABLE_NAME} MODIFY COLUMN data UInt64")
 
+    # mutate() is fire-and-forget (no mutations_sync) -- the mutation that rewrites existing parts
+    # to the new type runs asynchronously via the same background selectPartsToMutate() machinery
+    # ALTER TABLE ... UPDATE/DELETE already uses, so give it a window to actually apply.
+    assert_eq_with_retry(node1, f"SELECT sum(data) FROM {TABLE_NAME}", "30")
+    assert node1.query(f"SELECT toTypeName(data) FROM {TABLE_NAME} LIMIT 1").strip() == "UInt64"
+
+    # New inserts land in the new type, and are queried consistently alongside the rewritten rows.
+    node1.query(f"INSERT INTO {TABLE_NAME} VALUES (3, '5')")
+    assert_eq_with_retry(node1, f"SELECT sum(data) FROM {TABLE_NAME}", "35")
+
+
+def test_alter_combining_metadata_and_data_rewrite_commands(cluster):
+    node1 = cluster.instances["node1"]
+
+    node1.query(f"CREATE TABLE {TABLE_NAME} {TABLE_DDL}")
+    node1.query(f"INSERT INTO {TABLE_NAME} VALUES (1, '10')")
+
+    # A single ALTER statement mixing a metadata-only command (ADD COLUMN) and a data-rewrite
+    # command (MODIFY COLUMN type change) -- both must land, committed via the same atomic
+    # metadata+mutation Keeper multi() (the ADD COLUMN's default is metadata-only and applies
+    # immediately; the MODIFY COLUMN's rewrite is mutation-driven and asynchronous).
+    node1.query(
+        f"ALTER TABLE {TABLE_NAME} ADD COLUMN extra UInt64 DEFAULT 7, MODIFY COLUMN data UInt64"
+    )
+
+    assert node1.query(f"SELECT extra FROM {TABLE_NAME} WHERE id = 1").strip() == "7"
+    assert_eq_with_retry(node1, f"SELECT sum(data) FROM {TABLE_NAME}", "10")
+    assert node1.query(f"SELECT toTypeName(data) FROM {TABLE_NAME} LIMIT 1").strip() == "UInt64"
+
+
+def test_alter_modify_column_data_rewrite_visible_on_other_replica(cluster):
+    node1 = cluster.instances["node1"]
+    node2 = cluster.instances["node2"]
+
+    node1.query(f"CREATE TABLE {TABLE_NAME} {TABLE_DDL}")
+    table_uuid = node1.query(
+        f"SELECT uuid FROM system.tables WHERE table = '{TABLE_NAME}'"
+    ).strip()
+    node2.query(f"ATTACH TABLE {TABLE_NAME} UUID '{table_uuid}' {TABLE_DDL}")
+
+    node1.query(f"INSERT INTO {TABLE_NAME} VALUES (1, '10'), (2, '20')")
+    assert_eq_with_retry(node2, f"SELECT count() FROM {TABLE_NAME}", "2")
+
+    node1.query(f"ALTER TABLE {TABLE_NAME} MODIFY COLUMN data UInt64")
+
+    # node2 never ran the ALTER itself -- it must pick up both the schema change (metadata watcher)
+    # and the rewritten data (mutation execution, which any replica -- not just the ALTER's issuer
+    # -- may end up running, same as a manually-submitted mutation).
+    assert_eq_with_retry(
+        node2, f"SELECT sum(data) FROM {TABLE_NAME}", "30", retry_count=40, sleep_time=1
+    )
+    assert node2.query(f"SELECT toTypeName(data) FROM {TABLE_NAME} LIMIT 1").strip() == "UInt64"
+
+
+def test_concurrent_alter_modify_column_from_both_replicas_both_land(cluster):
+    node1 = cluster.instances["node1"]
+    node2 = cluster.instances["node2"]
+    table = "cloud_test_concurrent_modify"
+
+    node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
+    node1.query(
+        f"CREATE TABLE {table} (id UInt64, col_a String, col_b String) ENGINE = CloudMergeTree "
+        f"ORDER BY id SETTINGS storage_policy = 's3'"
+    )
+    try:
+        table_uuid = node1.query(
+            f"SELECT uuid FROM system.tables WHERE table = '{table}'"
+        ).strip()
+        node2.query(
+            f"ATTACH TABLE {table} UUID '{table_uuid}' "
+            f"(id UInt64, col_a String, col_b String) ENGINE = CloudMergeTree "
+            f"ORDER BY id SETTINGS storage_policy = 's3'"
+        )
+
+        node1.query(f"INSERT INTO {table} VALUES (1, '10', '100')")
+        assert_eq_with_retry(node2, f"SELECT count() FROM {table}", "1")
+
+        # Both replicas race to MODIFY a different column's type at once: the atomic
+        # metadata+mutation multi()'s CAS-fenced retry (reload the latest columns, reapply,
+        # retry) must let both metadata changes -- and both mutations -- land, not silently
+        # drop one, same as the existing ADD COLUMN concurrent-ALTER test's intent.
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [
+                executor.submit(
+                    node1.query, f"ALTER TABLE {table} MODIFY COLUMN col_a UInt64"
+                ),
+                executor.submit(
+                    node2.query, f"ALTER TABLE {table} MODIFY COLUMN col_b UInt64"
+                ),
+            ]
+            for future in futures:
+                future.result()
+
+        assert_eq_with_retry(
+            node1, f"SELECT toTypeName(col_a) FROM {table} LIMIT 1", "UInt64",
+            retry_count=40, sleep_time=1,
+        )
+        assert_eq_with_retry(
+            node1, f"SELECT toTypeName(col_b) FROM {table} LIMIT 1", "UInt64",
+            retry_count=40, sleep_time=1,
+        )
+        assert_eq_with_retry(node1, f"SELECT col_a FROM {table} WHERE id = 1", "10")
+        assert_eq_with_retry(node1, f"SELECT col_b FROM {table} WHERE id = 1", "100")
+        assert_eq_with_retry(
+            node2, f"SELECT toTypeName(col_a) FROM {table} LIMIT 1", "UInt64",
+            retry_count=40, sleep_time=1,
+        )
+        assert_eq_with_retry(
+            node2, f"SELECT toTypeName(col_b) FROM {table} LIMIT 1", "UInt64",
+            retry_count=40, sleep_time=1,
+        )
+    finally:
+        node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
 
 def test_attach_with_mismatched_columns_throws_incompatible_columns(cluster):
     node1 = cluster.instances["node1"]

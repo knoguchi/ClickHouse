@@ -354,4 +354,23 @@ Coordination::Error CloudMergeTreeCoordination::trySetMetadata(
     return code;
 }
 
+std::expected<CloudMergeTreeCoordination::MetadataAndMutationResult, Coordination::Error>
+CloudMergeTreeCoordination::trySetMetadataAndCreateMutation(
+    const zkutil::ZooKeeperPtr & zk, const String & new_columns_text, int32_t expected_metadata_version,
+    const String & mutation_entry_text) const
+{
+    Coordination::Requests ops;
+    ops.emplace_back(zkutil::makeSetRequest(metadataPath(), new_columns_text, expected_metadata_version));
+    ops.emplace_back(zkutil::makeCreateRequest(mutationsPath() + "/", mutation_entry_text, zkutil::CreateMode::PersistentSequential));
+
+    Coordination::Responses responses;
+    auto code = zk->tryMultiNoThrow(ops, responses);
+    if (code != Coordination::Error::ZOK)
+        return std::unexpected(code);
+
+    const auto & create_response = dynamic_cast<const Coordination::CreateResponse &>(*responses[1]);
+    String mutation_id = create_response.path_created.substr(mutationsPath().size() + 1);
+    return MetadataAndMutationResult{expected_metadata_version + 1, mutation_id};
+}
+
 }

@@ -830,9 +830,9 @@ void StorageCloudMergeTree::checkAlterIsPossible(const AlterCommands & commands,
     }
 }
 
-void StorageCloudMergeTree::mutate(const MutationCommands & commands, ContextPtr local_context)
+ReplicatedMergeTreeMutationEntry StorageCloudMergeTree::buildMutationEntry(
+    const MutationCommands & commands, ContextPtr local_context, int32_t alter_version)
 {
-    auto component_guard = Coordination::setCurrentComponent("StorageCloudMergeTree::mutate");
     auto zk = getZooKeeper();
 
     std::set<String> affected_partition_ids = getPartitionIdsAffectedByCommands(commands, local_context);
@@ -848,13 +848,22 @@ void StorageCloudMergeTree::mutate(const MutationCommands & commands, ContextPtr
     entry.create_time = time(nullptr);
     entry.source_replica = toString(ServerUUID::get());
     entry.commands = commands;
-    /// alter_version stays -1 (its "not an ALTER-metadata-driven mutation" default): CloudMergeTree
-    /// has no ALTER ADD/DROP/MODIFY COLUMN yet (DESIGN.md Phase 4 Step D, not built), so there is no
-    /// metadata-alter-vs-mutation ordering to record.
+    entry.alter_version = alter_version;
     if (!affected_partition_ids.empty())
         entry.block_numbers = coordination.snapshotBlockNumbers(zk, affected_partition_ids);
 
-    coordination.createMutation(zk, entry.toString());
+    return entry;
+}
+
+void StorageCloudMergeTree::mutate(const MutationCommands & commands, ContextPtr local_context)
+{
+    auto component_guard = Coordination::setCurrentComponent("StorageCloudMergeTree::mutate");
+    /// alter_version -1: this is its "not an ALTER-metadata-driven mutation" default -- a manually
+    /// submitted mutation (ALTER TABLE ... UPDATE/DELETE) has no metadata-alter-vs-mutation ordering
+    /// to record. See alter() below for the ALTER-driven case, which passes its own resulting
+    /// metadata version instead.
+    auto entry = buildMutationEntry(commands, local_context, /*alter_version=*/ -1);
+    coordination.createMutation(getZooKeeper(), entry.toString());
 }
 
 void StorageCloudMergeTree::checkMutationIsPossible(const MutationCommands &, const Settings &) const
@@ -870,18 +879,6 @@ void StorageCloudMergeTree::alter(const AlterCommands & params, ContextPtr local
 
     auto table_id = getStorageID();
     auto metadata_snapshot = getInMemoryMetadataPtr(local_context, false);
-    StorageInMemoryMetadata new_metadata = *metadata_snapshot;
-
-    /// A command needing an actual data rewrite (e.g. a genuine type conversion) is out of scope
-    /// for this step -- see the Phase 4 Step D plan's scope cut. Detected the same way
-    /// StorageMergeTree::alter() does: getMutationCommands() returns non-empty only for commands
-    /// that can't be satisfied by a metadata-only change. Called before apply() below, against the
-    /// still-unmodified metadata, matching upstream's own ordering.
-    auto mutation_commands = params.getMutationCommands(new_metadata, /*materialize_ttl=*/ false, local_context, /*with_alters=*/ false);
-    if (!mutation_commands.empty())
-        throw Exception(ErrorCodes::NOT_IMPLEMENTED,
-            "ALTER commands requiring a data rewrite are not yet implemented for CloudMergeTree");
-
     auto zk = getZooKeeper();
 
     /// The very first CAS attempt must be just as content-consistent with its fenced version as
@@ -894,43 +891,84 @@ void StorageCloudMergeTree::alter(const AlterCommands & params, ContextPtr local
     /// number, not that our payload actually derives from that version's content -- overwriting
     /// the other replica's change instead of stacking on top of it, with no ZBADVERSION to catch
     /// it. Reproduced reliably under two concurrent ALTERs from different replicas.
-    auto [initial_columns_text, expected_version] = coordination.getMetadata(zk);
-    new_metadata.columns = ColumnsDescription::parse(initial_columns_text);
-    params.apply(new_metadata, local_context);
+    auto initial = coordination.getMetadata(zk);
+    String columns_text = initial.first;
+    int32_t expected_version = initial.second;
 
-    /// Bounded retry against a concurrent ALTER from another replica: trySetMetadata()'s CAS fails
-    /// closed (ZBADVERSION) if the version we fenced on is stale, same fail-closed/retry shape
-    /// removeActivePartsMatching() and commitMergedPart() already rely on elsewhere in this file.
+    /// Bounded retry against a concurrent ALTER from another replica: trySetMetadata()'s (and
+    /// trySetMetadataAndCreateMutation()'s) CAS fails closed (ZBADVERSION) if the version we
+    /// fenced on is stale, same fail-closed/retry shape removeActivePartsMatching() and
+    /// commitMergedPart() already rely on elsewhere in this file.
     for (int attempt = 0; attempt < 20; ++attempt)
     {
-        int32_t new_version = 0;
-        auto code = coordination.trySetMetadata(
-            zk, new_metadata.getColumns().toString(/*include_comments=*/ true), expected_version, new_version);
+        StorageInMemoryMetadata new_metadata = *metadata_snapshot;
+        new_metadata.columns = ColumnsDescription::parse(columns_text);
 
-        if (code == Coordination::Error::ZOK)
+        /// getMutationCommands() must be recomputed against THIS attempt's own baseline every time
+        /// (not just once, up front) -- the same content/version-consistency reasoning as above: a
+        /// command's mutation-requiring-ness can depend on a column's CURRENT type, which must come
+        /// from the same Keeper read that fences this attempt's CAS. Called before apply() below,
+        /// against the still-unmodified metadata, matching upstream's own ordering.
+        auto mutation_commands = params.getMutationCommands(new_metadata, /*materialize_ttl=*/ false, local_context, /*with_alters=*/ false);
+        params.apply(new_metadata, local_context);
+        String new_columns_text = new_metadata.getColumns().toString(/*include_comments=*/ true);
+
+        if (mutation_commands.empty())
         {
-            new_metadata.setMetadataVersion(new_version);
-            /// Safe because checkAlterIsPossible() already validated this metadata (invoked
-            /// automatically by the standard AlterCommands validation path before alter() is
-            /// called, same as every other MergeTree engine).
-            DatabaseCatalog::instance().getDatabase(table_id.database_name)
-                ->alterTable(local_context, table_id, new_metadata, /*validate_new_create_query=*/ true);
-            setInMemoryMetadata(new_metadata);
-            current_metadata_version.store(new_version);
-            return;
+            int32_t new_version = 0;
+            auto code = coordination.trySetMetadata(zk, new_columns_text, expected_version, new_version);
+
+            if (code == Coordination::Error::ZOK)
+            {
+                new_metadata.setMetadataVersion(new_version);
+                /// Safe because checkAlterIsPossible() already validated this metadata (invoked
+                /// automatically by the standard AlterCommands validation path before alter() is
+                /// called, same as every other MergeTree engine).
+                DatabaseCatalog::instance().getDatabase(table_id.database_name)
+                    ->alterTable(local_context, table_id, new_metadata, /*validate_new_create_query=*/ true);
+                setInMemoryMetadata(new_metadata);
+                current_metadata_version.store(new_version);
+                return;
+            }
+
+            if (code != Coordination::Error::ZBADVERSION)
+                throw zkutil::KeeperException(code, "Cannot update metadata in Keeper for table {}", table_id.getNameForLogs());
+        }
+        else
+        {
+            /// A command requiring an actual data rewrite (e.g. a genuine type conversion): commit
+            /// the metadata change and the mutation that migrates existing parts to it atomically
+            /// together, in one multi() -- mirrors StorageReplicatedMergeTree::alter()'s own
+            /// atomic-together shape (DESIGN.md invariant 3's "exactly-once materialization"). A
+            /// crash between two *separate* writes would otherwise leave either a live schema
+            /// change with no mutation to ever rewrite old-typed data, or an orphaned mutation
+            /// naming a metadata state that was never actually published.
+            int32_t new_version_if_success = expected_version + 1;
+            auto entry = buildMutationEntry(mutation_commands, local_context, new_version_if_success);
+            auto result = coordination.trySetMetadataAndCreateMutation(zk, new_columns_text, expected_version, entry.toString());
+
+            if (result.has_value())
+            {
+                new_metadata.setMetadataVersion(result->new_metadata_version);
+                DatabaseCatalog::instance().getDatabase(table_id.database_name)
+                    ->alterTable(local_context, table_id, new_metadata, /*validate_new_create_query=*/ true);
+                setInMemoryMetadata(new_metadata);
+                current_metadata_version.store(result->new_metadata_version);
+                return;
+            }
+
+            if (result.error() != Coordination::Error::ZBADVERSION)
+                throw zkutil::KeeperException(result.error(),
+                    "Cannot update metadata and create mutation in Keeper for table {}", table_id.getNameForLogs());
         }
 
-        if (code != Coordination::Error::ZBADVERSION)
-            throw zkutil::KeeperException(code, "Cannot update metadata in Keeper for table {}", table_id.getNameForLogs());
-
-        /// Someone else's ALTER landed first: reload the actual current columns and rebuild our
-        /// target metadata on top of THAT fresh baseline, not our now-stale snapshot, before
-        /// retrying -- otherwise we'd silently clobber their change instead of stacking on it.
-        auto [latest_columns_text, latest_version] = coordination.getMetadata(zk);
-        expected_version = latest_version;
-        new_metadata = *metadata_snapshot;
-        new_metadata.columns = ColumnsDescription::parse(latest_columns_text);
-        params.apply(new_metadata, local_context);
+        /// Someone else's ALTER landed first: reload the actual current columns and version, and
+        /// retry from the top of the loop, which rebuilds new_metadata/mutation_commands against
+        /// THAT fresh baseline -- not our now-stale snapshot, otherwise we'd silently clobber their
+        /// change instead of stacking on it.
+        auto latest = coordination.getMetadata(zk);
+        columns_text = latest.first;
+        expected_version = latest.second;
     }
 
     throw Exception(ErrorCodes::LOGICAL_ERROR,
