@@ -97,6 +97,19 @@ without a heartbeat before another replica is allowed to steal it. Bounds
 how long a merge can be stuck (crashed holder, wedged replica) before
 another replica retries the same range.
 )", 0) \
+    DECLARE(UInt64, cloud_merge_tree_gc_grace_period_seconds, 480, R"(
+`CloudMergeTree` only. How long (in seconds) a part must have been absent
+from the active Keeper part set before the parts-killer GC task may
+physically delete its objects on shared storage. Bounds how long a reader
+on any replica that already resolved the part before it left the active
+set has to finish, mirroring `old_parts_lifetime`'s role for local
+Outdated-part cleanup on ordinary `MergeTree` -- except keyed off when the
+part left Keeper's canonical set, not a local refcount.
+)", 0) \
+    DECLARE(UInt64, cloud_merge_tree_gc_interval_ms, 30000, R"(
+`CloudMergeTree` only. How often (in milliseconds) the parts-killer GC
+background task scans for tombstoned parts past their grace period.
+)", 0) \
     DECLARE(Float, ratio_of_defaults_for_sparse_serialization, 0.9375f, R"(
 Minimal ratio of the number of _default_ values to the number of _all_ values
 in a column. Setting this value causes the column to be stored using sparse

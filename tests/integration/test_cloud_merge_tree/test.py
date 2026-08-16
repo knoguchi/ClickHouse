@@ -9,6 +9,18 @@ from helpers.test_tools import assert_eq_with_retry
 
 TABLE_NAME = "cloud_test"
 
+# Low grace period/interval so the Phase 3 GC tests below don't need to wait minutes for the
+# parts-killer to run -- production defaults (480s grace period) are exercised by the setting's
+# own default, not by these tests, which only need to prove the mechanism works at all. The grace
+# period still needs a comfortable margin over ordinary Python-side query round-trip time: a
+# background merge can tombstone parts well before the test gets around to checking them, so too
+# short a grace period races the "not deleted yet" assertion against the test's own overhead.
+GC_TABLE_DDL_SETTINGS = (
+    "storage_policy = 's3', "
+    "cloud_merge_tree_gc_grace_period_seconds = 15, "
+    "cloud_merge_tree_gc_interval_ms = 1000"
+)
+
 TABLE_DDL = """
     (id UInt64, data String)
     ENGINE = CloudMergeTree
@@ -48,6 +60,13 @@ def drop_table(cluster):
     yield
     for node in cluster.instances.values():
         node.query(f"DROP TABLE IF EXISTS {TABLE_NAME} SYNC")
+
+
+def list_objects(cluster, path="data/"):
+    minio = cluster.minio_client
+    objects = list(minio.list_objects(cluster.minio_bucket, path, recursive=True))
+    logging.info(f"list_objects ({len(objects)}): {[x.object_name for x in objects]}")
+    return objects
 
 
 def test_second_replica_sees_inserts_without_peer_fetch(cluster):
@@ -193,11 +212,14 @@ def test_optimize_merges_all_parts_and_propagates_to_second_replica(cluster):
     for i in range(1, row_count + 1):
         node1.query(f"INSERT INTO {TABLE_NAME} VALUES ({i}, 'v{i}')")
 
+    # Not asserting an exact pre-merge active-part count here: background merging
+    # (scheduleDataProcessingJob) can legitimately consolidate some of these 5 inserts before
+    # this check runs (more likely under load from other concurrently-running tests), same
+    # reasoning as test_concurrent_multi_writer_insert_no_collision_or_loss above. The row count
+    # is what actually matters and is checked below regardless of how many parts it's split
+    # across; _optimize_until_single_part converges to 1 part from any starting state.
     assert (
-        node1.query(
-            f"SELECT count() FROM system.parts WHERE table = '{TABLE_NAME}' AND active"
-        ).strip()
-        == str(row_count)
+        node1.query(f"SELECT count() FROM {TABLE_NAME}").strip() == str(row_count)
     )
 
     expected_sum = str(row_count * (row_count + 1) // 2)
@@ -289,3 +311,160 @@ def test_concurrent_optimize_race_exactly_one_winner(cluster):
         f"'/clickhouse/cloud_tables/{table_uuid}/leases'"
     ).strip()
     assert leases == "0"
+
+
+def test_merge_source_objects_survive_grace_period_then_get_collected(cluster):
+    node1 = cluster.instances["node1"]
+    table = "cloud_test_gc_merge"
+
+    node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
+    node1.query(
+        f"CREATE TABLE {table} (id UInt64, data String) ENGINE = CloudMergeTree "
+        f"ORDER BY id SETTINGS {GC_TABLE_DDL_SETTINGS}"
+    )
+    try:
+        table_uuid = node1.query(
+            f"SELECT uuid FROM system.tables WHERE table = '{table}'"
+        ).strip()
+
+        row_count = 5
+        for i in range(1, row_count + 1):
+            node1.query(f"INSERT INTO {table} VALUES ({i}, 'v{i}')")
+
+        # Not asserting an exact pre-merge active-part count or tombstone count below: background
+        # merging can legitimately consolidate some of these 5 inserts (into one or more
+        # intermediate merges, each tombstoning its own sources) before this test's own OPTIMIZE
+        # call runs, more so under load from other concurrently-running tests. The row count is
+        # what actually matters and is checked below; "at least one tombstone exists" is enough
+        # to prove the mechanism engaged at all, regardless of exactly how many merges produced it.
+        assert (
+            node1.query(f"SELECT count() FROM {table}").strip() == str(row_count)
+        )
+        expected_sum = str(row_count * (row_count + 1) // 2)
+
+        objects_before_merge = list_objects(cluster)
+
+        node1.query(f"OPTIMIZE TABLE {table}")
+        assert_eq_with_retry(
+            node1,
+            f"SELECT count() FROM system.parts WHERE table = '{table}' AND active",
+            "1",
+        )
+
+        # The merge's sources are Keeper-deactivated and tombstoned atomically with the merge
+        # commit (DESIGN.md invariant 3 is unaffected -- this just rides more ops in the same
+        # multi()).
+        assert (
+            int(
+                node1.query(
+                    f"SELECT count() FROM system.zookeeper WHERE path = "
+                    f"'/clickhouse/cloud_tables/{table_uuid}/dropped_parts'"
+                ).strip()
+            )
+            > 0
+        )
+
+        # Not deleted yet -- the grace period hasn't elapsed. The merged part's own objects are
+        # now additionally present alongside the not-yet-reclaimed sources, so the meaningful
+        # comparison is against the post-GC count below (a strict decrease), not against the
+        # pre-merge baseline (which the new part's objects would legitimately push above).
+        objects_immediately_after = list_objects(cluster)
+        assert len(objects_immediately_after) >= len(objects_before_merge)
+
+        # Wait past grace_period + gc_interval: the parts-killer physically deletes the sources'
+        # objects and drains their tombstones.
+        assert_eq_with_retry(
+            node1,
+            f"SELECT count() FROM system.zookeeper WHERE path = "
+            f"'/clickhouse/cloud_tables/{table_uuid}/dropped_parts'",
+            "0",
+            retry_count=30,
+            sleep_time=1,
+        )
+
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            remaining = list_objects(cluster)
+            if len(remaining) < len(objects_immediately_after):
+                break
+            time.sleep(1)
+        else:
+            raise AssertionError(
+                "Merge source parts' S3 objects were not garbage collected within timeout"
+            )
+
+        # Data itself is untouched -- only the superseded sources' objects were reclaimed.
+        assert node1.query(f"SELECT count() FROM {table}").strip() == str(row_count)
+        assert node1.query(f"SELECT sum(id) FROM {table}").strip() == expected_sum
+    finally:
+        # The drop_table autouse fixture only cleans up TABLE_NAME ("cloud_test") -- this test
+        # uses its own name, and leaving it (and its still-running parts_killer_task) attached
+        # would compete with every later test's BackgroundSchedulePool tasks for the rest of the
+        # suite run. Must run even on assertion failure, not just on success.
+        node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
+
+
+def test_drop_table_objects_survive_grace_period_then_get_collected(cluster):
+    node1 = cluster.instances["node1"]
+    node2 = cluster.instances["node2"]
+    table = "cloud_test_gc_drop"
+
+    node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
+    node2.query(f"DROP TABLE IF EXISTS {table} SYNC")
+    node1.query(
+        f"CREATE TABLE {table} (id UInt64, data String) ENGINE = CloudMergeTree "
+        f"ORDER BY id SETTINGS {GC_TABLE_DDL_SETTINGS}"
+    )
+    table_uuid = node1.query(
+        f"SELECT uuid FROM system.tables WHERE table = '{table}'"
+    ).strip()
+    node2.query(
+        f"ATTACH TABLE {table} UUID '{table_uuid}' (id UInt64, data String) "
+        f"ENGINE = CloudMergeTree ORDER BY id SETTINGS {GC_TABLE_DDL_SETTINGS}"
+    )
+    try:
+        for i in range(1, 4):
+            node1.query(f"INSERT INTO {table} VALUES ({i}, 'v{i}')")
+
+        active_part_names = node1.query(
+            f"SELECT name FROM system.parts WHERE table = '{table}' AND active"
+        ).strip().splitlines()
+        assert len(active_part_names) > 0
+
+        # Drop only on node1 -- node2 keeps its own StorageCloudMergeTree object (and
+        # parts-killer task) alive to actually perform the physical cleanup. If every replica
+        # dropped the table, no live GC task would remain to drain these tombstones; that
+        # liveness gap is a known, documented limitation of this phase (see DESIGN.md
+        # discussion), not something this test exercises.
+        node1.query(f"DROP TABLE {table} SYNC")
+
+        # Objects survive immediately after DROP -- this is the regression check proving
+        # physical deletion is no longer inline with the DROP TABLE query. Checked via Keeper
+        # tombstones for the exact parts this DROP deactivated (precise -- not confused by an
+        # unrelated, earlier background merge's tombstones independently aging out around the
+        # same time), not via a raw object-count delta.
+        tombstoned = node1.query(
+            f"SELECT name FROM system.zookeeper WHERE path = "
+            f"'/clickhouse/cloud_tables/{table_uuid}/dropped_parts'"
+        ).strip().splitlines()
+        assert set(active_part_names) <= set(tombstoned)
+
+        # Wait past grace_period + gc_interval: the parts-killer physically deletes this
+        # table's objects and drains its tombstones. Checked via Keeper, not a raw S3
+        # object-count delta -- other tests' tables can leave permanently-orphaned objects behind
+        # (the documented liveness gap: no live replica left to run their own trailing cleanup
+        # once every replica has dropped a table), which would otherwise make "did the total
+        # object count go down" an unreliable signal for this table's own reclaim specifically.
+        assert_eq_with_retry(
+            node1,
+            f"SELECT count() FROM system.zookeeper WHERE path = "
+            f"'/clickhouse/cloud_tables/{table_uuid}/dropped_parts'",
+            "0",
+            retry_count=30,
+            sleep_time=1,
+        )
+    finally:
+        # Same reasoning as the merge test's finally: this table's name isn't covered by the
+        # drop_table autouse fixture, and node2's copy must not outlive the test (its
+        # parts_killer_task would otherwise keep running for the rest of the suite).
+        node2.query(f"DROP TABLE IF EXISTS {table} SYNC")

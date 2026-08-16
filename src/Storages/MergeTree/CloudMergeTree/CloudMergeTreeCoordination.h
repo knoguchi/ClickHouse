@@ -23,6 +23,13 @@ namespace DB
   *   leases/<range>             -> merge/mutation assignment leases (ephemeral)
   *   replicas/<session>         -> replica liveness (ephemeral, owns no parts)
   *   temp/                      -> in-flight registrations for crash cleanup
+  *   dropped_parts/<part_name>  -> tombstone (value = ms-since-epoch when the part left parts/),
+  *                                 written atomically with its parts/<part_name> removal. The
+  *                                 parts-killer GC task physically deletes a tombstoned part's
+  *                                 shared-storage objects once cloud_merge_tree_gc_grace_period_seconds
+  *                                 has elapsed, then removes the tombstone.
+  *     .../claim                -> ephemeral, held only while a replica is actively deleting that
+  *                                 part's objects; self-heals on crash via session death.
   *
   * All methods take the ZooKeeperPtr per call so a session reconnect cannot leave
   * the object holding a dead handle (mirrors StorageReplicatedMergeTree).
@@ -41,6 +48,9 @@ public:
     String leasesPath() const { return root_path + "/leases"; }
     String leasePath(const String & merged_part_name) const { return leasesPath() + "/" + merged_part_name; }
     String dropMarkerPath() const { return root_path + "/dropped"; }
+    String droppedPartsPath() const { return root_path + "/dropped_parts"; }
+    String droppedPartPath(const String & part_name) const { return droppedPartsPath() + "/" + part_name; }
+    String droppedPartClaimPath(const String & part_name) const { return droppedPartPath(part_name) + "/claim"; }
 
     /// Idempotently create the root node hierarchy. Safe to call from every replica on startup.
     void createRootNodes(const zkutil::ZooKeeperPtr & zk) const;
@@ -103,16 +113,40 @@ public:
     /// DROP: atomically deactivate parts. Object data is left for GC, never deleted inline.
     Coordination::Error tryRemoveParts(const zkutil::ZooKeeperPtr & zk, const Strings & part_names) const;
 
-    /// DROP: every replica gets its own independent DROP TABLE query (there is no single
-    /// coordinator), but the table's data lives on storage shared by all of them. Without this,
-    /// every replica's drop() would call dropAllData() on the same shared directory concurrently
-    /// -- plain_rewritable's metadata layer detects the resulting racing move/delete against the
-    /// same object and fails (or, in a debug/sanitizer build with content validation enabled,
-    /// throws and retries forever). Only the replica that wins this Keeper CAS may physically
-    /// delete the shared data; the rest must skip that step entirely. Persistent (not ephemeral):
-    /// the marker must outlive the winner's own session so a crash mid-cleanup doesn't let a
-    /// second replica start deleting concurrently with a retry.
-    bool tryClaimPhysicalDrop(const zkutil::ZooKeeperPtr & zk) const;
+    /// DROP: marks that DROP TABLE was issued for this table. Every replica gets its own
+    /// independent DROP TABLE query and may call this concurrently -- idempotent, ZNODEEXISTS
+    /// from a losing racer is treated as success, the marker only needs to exist once. Physical
+    /// cleanup is no longer gated on winning this call (each part is now individually tombstoned
+    /// and claimed for deletion by the parts-killer GC task, see dropped_parts/ above); this
+    /// marker is read by that same GC task as "once parts/ and dropped_parts/ are both empty for
+    /// this table, the table root directory itself is safe to remove."
+    Coordination::Error markTableDropped(const zkutil::ZooKeeperPtr & zk) const;
+
+    /// A tombstoned part awaiting GC: its name and when it left parts/ (ms since epoch).
+    struct Tombstone
+    {
+        String part_name;
+        Int64 dropped_at_ms;
+    };
+
+    /// List all tombstones currently recorded under dropped_parts/, with their drop timestamps.
+    std::vector<Tombstone> listTombstones(const zkutil::ZooKeeperPtr & zk) const;
+
+    /// Best-effort mutual exclusion for physically deleting one tombstoned part's objects.
+    /// Returns true iff we now hold the claim; false (ZNODEEXISTS) means another replica's GC
+    /// cycle already claimed it -- skip, don't retry this cycle. Ephemeral: a crashed claimant's
+    /// claim vanishes with its session, unblocking retry without needing a staleness threshold
+    /// (GC claims are held only for the duration of one delete, much shorter than a Keeper
+    /// session timeout).
+    bool tryClaimTombstoneForDeletion(const zkutil::ZooKeeperPtr & zk, const String & part_name) const;
+
+    /// Release a claim without removing the tombstone (e.g. the delete failed) so another
+    /// replica's next cycle can retry promptly rather than waiting for session death.
+    void releaseTombstoneClaim(const zkutil::ZooKeeperPtr & zk, const String & part_name) const;
+
+    /// Remove a tombstone and its claim together, atomically, once its objects are confirmed
+    /// deleted. Safe/no-op if already gone (a concurrent retry got there first).
+    void releaseTombstone(const zkutil::ZooKeeperPtr & zk, const String & part_name) const;
 
     /// Load the current active part set. Fills out_parts_version with the parts-parent cversion,
     /// the monotonic part-set version used for change detection and read snapshots.

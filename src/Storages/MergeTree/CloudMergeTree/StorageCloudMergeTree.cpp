@@ -25,6 +25,7 @@
 #include <Core/UUID.h>
 #include <Core/ServerUUID.h>
 #include <base/defines.h>
+#include <chrono>
 #include <filesystem>
 
 namespace ProfileEvents
@@ -49,6 +50,8 @@ namespace MergeTreeSetting
 {
     extern const MergeTreeSettingsUInt64 parts_to_throw_insert;
     extern const MergeTreeSettingsUInt64 cloud_merge_tree_lease_staleness_ms;
+    extern const MergeTreeSettingsUInt64 cloud_merge_tree_gc_grace_period_seconds;
+    extern const MergeTreeSettingsUInt64 cloud_merge_tree_gc_interval_ms;
     extern const MergeTreeSettingsSeconds lock_acquire_timeout_for_background_operations;
 }
 
@@ -134,6 +137,11 @@ StorageCloudMergeTree::StorageCloudMergeTree(
             getStorageID(), getStorageID().getFullTableName() + " (CloudMergeTree::partSetUpdatingTask)",
             [this] { updatePartSetFromKeeper(); });
         part_set_updating_task->deactivate();
+
+        parts_killer_task = getContext()->getSchedulePool()->createTask(
+            getStorageID(), getStorageID().getFullTableName() + " (CloudMergeTree::partsKillerTask)",
+            [this] { runPartsKillerCycle(); });
+        parts_killer_task->deactivate();
     }
     else
     {
@@ -188,6 +196,7 @@ void StorageCloudMergeTree::startup()
     clearOldTemporaryDirectories(0, {"tmp_", "delete_tmp_", "tmp-fetch_"});
 
     part_set_updating_task->activateAndSchedule();
+    parts_killer_task->activateAndSchedule();
     background_operations_assignee.start();
 }
 
@@ -198,6 +207,9 @@ void StorageCloudMergeTree::shutdown(bool)
 
     if (part_set_updating_task)
         part_set_updating_task->deactivate();
+
+    if (parts_killer_task)
+        parts_killer_task->deactivate();
 
     background_operations_assignee.finish();
 
@@ -337,12 +349,14 @@ void StorageCloudMergeTree::drop()
 {
     shutdown(true);
 
-    /// Remove the canonical part set from Keeper, then the data. Object GC ownership lands in
-    /// Phase 3; for Phase 0 a DROP of the whole table removes its data directly. Every replica
-    /// gets its own independent DROP TABLE query and would otherwise call dropAllData() on the
-    /// same shared directory concurrently -- only the replica that wins the Keeper claim below
-    /// may do so.
-    bool should_physically_drop = true;
+    /// Remove the canonical part set from Keeper synchronously -- every replica gets its own
+    /// independent DROP TABLE query, and this is cheap/fast regardless of how many replicas run
+    /// it concurrently (each part's remove-and-tombstone multi() is independent). Physical
+    /// shared-storage deletion is NOT done here: S3 deletion is slow, and per DESIGN.md invariant
+    /// 2 it must go through the same grace-period-gated parts-killer GC task as merge-source
+    /// cleanup (see tryRemoveParts, which now tombstones every part it deactivates). The GC task
+    /// also removes the table's own root directory once every part -- active or tombstoned -- has
+    /// drained, gated on the `dropped` marker written below.
     if (!isStaticStorage())
     {
         auto component_guard = Coordination::setCurrentComponent("StorageCloudMergeTree::drop");
@@ -357,11 +371,15 @@ void StorageCloudMergeTree::drop()
                 throw zkutil::KeeperException(code, "Cannot remove parts from Keeper while dropping table {}", getStorageID().getNameForLogs());
         }
 
-        should_physically_drop = coordination.tryClaimPhysicalDrop(zk);
+        auto code = coordination.markTableDropped(zk);
+        if (code != Coordination::Error::ZOK)
+            throw zkutil::KeeperException(code, "Cannot mark table {} as dropped in Keeper", getStorageID().getNameForLogs());
     }
 
-    if (should_physically_drop)
-        dropAllData();
+    /// Local-only teardown: nothing here touches shared storage.
+    auto lock = lockParts();
+    data_parts_indexes.clear();
+    unregisterFromMergeSelection(getSettings());
 }
 
 void StorageCloudMergeTree::truncate(const ASTPtr &, const StorageMetadataPtr &, ContextPtr, TableExclusiveLockHolder &)
@@ -824,6 +842,98 @@ catch (const Coordination::Exception & e)
         part_set_updating_task->scheduleAfter(10000);
     else
         throw;
+}
+
+void StorageCloudMergeTree::runPartsKillerCycle()
+try
+{
+    auto component_guard = Coordination::setCurrentComponent("StorageCloudMergeTree::runPartsKillerCycle");
+    auto zk = getZooKeeper();
+
+    const auto settings = getSettings();
+    const Int64 grace_period_ms = static_cast<Int64>((*settings)[MergeTreeSetting::cloud_merge_tree_gc_grace_period_seconds]) * 1000;
+    const UInt64 interval_ms = (*settings)[MergeTreeSetting::cloud_merge_tree_gc_interval_ms];
+    const Int64 now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+
+    auto disks = getStoragePolicy()->getDisks();
+    const auto & disk = disks.front();
+
+    for (const auto & tombstone : coordination.listTombstones(zk))
+    {
+        if (now_ms - tombstone.dropped_at_ms < grace_period_ms)
+            continue;
+
+        /// Defensive, close to a no-op in practice: leases are keyed by merge *result* names,
+        /// never by source names, so a live lease essentially never covers a tombstoned source
+        /// part. Kept as a cheap trip-wire, not real protection -- the grace period above is
+        /// what actually guards against a concurrent reader on another replica.
+        if (zk->exists(coordination.leasePath(tombstone.part_name)))
+            continue;
+
+        if (!coordination.tryClaimTombstoneForDeletion(zk, tombstone.part_name))
+            continue; /// another replica's GC cycle claimed it first this round
+
+        try
+        {
+            auto part_path = std::filesystem::path(getRelativeDataPath()) / tombstone.part_name;
+            if (disk->existsDirectory(part_path))
+                disk->removeRecursive(part_path);
+            coordination.releaseTombstone(zk, tombstone.part_name);
+        }
+        catch (...)
+        {
+            coordination.releaseTombstoneClaim(zk, tombstone.part_name);
+            tryLogCurrentException(getLogger("StorageCloudMergeTree"),
+                fmt::format("Failed to physically delete tombstoned part {}, will retry", tombstone.part_name));
+        }
+    }
+
+    /// Trailing table-directory teardown: once DROP TABLE has been issued (the `dropped` marker
+    /// exists, written by drop()) and every part -- active or tombstoned -- has drained, the
+    /// table's own root directory is safe to remove. Mirrors dropAllData()'s own sequence
+    /// exactly (format_version.txt, then detached/moving, then the now-flat root) rather than a
+    /// single removeRecursive() on the still-nested root directly: that blanket call was tried
+    /// first and reproducibly orphaned the underlying S3 objects -- plain_rewritable's
+    /// remove-recursive "move to a garbage name, then finalize the delete" sequence renamed the
+    /// directory (making it logically unreachable) but the objects themselves were never
+    /// actually deleted, silently leaking them forever. Test A's per-part removeRecursive calls
+    /// never hit this because a part directory has no nested subdirectories; the table root does
+    /// (detached/), which is what the flat sequence below avoids by removing each piece before
+    /// the final recursive call ever sees anything nested under it.
+    int32_t unused_version = 0;
+    if (zk->exists(coordination.dropMarkerPath())
+        && coordination.loadActivePartNames(zk, unused_version).empty()
+        && coordination.listTombstones(zk).empty())
+    {
+        auto table_path = getRelativeDataPath();
+        if (disk->existsDirectory(table_path))
+        {
+            disk->removeFileIfExists(std::filesystem::path(table_path) / MergeTreeData::FORMAT_VERSION_FILE_NAME);
+
+            auto detached_path = std::filesystem::path(table_path) / MergeTreeData::DETACHED_DIR_NAME;
+            if (disk->existsDirectory(detached_path))
+                disk->removeRecursive(detached_path);
+
+            auto moving_path = std::filesystem::path(table_path) / MergeTreeData::MOVING_DIR_NAME;
+            if (disk->existsDirectory(moving_path))
+                disk->removeRecursive(moving_path);
+
+            disk->removeRecursive(table_path);
+        }
+    }
+
+    parts_killer_task->scheduleAfter(interval_ms);
+}
+catch (const Coordination::Exception & e)
+{
+    tryLogCurrentException(getLogger("StorageCloudMergeTree"), __PRETTY_FUNCTION__);
+    parts_killer_task->scheduleAfter(Coordination::isHardwareError(e.code) ? 10000 : (*getSettings())[MergeTreeSetting::cloud_merge_tree_gc_interval_ms]);
+}
+catch (...)
+{
+    tryLogCurrentException(getLogger("StorageCloudMergeTree"), __PRETTY_FUNCTION__);
+    parts_killer_task->scheduleAfter((*getSettings())[MergeTreeSetting::cloud_merge_tree_gc_interval_ms]);
 }
 
 }

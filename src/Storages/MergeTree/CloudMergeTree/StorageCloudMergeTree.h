@@ -146,6 +146,15 @@ private:
     BackgroundSchedulePoolTaskHolder part_set_updating_task;
     void updatePartSetFromKeeper();
 
+    /// Phase 3 "parts killer": periodically scans dropped_parts/ (tombstones written atomically
+    /// whenever a part leaves the active Keeper set -- merge sources, or a dropped table's parts)
+    /// and physically deletes a tombstoned part's shared-storage objects once
+    /// cloud_merge_tree_gc_grace_period_seconds has elapsed, per DESIGN.md invariant 2. Simple
+    /// polling on cloud_merge_tree_gc_interval_ms, not watch-driven -- GC latency is bounded by
+    /// the grace period regardless, unlike part_set_updating_task's correctness-critical immediacy.
+    BackgroundSchedulePoolTaskHolder parts_killer_task;
+    void runPartsKillerCycle();
+
     /// Serialize a part's columns+checksums into the header stored in its znode.
     String serializePartHeader(const DataPartPtr & part) const;
 

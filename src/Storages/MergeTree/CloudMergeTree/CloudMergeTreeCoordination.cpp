@@ -1,6 +1,8 @@
 #include <Storages/MergeTree/CloudMergeTree/CloudMergeTreeCoordination.h>
 
 #include <Common/ZooKeeper/KeeperException.h>
+#include <IO/ReadHelpers.h>
+#include <IO/WriteHelpers.h>
 #include <chrono>
 
 namespace DB
@@ -13,6 +15,12 @@ namespace
         while (!s.empty() && s.back() == '/')
             s.pop_back();
         return s;
+    }
+
+    Int64 nowMilliseconds()
+    {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
     }
 }
 
@@ -32,6 +40,7 @@ void CloudMergeTreeCoordination::createRootNodes(const zkutil::ZooKeeperPtr & zk
     zk->createIfNotExists(root_path + "/leases", "");
     zk->createIfNotExists(root_path + "/replicas", "");
     zk->createIfNotExists(tempPath(), "");
+    zk->createIfNotExists(droppedPartsPath(), "");
 }
 
 void CloudMergeTreeCoordination::ensureBlockNumbersPartition(const zkutil::ZooKeeperPtr & zk, const String & partition_id) const
@@ -70,21 +79,18 @@ Coordination::Error CloudMergeTreeCoordination::tryCommitMerge(
     /// Add the merged result.
     ops.emplace_back(zkutil::makeCreateRequest(partPath(merged_part_name), merged_part_header, zkutil::CreateMode::Persistent));
 
-    /// Deactivate the sources in the same atomic step.
+    /// Deactivate the sources and tombstone them in the same atomic step, so the parts-killer
+    /// GC task's grace-period clock starts exactly when the source genuinely left parts/, never
+    /// derived after the fact (Keeper doesn't retain deleted-znode history).
+    const String tombstone_ts = toString(nowMilliseconds());
     for (const auto & source : source_part_names)
+    {
         ops.emplace_back(zkutil::makeRemoveRequest(partPath(source), -1));
+        ops.emplace_back(zkutil::makeCreateRequest(droppedPartPath(source), tombstone_ts, zkutil::CreateMode::Persistent));
+    }
 
     Coordination::Responses responses;
     return zk->tryMultiNoThrow(ops, responses);
-}
-
-namespace
-{
-    Int64 nowMilliseconds()
-    {
-        return std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
-    }
 }
 
 std::expected<CloudMergeTreeCoordination::LeaseHandle, Coordination::Error> CloudMergeTreeCoordination::acquireOrStealLease(
@@ -150,17 +156,62 @@ Coordination::Error CloudMergeTreeCoordination::tryRemoveParts(
     const zkutil::ZooKeeperPtr & zk, const Strings & part_names) const
 {
     Coordination::Requests ops;
+    const String tombstone_ts = toString(nowMilliseconds());
     for (const auto & part_name : part_names)
+    {
         ops.emplace_back(zkutil::makeRemoveRequest(partPath(part_name), -1));
+        ops.emplace_back(zkutil::makeCreateRequest(droppedPartPath(part_name), tombstone_ts, zkutil::CreateMode::Persistent));
+    }
 
     Coordination::Responses responses;
     return zk->tryMultiNoThrow(ops, responses);
 }
 
-bool CloudMergeTreeCoordination::tryClaimPhysicalDrop(const zkutil::ZooKeeperPtr & zk) const
+Coordination::Error CloudMergeTreeCoordination::markTableDropped(const zkutil::ZooKeeperPtr & zk) const
 {
     auto code = zk->tryCreate(dropMarkerPath(), "", zkutil::CreateMode::Persistent);
+    return code == Coordination::Error::ZNODEEXISTS ? Coordination::Error::ZOK : code;
+}
+
+std::vector<CloudMergeTreeCoordination::Tombstone> CloudMergeTreeCoordination::listTombstones(const zkutil::ZooKeeperPtr & zk) const
+{
+    std::vector<Tombstone> result;
+    Strings names = zk->getChildren(droppedPartsPath());
+    result.reserve(names.size());
+    for (const auto & name : names)
+    {
+        String value;
+        if (zk->tryGet(droppedPartPath(name), value) && !value.empty())
+            result.push_back(Tombstone{name, parse<Int64>(value)});
+    }
+    return result;
+}
+
+bool CloudMergeTreeCoordination::tryClaimTombstoneForDeletion(const zkutil::ZooKeeperPtr & zk, const String & part_name) const
+{
+    auto code = zk->tryCreate(droppedPartClaimPath(part_name), "", zkutil::CreateMode::Ephemeral);
     return code == Coordination::Error::ZOK;
+}
+
+void CloudMergeTreeCoordination::releaseTombstoneClaim(const zkutil::ZooKeeperPtr & zk, const String & part_name) const
+{
+    zk->tryRemove(droppedPartClaimPath(part_name), -1);
+}
+
+void CloudMergeTreeCoordination::releaseTombstone(const zkutil::ZooKeeperPtr & zk, const String & part_name) const
+{
+    Coordination::Requests ops;
+    ops.emplace_back(zkutil::makeRemoveRequest(droppedPartClaimPath(part_name), -1));
+    ops.emplace_back(zkutil::makeRemoveRequest(droppedPartPath(part_name), -1));
+
+    Coordination::Responses responses;
+    if (zk->tryMultiNoThrow(ops, responses) == Coordination::Error::ZOK)
+        return;
+
+    /// The claim may already be gone (e.g. a previous attempt deleted the objects but crashed
+    /// before reaching this call, and its ephemeral claim died with its session in the meantime)
+    /// -- fall back to removing just the tombstone. Best-effort, silently ignored if already gone.
+    zk->tryRemove(droppedPartPath(part_name), -1);
 }
 
 Strings CloudMergeTreeCoordination::loadActivePartNames(
