@@ -124,10 +124,10 @@ public:
         MutableDataPartPtr & new_part, const DataPartsVector & source_parts,
         const String & lease_path, int32_t lease_version, ContextPtr local_context);
 
-    /// Plain `OPTIMIZE TABLE t` only: synchronously selects and runs merges (via
-    /// CloudMergePlainMergeTreeTask::executeHere) until nothing more is selectable. Every other
-    /// form (PARTITION/FINAL/DEDUPLICATE/CLEANUP) throws NOT_IMPLEMENTED, same stub style as
-    /// dropPart/dropPartition/attachPartition above.
+    /// `OPTIMIZE TABLE t [PARTITION p] [FINAL] [DEDUPLICATE] [CLEANUP]`: synchronously selects and
+    /// runs merges (via CloudMergePlainMergeTreeTask::executeHere) until nothing more is
+    /// selectable, once per affected partition (all currently-existing partitions for whole-table
+    /// FINAL, or just the one named by PARTITION). See optimizeUntilConverged() below.
     bool optimize(
         const ASTPtr & query,
         const StorageMetadataPtr & metadata_snapshot,
@@ -338,8 +338,22 @@ private:
     /// built for a range whose lease already belongs to someone else. Losing the lease race to a
     /// faster replica surfaces as SelectMergeFailure::Reason::NOTHING_TO_MERGE -- an expected,
     /// benign outcome each scheduling cycle, not an error worth logging above trace level.
+    ///
+    /// partition_id empty (the background-scheduler and plain-OPTIMIZE default): normal cost-based
+    /// selection via MergeSelectorApplier. partition_id non-empty (OPTIMIZE ... PARTITION/FINAL):
+    /// forces selectAllPartsToMergeWithinPartition() instead, which grabs every active part of that
+    /// one partition unconditionally -- see optimizeUntilConverged().
     std::expected<CloudMergeMutateSelectedEntryPtr, SelectMergeFailure> selectPartsToMerge(
-        const StorageMetadataPtr & metadata_snapshot, std::unique_lock<std::mutex> & lock, bool aggressive = false);
+        const StorageMetadataPtr & metadata_snapshot, std::unique_lock<std::mutex> & lock, bool aggressive = false,
+        const String & partition_id = {}, bool final = false, bool optimize_skip_merged_partitions = false);
+
+    /// Shared body of optimize(): runs the synchronous select+execute loop for one partition (or,
+    /// when partition_id is empty, the whole table via cost-based selection) until nothing more is
+    /// selectable. Called once directly for plain OPTIMIZE / OPTIMIZE ... PARTITION p, and once per
+    /// currently-existing partition for whole-table OPTIMIZE ... FINAL.
+    void optimizeUntilConverged(
+        const StorageMetadataPtr & metadata_snapshot, const String & partition_id, bool final,
+        bool optimize_skip_merged_partitions, bool deduplicate, const Names & deduplicate_by_columns, bool cleanup);
 
     /// Mutation counterpart of selectPartsToMerge(), tried by scheduleDataProcessingJob() only when
     /// merge selection found nothing this cycle (same two-phase shape StorageMergeTree's own

@@ -199,6 +199,24 @@ def _optimize_until_single_part(node, timeout_seconds=30):
     )
 
 
+def _optimize_query_until(node, optimize_query, condition, timeout_seconds=30):
+    # Generalization of _optimize_until_single_part above for PARTITION/FINAL forms, whose
+    # convergence condition isn't just "one active part total". Same underlying reason a single
+    # call can legitimately no-op: selectPartsToMerge's parts-version freshness check
+    # (StorageCloudMergeTree.cpp) bails out immediately -- not just for cost-based selection but
+    # for selectAllPartsToMergeWithinPartition too -- if this replica's local watcher hasn't yet
+    # caught up to Keeper's latest parts-version, e.g. right after a burst of INSERTs.
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        node.query(optimize_query)
+        if condition():
+            return
+        time.sleep(0.5)
+    raise AssertionError(
+        f"{optimize_query!r} on {node.name} did not converge within {timeout_seconds}s"
+    )
+
+
 def test_optimize_merges_all_parts_and_propagates_to_second_replica(cluster):
     node1 = cluster.instances["node1"]
     node2 = cluster.instances["node2"]
@@ -2008,3 +2026,175 @@ def test_optimize_throws_when_merges_stopped(cluster):
         )
     finally:
         node1.query(f"SYSTEM START MERGES {TABLE_NAME}")
+
+
+def test_optimize_partition_merges_only_that_partition(cluster):
+    node1 = cluster.instances["node1"]
+    ddl = (
+        "(id UInt64, data String) ENGINE = CloudMergeTree "
+        "PARTITION BY id % 2 ORDER BY id SETTINGS storage_policy = 's3'"
+    )
+    node1.query(f"CREATE TABLE {TABLE_NAME} {ddl}")
+
+    # The odd-id partition gets exactly one row/part for the table's entire lifetime -- nothing
+    # can ever merge it with anything else, so its part count is a stable invariant regardless of
+    # background merging timing, unlike the even-id partition below. That makes this test's "the
+    # untouched partition wasn't touched" assertion robust without needing a SYSTEM STOP MERGES
+    # dance to avoid racing the background scheduler.
+    node1.query(f"INSERT INTO {TABLE_NAME} VALUES (1, 'v1')")
+    for i in (2, 4, 6, 8, 10):
+        node1.query(f"INSERT INTO {TABLE_NAME} VALUES ({i}, 'v{i}')")
+
+    even_partition_id = node1.query(
+        f"SELECT DISTINCT partition_id FROM system.parts "
+        f"WHERE table = '{TABLE_NAME}' AND active AND partition = '0'"
+    ).strip()
+    assert even_partition_id != ""
+
+    # PARTITION ID '<id>', not PARTITION <value>: same reasoning as the DROP PARTITION test above
+    # -- don't assume how CloudMergeTree/MergeTree formats a partition-key expression into a
+    # literal, look the ID up directly and pass it as an ID.
+    _optimize_query_until(
+        node1,
+        f"OPTIMIZE TABLE {TABLE_NAME} PARTITION ID '{even_partition_id}'",
+        lambda: node1.query(
+            f"SELECT count() FROM system.parts WHERE table = '{TABLE_NAME}' AND active AND partition = '0'"
+        ).strip()
+        == "1",
+    )
+
+    # selectAllPartsToMergeWithinPartition must only ever grab the requested partition_id's parts
+    # -- the odd-id partition's single part must be untouched (same part the whole time, not just
+    # "still one part").
+    assert (
+        node1.query(
+            f"SELECT count() FROM system.parts WHERE table = '{TABLE_NAME}' AND active AND partition = '1'"
+        ).strip()
+        == "1"
+    )
+
+    assert node1.query(f"SELECT count() FROM {TABLE_NAME}").strip() == "6"
+    assert node1.query(f"SELECT sum(id) FROM {TABLE_NAME}").strip() == "31"
+
+
+def test_optimize_partition_final_skips_already_merged_partition(cluster):
+    node1 = cluster.instances["node1"]
+    ddl = (
+        "(id UInt64, data String) ENGINE = CloudMergeTree "
+        "PARTITION BY id % 2 ORDER BY id SETTINGS storage_policy = 's3'"
+    )
+    node1.query(f"CREATE TABLE {TABLE_NAME} {ddl}")
+
+    node1.query(f"INSERT INTO {TABLE_NAME} VALUES (2, 'a')")
+    node1.query(f"INSERT INTO {TABLE_NAME} VALUES (4, 'b')")
+
+    even_partition_id = node1.query(
+        f"SELECT DISTINCT partition_id FROM system.parts "
+        f"WHERE table = '{TABLE_NAME}' AND active AND partition = '0'"
+    ).strip()
+    assert even_partition_id != ""
+
+    # Plain (non-FINAL) PARTITION OPTIMIZE first: merges the two level-0 parts into one part with
+    # level > 0 -- the precondition optimize_skip_merged_partitions' short-circuit actually checks
+    # for ("already merged", not just "one part").
+    _optimize_query_until(
+        node1,
+        f"OPTIMIZE TABLE {TABLE_NAME} PARTITION ID '{even_partition_id}'",
+        lambda: node1.query(
+            f"SELECT count() FROM system.parts WHERE table = '{TABLE_NAME}' AND active AND partition = '0'"
+        ).strip()
+        == "1",
+    )
+    part_name_before = node1.query(
+        f"SELECT name FROM system.parts WHERE table = '{TABLE_NAME}' AND active AND partition = '0'"
+    ).strip()
+
+    # PARTITION ... FINAL on an already-single-merged-part partition must complete without
+    # producing a redundant self-merge -- the part name (and thus the underlying data) must be
+    # exactly the one just observed above, not a freshly produced one. No retry needed here: a
+    # genuine optimize_skip_merged_partitions no-op and a watcher-lag no-op (see
+    # _optimize_query_until above) are observationally identical -- both leave the part name
+    # unchanged, which is exactly what this assertion checks.
+    node1.query(f"OPTIMIZE TABLE {TABLE_NAME} PARTITION ID '{even_partition_id}' FINAL")
+    part_name_after = node1.query(
+        f"SELECT name FROM system.parts WHERE table = '{TABLE_NAME}' AND active AND partition = '0'"
+    ).strip()
+    assert part_name_after == part_name_before
+
+    assert node1.query(f"SELECT count() FROM {TABLE_NAME}").strip() == "2"
+    assert node1.query(f"SELECT sum(id) FROM {TABLE_NAME}").strip() == "6"
+
+
+def test_optimize_final_converges_every_partition(cluster):
+    node1 = cluster.instances["node1"]
+    ddl = (
+        "(id UInt64, data String) ENGINE = CloudMergeTree "
+        "PARTITION BY id % 2 ORDER BY id SETTINGS storage_policy = 's3'"
+    )
+    node1.query(f"CREATE TABLE {TABLE_NAME} {ddl}")
+
+    # Multiple parts in *both* partitions -- whole-table FINAL (no PARTITION clause) must converge
+    # every currently-existing partition to one part each, not just whichever one the cost-based
+    # selector would have picked first.
+    for i in (2, 4, 6):
+        node1.query(f"INSERT INTO {TABLE_NAME} VALUES ({i}, 'v{i}')")
+    for i in (1, 3, 5, 7):
+        node1.query(f"INSERT INTO {TABLE_NAME} VALUES ({i}, 'v{i}')")
+
+    def _both_partitions_converged():
+        return node1.query(
+            f"SELECT countDistinct(partition), count() FROM system.parts "
+            f"WHERE table = '{TABLE_NAME}' AND active"
+        ).strip() == "2\t2"
+
+    _optimize_query_until(
+        node1, f"OPTIMIZE TABLE {TABLE_NAME} FINAL", _both_partitions_converged
+    )
+
+    assert node1.query(f"SELECT count() FROM {TABLE_NAME}").strip() == "7"
+    assert node1.query(f"SELECT sum(id) FROM {TABLE_NAME}").strip() == "28"
+
+
+def test_optimize_partition_visible_on_second_replica(cluster):
+    node1 = cluster.instances["node1"]
+    node2 = cluster.instances["node2"]
+    ddl = (
+        "(id UInt64, data String) ENGINE = CloudMergeTree "
+        "PARTITION BY id % 2 ORDER BY id SETTINGS storage_policy = 's3'"
+    )
+    node1.query(f"CREATE TABLE {TABLE_NAME} {ddl}")
+    table_uuid = node1.query(
+        f"SELECT uuid FROM system.tables WHERE table = '{TABLE_NAME}'"
+    ).strip()
+    node2.query(f"ATTACH TABLE {TABLE_NAME} UUID '{table_uuid}' {ddl}")
+
+    for i in (2, 4, 6):
+        node1.query(f"INSERT INTO {TABLE_NAME} VALUES ({i}, 'v{i}')")
+    node1.query(f"INSERT INTO {TABLE_NAME} VALUES (1, 'v1')")
+    assert_eq_with_retry(node2, f"SELECT count() FROM {TABLE_NAME}", "4")
+
+    even_partition_id = node1.query(
+        f"SELECT DISTINCT partition_id FROM system.parts "
+        f"WHERE table = '{TABLE_NAME}' AND active AND partition = '0'"
+    ).strip()
+    assert even_partition_id != ""
+
+    # node2 never ran the OPTIMIZE itself -- same Keeper part-set watcher mechanism as every other
+    # cross-replica visibility test in this file, just exercised for the new partition-scoped
+    # selection path specifically.
+    _optimize_query_until(
+        node1,
+        f"OPTIMIZE TABLE {TABLE_NAME} PARTITION ID '{even_partition_id}'",
+        lambda: node1.query(
+            f"SELECT count() FROM system.parts WHERE table = '{TABLE_NAME}' AND active AND partition = '0'"
+        ).strip()
+        == "1",
+    )
+
+    assert_eq_with_retry(
+        node2,
+        f"SELECT count() FROM system.parts WHERE table = '{TABLE_NAME}' AND active AND partition = '0'",
+        "1",
+    )
+    assert_eq_with_retry(node2, f"SELECT count() FROM {TABLE_NAME}", "4")
+    assert_eq_with_retry(node2, f"SELECT sum(id) FROM {TABLE_NAME}", "13")

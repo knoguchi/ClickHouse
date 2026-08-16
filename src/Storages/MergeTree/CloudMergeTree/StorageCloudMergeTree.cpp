@@ -13,6 +13,7 @@
 #include <Storages/MergeTree/MergeTreeDataSelectExecutor.h>
 #include <Storages/MergeTree/ReplicatedMergeTreePartHeader.h>
 #include <Storages/MergeTree/MergeTreeSettings.h>
+#include <Core/Settings.h>
 #include <Storages/MergeTree/Compaction/ConstructFuturePart.h>
 #include <Storages/MergeTree/Compaction/CompactionStatistics.h>
 #include <Storages/MergeTree/Compaction/MergeSelectorApplier.h>
@@ -74,6 +75,11 @@ namespace MergeTreeSetting
     extern const MergeTreeSettingsUInt64 cloud_merge_tree_gc_interval_ms;
     extern const MergeTreeSettingsSeconds lock_acquire_timeout_for_background_operations;
     extern const MergeTreeSettingsBool allow_experimental_replacing_merge_with_cleanup;
+}
+
+namespace Setting
+{
+    extern const SettingsBool optimize_skip_merged_partitions;
 }
 
 /// Minimal mutations snapshot: CloudMergeTree has no mutations in Phase 0, so the snapshot is
@@ -617,7 +623,8 @@ std::unique_ptr<MergeTreeSettings> StorageCloudMergeTree::getDefaultSettings() c
 }
 
 std::expected<CloudMergeMutateSelectedEntryPtr, SelectMergeFailure> StorageCloudMergeTree::selectPartsToMerge(
-    const StorageMetadataPtr & /*metadata_snapshot*/, std::unique_lock<std::mutex> & lock, bool aggressive)
+    const StorageMetadataPtr & metadata_snapshot, std::unique_lock<std::mutex> & lock, bool aggressive,
+    const String & partition_id, bool final, bool optimize_skip_merged_partitions)
 {
     auto component_guard = Coordination::setCurrentComponent("StorageCloudMergeTree::selectPartsToMerge");
     auto zk = getZooKeeper();
@@ -655,25 +662,39 @@ std::expected<CloudMergeMutateSelectedEntryPtr, SelectMergeFailure> StorageCloud
         });
     }
 
-    UInt64 max_source_parts_bytes_for_merge = CompactionStatistics::getMaxSourcePartsBytesForMerge(*this);
-    UInt64 max_result_part_rows = CompactionStatistics::getMaxResultPartRowsCount(*this);
+    std::expected<MergeSelectorChoices, SelectMergeFailure> select_result;
+    if (partition_id.empty())
+    {
+        /// Normal background/plain-OPTIMIZE path: cost-based selection bounded by
+        /// max_source_parts_bytes_for_merge -- see MergeSelectorApplier.
+        UInt64 max_source_parts_bytes_for_merge = CompactionStatistics::getMaxSourcePartsBytesForMerge(*this);
+        UInt64 max_result_part_rows = CompactionStatistics::getMaxResultPartRowsCount(*this);
 
-    if (max_source_parts_bytes_for_merge == 0)
-        return std::unexpected(SelectMergeFailure{
-            .reason = SelectMergeFailure::Reason::CANNOT_SELECT,
-            .explanation = PreformattedMessage::create("Current value of max_source_parts_bytes is zero"),
-        });
+        if (max_source_parts_bytes_for_merge == 0)
+            return std::unexpected(SelectMergeFailure{
+                .reason = SelectMergeFailure::Reason::CANNOT_SELECT,
+                .explanation = PreformattedMessage::create("Current value of max_source_parts_bytes is zero"),
+            });
 
-    auto select_result = merger_mutator.selectPartsToMerge(
-        parts_collector,
-        merge_predicate,
-        MergeSelectorApplier(
-            /*merge_constraints=*/{{max_source_parts_bytes_for_merge, max_result_part_rows}},
-            /*merge_with_ttl_allowed=*/false, /// CloudMergeTree has no TTL-driven merges yet
-            aggressive,
-            /*range_filter_=*/nullptr,
-            /*storage_id_=*/getStorageID()),
-        /*partitions_hint=*/std::nullopt);
+        select_result = merger_mutator.selectPartsToMerge(
+            parts_collector,
+            merge_predicate,
+            MergeSelectorApplier(
+                /*merge_constraints=*/{{max_source_parts_bytes_for_merge, max_result_part_rows}},
+                /*merge_with_ttl_allowed=*/false, /// CloudMergeTree has no TTL-driven merges yet
+                aggressive,
+                /*range_filter_=*/nullptr,
+                /*storage_id_=*/getStorageID()),
+            /*partitions_hint=*/std::nullopt);
+    }
+    else
+    {
+        /// OPTIMIZE TABLE ... PARTITION p [FINAL]: unconditionally grabs every active part of that
+        /// one partition as a single merge range, bypassing max_source_parts_bytes_for_merge's cost
+        /// heuristic entirely -- see MergeTreeDataMergerMutator::selectAllPartsToMergeWithinPartition.
+        select_result = merger_mutator.selectAllPartsToMergeWithinPartition(
+            metadata_snapshot, parts_collector, merge_predicate, partition_id, final, optimize_skip_merged_partitions);
+    }
 
     if (!select_result.has_value())
         return std::unexpected(select_result.error());
@@ -1125,14 +1146,6 @@ bool StorageCloudMergeTree::optimize(
     bool cleanup,
     ContextPtr local_context)
 {
-    /// PARTITION/FINAL still need machinery CloudMergeTree doesn't have yet (partition-scoped
-    /// selection). DEDUPLICATE/CLEANUP need none of that -- the underlying merge machinery
-    /// (mergePartsToTemporaryPart via MergeTask) already supports both, this was purely a
-    /// plumbing gap; see CloudMergePlainMergeTreeTask's deduplicate/cleanup members below.
-    if (partition || final)
-        throw Exception(ErrorCodes::NOT_IMPLEMENTED,
-            "OPTIMIZE TABLE with PARTITION or FINAL is not implemented for CloudMergeTree yet");
-
     /// Same legality guards as StorageMergeTree::optimize(): CLEANUP's semantic requirements are
     /// engine-independent, not something CloudMergeTree gets to relax. Phase 0 registration only
     /// supports MergingParams::Mode::Ordinary (see registerStorageMergeTree.cpp's isCloud()) --
@@ -1154,7 +1167,49 @@ bool StorageCloudMergeTree::optimize(
         throw Exception(ErrorCodes::ABORTED, "Cancelled merging parts");
 
     auto metadata_snapshot = getInMemoryMetadataPtr(local_context, false);
+    bool optimize_skip_merged_partitions = local_context->getSettingsRef()[Setting::optimize_skip_merged_partitions];
 
+    if (!partition && final)
+    {
+        /// Whole-table FINAL: one converge-to-one-part call per currently-existing partition,
+        /// matching StorageMergeTree::optimize()'s own expansion -- not a repeated-until-converged
+        /// loop *within* a partition (one optimizeUntilConverged() call already grabs everything in
+        /// that partition each iteration via selectAllPartsToMergeWithinPartition).
+        std::unordered_set<String> partition_ids;
+        for (const auto & part : getDataPartsVectorForInternalUsage({DataPartState::Active}, {DataPartKind::Regular}))
+            partition_ids.insert(part->info.getPartitionId());
+
+        for (const auto & partition_id : partition_ids)
+        {
+            optimizeUntilConverged(metadata_snapshot, partition_id, /*final=*/true, optimize_skip_merged_partitions, deduplicate, deduplicate_by_columns, cleanup);
+
+            /// A merge just committed for this partition (if any) only advances
+            /// current_parts_version asynchronously, via the background watcher -- without forcing
+            /// a synchronous resync here, the *next* partition's own selectPartsToMerge call would
+            /// immediately see this table's Keeper parts-version having just moved, judge its local
+            /// view stale, and silently skip itself for this entire OPTIMIZE call (repeatable: nothing
+            /// else prompts a resync before moving on to it). updatePartSetFromKeeper() is safe to
+            /// call inline here -- it only reconciles parts *we* already know about (our own just-
+            /// committed merge already added its result to the local working set synchronously), so
+            /// there is nothing to adopt from disk and it resolves in one round trip.
+            updatePartSetFromKeeper();
+        }
+
+        return true;
+    }
+
+    String partition_id;
+    if (partition)
+        partition_id = getPartitionIDFromQuery(partition, local_context);
+
+    optimizeUntilConverged(metadata_snapshot, partition_id, final, optimize_skip_merged_partitions, deduplicate, deduplicate_by_columns, cleanup);
+    return true;
+}
+
+void StorageCloudMergeTree::optimizeUntilConverged(
+    const StorageMetadataPtr & metadata_snapshot, const String & partition_id, bool final,
+    bool optimize_skip_merged_partitions, bool deduplicate, const Names & deduplicate_by_columns, bool cleanup)
+{
     /// Synchronous loop: run selection+execution inline (no background pool involved) until
     /// there's genuinely nothing left to merge, so OPTIMIZE has deterministic, testable
     /// completion instead of racing background scheduling timing.
@@ -1173,17 +1228,17 @@ bool StorageCloudMergeTree::optimize(
             /// background scheduling and could sit on a converged-enough-looking set of small,
             /// unevenly-sized parts (e.g. one merged 6-row part plus two 1-row parts) far longer
             /// than callers reasonably wait for a supposedly-forced OPTIMIZE to finish.
-            auto merge_select_result = selectPartsToMerge(metadata_snapshot, lock, /*aggressive=*/true);
+            auto merge_select_result = selectPartsToMerge(
+                metadata_snapshot, lock, /*aggressive=*/true, partition_id, final, optimize_skip_merged_partitions);
             if (!merge_select_result)
             {
                 /// Both real convergence ("no need to merge parts according to merge selector
-                /// algorithm", reported as CANNOT_SELECT -- selectPartsToMerge's top-level
-                /// SelectMergeFailure::Reason never actually comes back as NOTHING_TO_MERGE for
-                /// the whole-table case, only its inner detail does) and a lost lease race are
-                /// unremarkable stopping points for a plain OPTIMIZE, not failures: whatever could
-                /// be merged already has been. Log for visibility and stop the loop successfully.
+                /// algorithm" / "There is only one part inside partition", reported as
+                /// CANNOT_SELECT) and a lost lease race are unremarkable stopping points for a plain
+                /// OPTIMIZE, not failures: whatever could be merged already has been. Log for
+                /// visibility and stop the loop successfully.
                 LOG_TRACE(getLogger("StorageCloudMergeTree"), "Stopping OPTIMIZE: {}", merge_select_result.error().explanation.text);
-                return true;
+                return;
             }
             merge_entry = std::move(merge_select_result.value());
         }
