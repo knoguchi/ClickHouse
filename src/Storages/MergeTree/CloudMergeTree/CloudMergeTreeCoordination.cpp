@@ -1,6 +1,7 @@
 #include <Storages/MergeTree/CloudMergeTree/CloudMergeTreeCoordination.h>
 
 #include <Common/ZooKeeper/KeeperException.h>
+#include <chrono>
 
 namespace DB
 {
@@ -26,18 +27,26 @@ void CloudMergeTreeCoordination::createRootNodes(const zkutil::ZooKeeperPtr & zk
     zk->createAncestors(root_path + "/");
     zk->createIfNotExists(root_path, "");
     zk->createIfNotExists(partsPath(), "");
-    zk->createIfNotExists(root_path + "/block_numbers", "");
+    zk->createIfNotExists(blockNumbersPath(), "");
     zk->createIfNotExists(root_path + "/mutations", "");
     zk->createIfNotExists(root_path + "/leases", "");
     zk->createIfNotExists(root_path + "/replicas", "");
-    zk->createIfNotExists(root_path + "/temp", "");
+    zk->createIfNotExists(tempPath(), "");
+}
+
+void CloudMergeTreeCoordination::ensureBlockNumbersPartition(const zkutil::ZooKeeperPtr & zk, const String & partition_id) const
+{
+    zk->createIfNotExists(blockNumbersPartitionPath(partition_id), "");
 }
 
 Coordination::Error CloudMergeTreeCoordination::tryCommitInsert(
-    const zkutil::ZooKeeperPtr & zk, const String & part_name, const String & part_header) const
+    const zkutil::ZooKeeperPtr & zk, const String & part_name, const String & part_header,
+    Coordination::Requests extra_ops) const
 {
     Coordination::Requests ops;
     ops.emplace_back(zkutil::makeCreateRequest(partPath(part_name), part_header, zkutil::CreateMode::Persistent));
+    for (auto & op : extra_ops)
+        ops.emplace_back(std::move(op));
 
     Coordination::Responses responses;
     return zk->tryMultiNoThrow(ops, responses);
@@ -69,6 +78,74 @@ Coordination::Error CloudMergeTreeCoordination::tryCommitMerge(
     return zk->tryMultiNoThrow(ops, responses);
 }
 
+namespace
+{
+    Int64 nowMilliseconds()
+    {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+    }
+}
+
+std::expected<CloudMergeTreeCoordination::LeaseHandle, Coordination::Error> CloudMergeTreeCoordination::acquireOrStealLease(
+    const zkutil::ZooKeeperPtr & zk, const String & lease_path, const String & holder_data, Int64 staleness_threshold_ms) const
+{
+    auto code = zk->tryCreate(lease_path, holder_data, zkutil::CreateMode::Ephemeral);
+    if (code == Coordination::Error::ZOK)
+    {
+        Coordination::Stat stat;
+        if (!zk->exists(lease_path, &stat))
+            return std::unexpected(Coordination::Error::ZNONODE);
+        return LeaseHandle{lease_path, stat.version};
+    }
+
+    if (code != Coordination::Error::ZNODEEXISTS)
+        return std::unexpected(code);
+
+    /// Someone already holds it. Only worth stealing if it's gone stale (no heartbeat for
+    /// longer than the threshold) -- a live, actively-heartbeating holder just means we
+    /// genuinely lost the race for this range this cycle.
+    Coordination::Stat existing_stat;
+    String existing_data;
+    if (!zk->tryGet(lease_path, existing_data, &existing_stat))
+        return std::unexpected(Coordination::Error::ZNODEEXISTS);
+
+    if (nowMilliseconds() - existing_stat.mtime < staleness_threshold_ms)
+        return std::unexpected(Coordination::Error::ZNODEEXISTS);
+
+    /// Stale: atomically replace it, fenced by the version we just read. If the holder
+    /// heartbeated in the meantime this fails with ZBADVERSION -- treat identically to "lost
+    /// the race", no retry loop here.
+    Coordination::Requests ops;
+    ops.emplace_back(zkutil::makeRemoveRequest(lease_path, existing_stat.version));
+    ops.emplace_back(zkutil::makeCreateRequest(lease_path, holder_data, zkutil::CreateMode::Ephemeral));
+
+    Coordination::Responses responses;
+    auto steal_code = zk->tryMultiNoThrow(ops, responses);
+    if (steal_code != Coordination::Error::ZOK)
+        return std::unexpected(steal_code);
+
+    Coordination::Stat new_stat;
+    if (!zk->exists(lease_path, &new_stat))
+        return std::unexpected(Coordination::Error::ZNONODE);
+    return LeaseHandle{lease_path, new_stat.version};
+}
+
+std::expected<int32_t, Coordination::Error> CloudMergeTreeCoordination::touchLease(
+    const zkutil::ZooKeeperPtr & zk, const String & lease_path, int32_t current_version) const
+{
+    Coordination::Stat stat;
+    auto code = zk->trySet(lease_path, "", current_version, &stat);
+    if (code != Coordination::Error::ZOK)
+        return std::unexpected(code);
+    return stat.version;
+}
+
+void CloudMergeTreeCoordination::releaseLease(const zkutil::ZooKeeperPtr & zk, const String & lease_path, int32_t lease_version) const
+{
+    zk->tryRemove(lease_path, lease_version);
+}
+
 Coordination::Error CloudMergeTreeCoordination::tryRemoveParts(
     const zkutil::ZooKeeperPtr & zk, const Strings & part_names) const
 {
@@ -78,6 +155,12 @@ Coordination::Error CloudMergeTreeCoordination::tryRemoveParts(
 
     Coordination::Responses responses;
     return zk->tryMultiNoThrow(ops, responses);
+}
+
+bool CloudMergeTreeCoordination::tryClaimPhysicalDrop(const zkutil::ZooKeeperPtr & zk) const
+{
+    auto code = zk->tryCreate(dropMarkerPath(), "", zkutil::CreateMode::Persistent);
+    return code == Coordination::Error::ZOK;
 }
 
 Strings CloudMergeTreeCoordination::loadActivePartNames(
@@ -96,6 +179,13 @@ Strings CloudMergeTreeCoordination::loadActivePartNames(
     Strings names = zk->getChildrenWatch(partsPath(), &stat, std::move(watch_callback));
     out_parts_version = stat.cversion;
     return names;
+}
+
+int32_t CloudMergeTreeCoordination::getPartsVersion(const zkutil::ZooKeeperPtr & zk) const
+{
+    Coordination::Stat stat;
+    zk->exists(partsPath(), &stat);
+    return stat.cversion;
 }
 
 bool CloudMergeTreeCoordination::tryGetPartHeader(

@@ -2,13 +2,21 @@
 
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <Storages/MergeTree/MergeTreeDataWriter.h>
+#include <Storages/MergeTree/MergeTreeDataMergerMutator.h>
+#include <Storages/MergeTree/Compaction/PartProperties.h>
 #include <Storages/MergeTree/CloudMergeTree/CloudMergeTreeCoordination.h>
 #include <Common/ZooKeeper/ZooKeeper.h>
-#include <Common/SimpleIncrement.h>
 #include <Core/BackgroundSchedulePool.h>
+#include <expected>
 
 namespace DB
 {
+
+/// Defined in CloudMergePlainMergeTreeTask.h. Only forward-declared here: that header includes
+/// this one (it needs the full StorageCloudMergeTree type for CloudCurrentlyMergingPartsTagger),
+/// so including it back would be circular.
+struct CloudMergeMutateSelectedEntry;
+using CloudMergeMutateSelectedEntryPtr = std::shared_ptr<CloudMergeMutateSelectedEntry>;
 
 /** CloudMergeTree: a stateless-replica MergeTree whose authoritative active part
   * set lives in Keeper and whose part data lives on a shared object-storage disk.
@@ -61,6 +69,24 @@ public:
     void drop() override;
     void truncate(const ASTPtr &, const StorageMetadataPtr &, ContextPtr, TableExclusiveLockHolder &) override;
 
+    /// IStorage::totalRows/totalBytes/totalBytesUncompressed default to std::nullopt; ServerAsynchronousMetrics
+    /// calls .value() on them unconditionally for every MergeTreeData-derived table, so a
+    /// MergeTreeData subclass that doesn't override these throws (and, at server startup, before
+    /// the metrics thread's own steady-state try/catch is established, crashes the whole process).
+    std::optional<UInt64> totalRows(ContextPtr) const override { return getTotalActiveSizeInRows(); }
+    std::optional<UInt64> totalBytes(ContextPtr) const override { return getTotalActiveSizeInBytes(); }
+    std::optional<UInt64> totalBytesUncompressed(const Settings &) const override;
+
+    /// data.insert_increment is a per-process counter, meant to give temp part directories
+    /// process-local uniqueness -- sufficient on ordinary MergeTree/ReplicatedMergeTree, where
+    /// every replica's temp directories live on that replica's own local disk. CloudMergeTree
+    /// writes temp directories to the *shared* disk every replica sees, so two replicas whose
+    /// local counters reach the same value at the same time would otherwise collide on the same
+    /// path. A fresh UUID per call (this is invoked once per writeTempPart, i.e. once per INSERT)
+    /// makes every temp directory name globally unique regardless of what any replica's local
+    /// counter says.
+    std::string getPostfixForTempInsertName() const override;
+
     /// The part-set coordinator and a freshly-resolved Keeper session. Used by the sink.
     const CloudMergeTreeCoordination & getCoordination() const { return coordination; }
     zkutil::ZooKeeperPtr getZooKeeper() const;
@@ -69,14 +95,45 @@ public:
     /// Throws on a Keeper failure so the INSERT fails closed (no silent local-only commit).
     void commitInsertedPart(MutableDataPartPtr & part, ContextPtr context);
 
+    /// Returns the maximum level of all outdated parts strictly between left and right, or 0 for
+    /// an empty range. Used by the merge predicate to reject a merge that would paper over a gap
+    /// containing a higher-level outdated part (see StorageMergeTree::getMaxLevelInBetween, which
+    /// this is a verbatim copy of -- the logic isn't specific to how parts get into the set).
+    UInt32 getMaxLevelInBetween(const PartProperties & left, const PartProperties & right) const;
+
+    /// Keeper-fenced merge commit (DESIGN.md invariant 3, exactly-once materialization): a single
+    /// multi() that creates the merged part, removes the sources, and checks the lease is still
+    /// held at lease_version. Returns false (without throwing, without touching local state) if
+    /// the lease was lost to another replica -- the caller must discard new_part in that case.
+    /// Mirrors commitInsertedPart()'s Keeper-first pattern.
+    bool commitMergedPart(
+        MutableDataPartPtr & new_part, const DataPartsVector & source_parts,
+        const String & lease_path, int32_t lease_version, ContextPtr local_context);
+
+    /// Plain `OPTIMIZE TABLE t` only: synchronously selects and runs merges (via
+    /// CloudMergePlainMergeTreeTask::executeHere) until nothing more is selectable. Every other
+    /// form (PARTITION/FINAL/DEDUPLICATE/CLEANUP) throws NOT_IMPLEMENTED, same stub style as
+    /// dropPart/dropPartition/attachPartition above.
+    bool optimize(
+        const ASTPtr & query,
+        const StorageMetadataPtr & metadata_snapshot,
+        const ASTPtr & partition,
+        bool final,
+        bool deduplicate,
+        const Names & deduplicate_by_columns,
+        bool cleanup,
+        ContextPtr context) override;
+
 private:
     MergeTreeDataWriter writer;
     CloudMergeTreeCoordination coordination;
+    MergeTreeDataMergerMutator merger_mutator;
 
-    /// Phase 0/1: single-writer block-number allocation, serialized by lockParts() in
-    /// commitInsertedPart(). Multi-writer allocation via Keeper arrives in Phase 2 together
-    /// with merges.
-    SimpleIncrement increment;
+    /// Guards currently_merging_mutating_parts, same as StorageMergeTree -- these two live on
+    /// StorageMergeTree, not MergeTreeData, so CloudMergeTree needs its own copies for Phase 2
+    /// merge selection (CloudMergeTreeMergePredicate::canUsePartInMerges()).
+    mutable std::mutex currently_processing_in_background_mutex;
+    DataParts currently_merging_mutating_parts;
 
     std::atomic<bool> shutdown_called{false};
 
@@ -111,10 +168,20 @@ private:
     void startBackgroundMovesIfNeeded() override;
     std::unique_ptr<MergeTreeSettings> getDefaultSettings() const override;
 
-    /// Phase 0: no background merge/mutation scheduling yet.
     bool scheduleDataProcessingJob(BackgroundJobsAssignee & assignee) override;
 
+    /// Merge selection + lease acquisition, run together under currently_processing_in_background_mutex
+    /// (lock already held by the caller) so a MergeTask (space reservation, part tagging) is never
+    /// built for a range whose lease already belongs to someone else. Losing the lease race to a
+    /// faster replica surfaces as SelectMergeFailure::Reason::NOTHING_TO_MERGE -- an expected,
+    /// benign outcome each scheduling cycle, not an error worth logging above trace level.
+    std::expected<CloudMergeMutateSelectedEntryPtr, SelectMergeFailure> selectPartsToMerge(
+        const StorageMetadataPtr & metadata_snapshot, std::unique_lock<std::mutex> & lock, bool aggressive = false);
+
     friend class CloudMergeTreeSink;
+    friend class CloudMergeTreeMergePredicate;
+    friend class CloudMergePlainMergeTreeTask;
+    friend struct CloudCurrentlyMergingPartsTagger;
 
     struct MutationsSnapshot;
 };

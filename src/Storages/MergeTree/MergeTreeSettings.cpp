@@ -91,6 +91,12 @@ The maximum number of streams (columns) that can be flushed in parallel
 (analog of max_insert_delayed_streams_for_parallel_write for merges). Works
 only for Vertical merges.
 )", 0) \
+    DECLARE(UInt64, cloud_merge_tree_lease_staleness_ms, 60000, R"(
+`CloudMergeTree` only. How long (in milliseconds) a merge lease may go
+without a heartbeat before another replica is allowed to steal it. Bounds
+how long a merge can be stuck (crashed holder, wedged replica) before
+another replica retries the same range.
+)", 0) \
     DECLARE(Float, ratio_of_defaults_for_sparse_serialization, 0.9375f, R"(
 Minimal ratio of the number of _default_ values to the number of _all_ values
 in a column. Setting this value causes the column to be stored using sparse
