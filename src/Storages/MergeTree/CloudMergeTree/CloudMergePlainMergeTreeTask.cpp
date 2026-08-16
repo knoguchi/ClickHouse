@@ -203,8 +203,10 @@ void CloudMergePlainMergeTreeTask::prepare()
         }
     };
 
-    /// deduplicate=false, cleanup=false, txn=nullptr: dedup and CLEANUP-mode replacing merges are
-    /// out of Phase 2 scope (DESIGN.md's deferred list); CloudMergeTree has no MVCC transactions.
+    /// txn=nullptr: CloudMergeTree has no MVCC transactions. deduplicate/deduplicate_by_columns/
+    /// cleanup come from the constructor -- real values for an explicit OPTIMIZE TABLE ...
+    /// DEDUPLICATE/CLEANUP (StorageCloudMergeTree::optimize()'s synchronous loop), always
+    /// false/{}/false for ordinary background merging (scheduleDataProcessingJob()).
     merge_task = storage.merger_mutator.mergePartsToTemporaryPart(
         future_part,
         metadata_snapshot,
@@ -214,9 +216,9 @@ void CloudMergePlainMergeTreeTask::prepare()
         time(nullptr),
         task_context,
         merge_mutate_entry->tagger->reserved_space,
-        /*deduplicate=*/ false,
-        /*deduplicate_by_columns=*/ {},
-        /*cleanup=*/ false,
+        deduplicate,
+        deduplicate_by_columns,
+        cleanup,
         storage.merging_params,
         /*txn=*/ nullptr);
 }

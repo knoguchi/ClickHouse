@@ -1488,3 +1488,88 @@ def test_covered_parts_are_reclaimed_from_local_memory_after_merge(cluster):
         assert node1.query(f"SELECT sum(id) FROM {table}").strip() == "6"
     finally:
         node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
+
+
+def test_optimize_deduplicate_removes_exact_duplicate_rows(cluster):
+    node1 = cluster.instances["node1"]
+
+    node1.query(f"CREATE TABLE {TABLE_NAME} {TABLE_DDL}")
+    # Two separate INSERTs land in two separate parts -- DEDUPLICATE only collapses duplicates
+    # *within one merge*, not incrementally across the whole table's history, so this is the
+    # minimum setup needed to actually exercise it. deduplicate_insert must be disabled for the
+    # inserts themselves, or CloudMergeTree's own whole-block insert-time dedup (Phase 4 Step B)
+    # would silently collapse the second identical INSERT before OPTIMIZE ever runs, defeating
+    # the point of this test.
+    node1.query(
+        f"INSERT INTO {TABLE_NAME} VALUES (1, 'a')", settings={"deduplicate_insert": "disable"}
+    )
+    node1.query(
+        f"INSERT INTO {TABLE_NAME} VALUES (1, 'a')", settings={"deduplicate_insert": "disable"}
+    )
+    node1.query(
+        f"INSERT INTO {TABLE_NAME} VALUES (2, 'b')", settings={"deduplicate_insert": "disable"}
+    )
+    assert node1.query(f"SELECT count() FROM {TABLE_NAME}").strip() == "3"
+
+    node1.query(f"OPTIMIZE TABLE {TABLE_NAME} DEDUPLICATE")
+
+    assert node1.query(f"SELECT count() FROM {TABLE_NAME}").strip() == "2"
+    assert_eq_with_retry(
+        node1,
+        f"SELECT count() FROM system.parts WHERE table = '{TABLE_NAME}' AND active",
+        "1",
+    )
+
+
+def test_optimize_deduplicate_by_columns_dedups_on_subset(cluster):
+    node1 = cluster.instances["node1"]
+
+    node1.query(f"CREATE TABLE {TABLE_NAME} {TABLE_DDL}")
+    # Same id, different data -- a full-row DEDUPLICATE would NOT collapse these (rows differ),
+    # but DEDUPLICATE BY id must, since it only compares the named column(s). Different data means
+    # insert-time whole-block dedup never applies here regardless, unlike the test above.
+    node1.query(f"INSERT INTO {TABLE_NAME} VALUES (1, 'a')")
+    node1.query(f"INSERT INTO {TABLE_NAME} VALUES (1, 'b')")
+    assert node1.query(f"SELECT count() FROM {TABLE_NAME}").strip() == "2"
+
+    # No parens around the column list -- "DEDUPLICATE BY (id)" is a syntax error (confirmed via
+    # upstream's own 01581_deduplicate_by_columns_local.sql test, which always uses a bare list).
+    node1.query(f"OPTIMIZE TABLE {TABLE_NAME} DEDUPLICATE BY id")
+
+    assert node1.query(f"SELECT count() FROM {TABLE_NAME}").strip() == "1"
+
+
+def test_optimize_cleanup_throws_cannot_assign_optimize(cluster):
+    node1 = cluster.instances["node1"]
+
+    node1.query(f"CREATE TABLE {TABLE_NAME} {TABLE_DDL}")
+    node1.query(f"INSERT INTO {TABLE_NAME} VALUES (1, 'a')")
+
+    # CloudMergeTree's Phase 0 registration only supports MergingParams::Mode::Ordinary -- there
+    # is no way to CREATE a Replacing-mode CloudMergeTree table yet, so CLEANUP must always
+    # reject here, same as upstream would for any non-ReplacingMergeTree table.
+    with pytest.raises(QueryRuntimeException) as exc:
+        node1.query(f"OPTIMIZE TABLE {TABLE_NAME} CLEANUP")
+    assert "CANNOT_ASSIGN_OPTIMIZE" in str(exc.value)
+
+
+def test_optimize_plain_still_works_unchanged(cluster):
+    node1 = cluster.instances["node1"]
+
+    node1.query(f"CREATE TABLE {TABLE_NAME} {TABLE_DDL}")
+    node1.query(f"INSERT INTO {TABLE_NAME} VALUES (1, 'a')")
+    node1.query(f"INSERT INTO {TABLE_NAME} VALUES (2, 'b')")
+    node1.query(f"INSERT INTO {TABLE_NAME} VALUES (3, 'c')")
+
+    # Regression guard: a plain OPTIMIZE TABLE (no modifiers) -- the background scheduling path's
+    # own CloudMergePlainMergeTreeTask construction -- must still work with the new required
+    # deduplicate/deduplicate_by_columns/cleanup constructor arguments wired correctly.
+    node1.query(f"OPTIMIZE TABLE {TABLE_NAME}")
+
+    assert node1.query(f"SELECT count() FROM {TABLE_NAME}").strip() == "3"
+    assert node1.query(f"SELECT sum(id) FROM {TABLE_NAME}").strip() == "6"
+    assert_eq_with_retry(
+        node1,
+        f"SELECT count() FROM system.parts WHERE table = '{TABLE_NAME}' AND active",
+        "1",
+    )

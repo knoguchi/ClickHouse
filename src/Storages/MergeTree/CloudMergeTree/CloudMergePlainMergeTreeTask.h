@@ -74,12 +74,18 @@ public:
         StorageMetadataPtr metadata_snapshot_,
         CloudMergeMutateSelectedEntryPtr merge_mutate_entry_,
         TableLockHolder table_lock_holder_,
-        IExecutableTask::TaskResultCallback & task_result_callback_)
+        IExecutableTask::TaskResultCallback & task_result_callback_,
+        bool deduplicate_,
+        Names deduplicate_by_columns_,
+        bool cleanup_)
         : storage(storage_)
         , metadata_snapshot(std::move(metadata_snapshot_))
         , merge_mutate_entry(std::move(merge_mutate_entry_))
         , table_lock_holder(std::move(table_lock_holder_))
         , task_result_callback(task_result_callback_)
+        , deduplicate(deduplicate_)
+        , deduplicate_by_columns(std::move(deduplicate_by_columns_))
+        , cleanup(cleanup_)
     {
         for (auto & item : merge_mutate_entry->future_part->parts)
             priority.value += item->getBytesOnDisk();
@@ -125,6 +131,16 @@ private:
     std::function<void()> transfer_profile_counters_to_initial_query;
     IExecutableTask::TaskResultCallback task_result_callback;
     MergeTaskPtr merge_task{nullptr};
+
+    /// OPTIMIZE TABLE ... DEDUPLICATE [BY ...] / CLEANUP: threaded through as constructor
+    /// arguments rather than fields on CloudMergeMutateSelectedEntry, same shape
+    /// MergePlainMergeTreeTask uses -- selection is purely about which parts, these decide how to
+    /// merge them. StorageCloudMergeTree::optimize()'s synchronous loop passes real values;
+    /// scheduleDataProcessingJob()'s background path always passes false/{}/false, since ordinary
+    /// background merging must never deduplicate or cleanup on its own.
+    bool deduplicate{false};
+    Names deduplicate_by_columns;
+    bool cleanup{false};
 
     ProfileEvents::Counters profile_counters;
 

@@ -56,6 +56,7 @@ namespace ErrorCodes
     extern const int LOGICAL_ERROR;
     extern const int SUPPORT_IS_DISABLED;
     extern const int INCOMPATIBLE_COLUMNS;
+    extern const int CANNOT_ASSIGN_OPTIMIZE;
 }
 
 namespace MergeTreeSetting
@@ -65,6 +66,7 @@ namespace MergeTreeSetting
     extern const MergeTreeSettingsUInt64 cloud_merge_tree_gc_grace_period_seconds;
     extern const MergeTreeSettingsUInt64 cloud_merge_tree_gc_interval_ms;
     extern const MergeTreeSettingsSeconds lock_acquire_timeout_for_background_operations;
+    extern const MergeTreeSettingsBool allow_experimental_replacing_merge_with_cleanup;
 }
 
 /// Minimal mutations snapshot: CloudMergeTree has no mutations in Phase 0, so the snapshot is
@@ -1066,8 +1068,12 @@ bool StorageCloudMergeTree::scheduleDataProcessingJob(BackgroundJobsAssignee & a
 
     if (merge_entry)
     {
+        /// Ordinary background merging must never deduplicate or cleanup on its own -- only an
+        /// explicit OPTIMIZE TABLE ... DEDUPLICATE/CLEANUP does (see optimize()'s own construction
+        /// of this task below).
         auto task = std::make_shared<CloudMergePlainMergeTreeTask>(
-            *this, metadata_snapshot, merge_entry, table_lock_holder, common_assignee_trigger);
+            *this, metadata_snapshot, merge_entry, table_lock_holder, common_assignee_trigger,
+            /*deduplicate_=*/ false, /*deduplicate_by_columns_=*/ Names{}, /*cleanup_=*/ false);
         return assignee.scheduleMergeMutateTask(task);
     }
 
@@ -1087,17 +1093,30 @@ bool StorageCloudMergeTree::optimize(
     const ASTPtr & partition,
     bool final,
     bool deduplicate,
-    const Names & /*deduplicate_by_columns*/,
+    const Names & deduplicate_by_columns,
     bool cleanup,
     ContextPtr local_context)
 {
-    /// Only the plain form is implemented -- PARTITION/FINAL/DEDUPLICATE/CLEANUP all need
-    /// machinery CloudMergeTree doesn't have yet (partition-scoped selection, mutations,
-    /// replacing-merge cleanup). Same stub style as dropPart/dropPartition/attachPartition above.
-    if (partition || final || deduplicate || cleanup)
+    /// PARTITION/FINAL still need machinery CloudMergeTree doesn't have yet (partition-scoped
+    /// selection). DEDUPLICATE/CLEANUP need none of that -- the underlying merge machinery
+    /// (mergePartsToTemporaryPart via MergeTask) already supports both, this was purely a
+    /// plumbing gap; see CloudMergePlainMergeTreeTask's deduplicate/cleanup members below.
+    if (partition || final)
         throw Exception(ErrorCodes::NOT_IMPLEMENTED,
-            "OPTIMIZE TABLE with PARTITION, FINAL, DEDUPLICATE or CLEANUP is not implemented for "
-            "CloudMergeTree yet; only a plain OPTIMIZE TABLE is supported");
+            "OPTIMIZE TABLE with PARTITION or FINAL is not implemented for CloudMergeTree yet");
+
+    /// Same legality guards as StorageMergeTree::optimize(): CLEANUP's semantic requirements are
+    /// engine-independent, not something CloudMergeTree gets to relax. Phase 0 registration only
+    /// supports MergingParams::Mode::Ordinary (see registerStorageMergeTree.cpp's isCloud()) --
+    /// there is no way to CREATE a Replacing-mode CloudMergeTree table yet, so the first check
+    /// below is unconditionally true for every table this engine can currently create. That's
+    /// accurate, not a bug: it's exactly what upstream would also throw for any non-Replacing
+    /// table, and this plumbing is forward-compatible for whenever Replacing-mode registration
+    /// lands separately.
+    if (cleanup && merging_params.mode != MergingParams::Mode::Replacing)
+        throw Exception(ErrorCodes::CANNOT_ASSIGN_OPTIMIZE, "Cannot OPTIMIZE with CLEANUP table: only ReplacingMergeTree can be CLEANUP");
+    if (cleanup && !(*getSettings())[MergeTreeSetting::allow_experimental_replacing_merge_with_cleanup])
+        throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "Experimental merges with CLEANUP are not allowed");
 
     auto metadata_snapshot = getInMemoryMetadataPtr(local_context, false);
 
@@ -1135,7 +1154,9 @@ bool StorageCloudMergeTree::optimize(
         }
 
         IExecutableTask::TaskResultCallback f = [](bool) {};
-        auto task = std::make_shared<CloudMergePlainMergeTreeTask>(*this, metadata_snapshot, merge_entry, table_lock_holder, f);
+        auto task = std::make_shared<CloudMergePlainMergeTreeTask>(
+            *this, metadata_snapshot, merge_entry, table_lock_holder, f,
+            deduplicate, deduplicate_by_columns, cleanup);
         executeHere(task);
     }
 }
