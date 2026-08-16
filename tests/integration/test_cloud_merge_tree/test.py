@@ -1450,3 +1450,41 @@ def test_kill_mutation_on_nonexistent_id_is_a_no_op(cluster):
     # no-op, not an error.
     node1.query(f"KILL MUTATION WHERE table = '{TABLE_NAME}' AND mutation_id = '99999999'")
     assert node1.query(f"SELECT data FROM {TABLE_NAME} WHERE id = 1").strip() == "a"
+
+
+def test_covered_parts_are_reclaimed_from_local_memory_after_merge(cluster):
+    node1 = cluster.instances["node1"]
+    table = "cloud_test_covered_parts_reclaimed"
+
+    node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
+    node1.query(
+        f"CREATE TABLE {table} (id UInt64, data String) ENGINE = CloudMergeTree "
+        f"ORDER BY id SETTINGS storage_policy = 's3'"
+    )
+    try:
+        for i in range(1, 4):
+            node1.query(f"INSERT INTO {table} VALUES ({i}, 'v{i}')")
+
+        node1.query(f"OPTIMIZE TABLE {table}")
+
+        assert_eq_with_retry(
+            node1,
+            f"SELECT count() FROM system.parts WHERE table = '{table}' AND active",
+            "1",
+        )
+
+        # Before this fix, MergeTreeData::Transaction::commit()'s generic covered-part handling
+        # demoted a merge's source parts to Outdated with a future remove_time, relying on the
+        # generic old-parts cleanup thread to eventually erase them from data_parts_indexes --
+        # a thread CloudMergeTree never runs. They must now be gone from system.parts entirely
+        # (not just inactive), not lingering in local memory forever.
+        assert_eq_with_retry(
+            node1,
+            f"SELECT count() FROM system.parts WHERE table = '{table}' AND NOT active",
+            "0",
+        )
+
+        assert node1.query(f"SELECT count() FROM {table}").strip() == "3"
+        assert node1.query(f"SELECT sum(id) FROM {table}").strip() == "6"
+    finally:
+        node1.query(f"DROP TABLE IF EXISTS {table} SYNC")

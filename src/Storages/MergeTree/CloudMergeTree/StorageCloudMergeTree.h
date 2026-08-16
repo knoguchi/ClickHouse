@@ -273,7 +273,18 @@ private:
     /// Transaction::commit). Caller must hold lock. Never fails: if something already active
     /// locally covers this part (e.g. a later merge result adopted earlier in the same batch), this
     /// name is already effectively satisfied and there is nothing more to do.
-    void admitPartLocally(MutableDataPartPtr part, DataPartsLock & lock);
+    ///
+    /// Returns whatever Transaction::commit() itself returns: any local parts this admission
+    /// covered/superseded. MergeTreeData::Transaction::commit() only ever demotes a covered part to
+    /// Outdated with a future remove_time, relying on the generic old-parts cleanup thread to later
+    /// erase it from data_parts_indexes -- a thread CloudMergeTree never runs (physical deletion is
+    /// exclusively owned by the Keeper-driven parts-killer). Left alone, every merge/adoption would
+    /// leak its covered parts' DataPart objects in memory forever. Callers are responsible for
+    /// immediately transitioning the returned parts to Deleting and calling removePartsFinally()
+    /// once their own lock is released (mirrors detachActivePartsMatching()'s and
+    /// updatePartSetFromKeeper()'s identical treatment of explicitly-removed parts) -- this only
+    /// forgets the DataPart *object*, it never touches the shared disk.
+    DataPartsVector admitPartLocally(MutableDataPartPtr part, DataPartsLock & lock);
 
     /// Build a mutation entry ready to serialize into a mutations/<id> znode -- shared by mutate()
     /// (alter_version = -1, a manually-submitted mutation) and alter() (alter_version = the metadata

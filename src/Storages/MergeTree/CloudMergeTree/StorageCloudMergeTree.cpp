@@ -255,7 +255,7 @@ StorageCloudMergeTree::MutableDataPartPtr StorageCloudMergeTree::buildPartFromDi
     return part;
 }
 
-void StorageCloudMergeTree::admitPartLocally(MutableDataPartPtr part, DataPartsLock & lock)
+DataPartsVector StorageCloudMergeTree::admitPartLocally(MutableDataPartPtr part, DataPartsLock & lock)
 {
     Transaction transaction(*this, nullptr);
     if (!addTempPart(part, transaction, lock, /*out_covered_parts=*/ nullptr))
@@ -263,9 +263,9 @@ void StorageCloudMergeTree::admitPartLocally(MutableDataPartPtr part, DataPartsL
         /// Something already active locally covers this part -- e.g. a later merge result
         /// adopted earlier in this same batch already supersedes it. Not an error: this name
         /// is already effectively satisfied, nothing more to do for it.
-        return;
+        return {};
     }
-    transaction.commit(lock);
+    return transaction.commit(lock);
 }
 
 UInt32 StorageCloudMergeTree::getMaxLevelInBetween(const PartProperties & left, const PartProperties & right) const
@@ -414,6 +414,7 @@ bool StorageCloudMergeTree::commitInsertedPart(MutableDataPartPtr & part, Contex
     block_lock.getUnlockOp(extra_ops);
 
     Transaction transaction(*this, local_context->getCurrentTransaction().get());
+    DataPartsVector covered_parts;
     {
         auto lock = lockParts();
 
@@ -442,8 +443,18 @@ bool StorageCloudMergeTree::commitInsertedPart(MutableDataPartPtr & part, Contex
 
         /// Only now reflect it in this replica's in-memory cache.
         renameTempPartAndAdd(part, transaction, lock, /*rename_in_transaction=*/ false);
-        transaction.commit(lock);
+        covered_parts = transaction.commit(lock);
+        for (const auto & covered : covered_parts)
+            modifyPartState(covered, DataPartState::Deleting, lock);
     }
+    /// See admitPartLocally()'s doc comment: a covered part must not linger as a timer-based
+    /// Outdated entry, since CloudMergeTree never runs the generic cleanup thread that would
+    /// eventually erase it. removePartsFinally() takes its own lockParts() internally, so it must
+    /// run after the block above releases this function's own lock. Rare in practice for INSERT
+    /// (a fresh part covering something existing is an edge case, not the common path), but handled
+    /// uniformly with commitMergedPart()/admitPartLocally()'s callers for the same reason.
+    if (!covered_parts.empty())
+        removePartsFinally(covered_parts);
     return true;
 }
 
@@ -490,7 +501,22 @@ bool StorageCloudMergeTree::commitMergedPart(
     Transaction transaction(*this, nullptr);
     renameTempPartAndReplace(new_part, transaction, /*rename_in_transaction=*/ true);
     transaction.renameParts();
-    transaction.commit();
+    DataPartsVector covered_parts = transaction.commit();
+
+    /// See admitPartLocally()'s doc comment: a source part covered by this merge/mutation result
+    /// must not linger as a timer-based Outdated entry -- CloudMergeTree never runs the generic
+    /// cleanup thread that would eventually erase it. transaction.commit() (the no-arg overload)
+    /// already acquired and released its own lock internally by the time it returns here, so
+    /// re-acquiring one below is a fresh, separate acquisition, not nested with anything above.
+    if (!covered_parts.empty())
+    {
+        {
+            auto lock = lockParts();
+            for (const auto & covered : covered_parts)
+                modifyPartState(covered, DataPartState::Deleting, lock);
+        }
+        removePartsFinally(covered_parts);
+    }
     return true;
 }
 
@@ -1394,8 +1420,19 @@ PartitionCommandsResultInfo StorageCloudMergeTree::attachPartition(
             && code != Coordination::Error::ZNODEEXISTS)
             throw zkutil::KeeperException(code, "Cannot reattach part {} in Keeper for table {}", name, getStorageID().getNameForLogs());
 
-        auto lock = lockParts();
-        admitPartLocally(part, lock);
+        DataPartsVector covered_parts;
+        {
+            auto lock = lockParts();
+            covered_parts = admitPartLocally(part, lock);
+            for (const auto & covered : covered_parts)
+                modifyPartState(covered, DataPartState::Deleting, lock);
+        }
+        /// See admitPartLocally()'s doc comment: erase any covered part's in-memory bookkeeping
+        /// immediately (removePartsFinally() takes its own lockParts(), so must run after the block
+        /// above releases this one) rather than leaving it as a timer-based Outdated entry nothing
+        /// would ever clean up.
+        if (!covered_parts.empty())
+            removePartsFinally(covered_parts);
 
         results.push_back(PartitionCommandResultInfo{
             .command_type = command.part ? "ATTACH PART" : "ATTACH PARTITION",
@@ -1501,7 +1538,13 @@ try
         auto part = buildPartFromDisk(name);
         if (!part)
             return false;
-        admitPartLocally(part, lock);
+        /// See admitPartLocally()'s doc comment: any part this adoption covers/supersedes goes
+        /// into the same to_remove collected below for the explicit-removal case -- both are
+        /// erased together, once, after this function's lock is released.
+        auto covered = admitPartLocally(part, lock);
+        for (const auto & part_to_forget : covered)
+            modifyPartState(part_to_forget, DataPartState::Deleting, lock);
+        to_remove.insert(to_remove.end(), covered.begin(), covered.end());
         return true;
     };
 
@@ -1551,14 +1594,18 @@ try
         /// Safe to drop local parts no longer active in Keeper only now, with every part Keeper
         /// currently considers active confirmed present locally (adopted above, or already
         /// known): anything superseded by a part adopted above was already atomically removed by
-        /// that adoption's own Transaction::commit(), so it can't appear here. Whatever remains
-        /// has no replacement coming this cycle and can be dropped outright.
+        /// that adoption's own Transaction::commit(), so it can't appear here (still_known only
+        /// queries {Active}, and try_adopt_part's covered parts were already transitioned to
+        /// Deleting above -- kept in a genuinely separate vector below so they're never passed to
+        /// removePartsFromWorkingSet() a second time). Whatever remains has no replacement coming
+        /// this cycle and can be dropped outright.
         auto still_known = getDataPartsVectorForInternalUsage({DataPartState::Active}, {DataPartKind::Regular}, lock);
+        DataPartsVector no_longer_active;
         for (const auto & part : still_known)
             if (!active_set.contains(part->name))
-                to_remove.push_back(part);
+                no_longer_active.push_back(part);
 
-        if (!to_remove.empty())
+        if (!no_longer_active.empty())
         {
             /// Same reasoning as detachActivePartsMatching's identical pattern: a name removed
             /// here (merge-superseded source, permanent DROP, or -- since this loop can't tell
@@ -1567,9 +1614,10 @@ try
             /// Transition to Deleting now, under lock; removePartsFinally() actually erases it
             /// from data_parts_indexes, called below once this lock-scoping block has ended (it
             /// takes its own lockParts() internally).
-            removePartsFromWorkingSet(/*txn=*/ nullptr, to_remove, /*clear_without_timeout=*/ true, lock);
-            for (const auto & part : to_remove)
+            removePartsFromWorkingSet(/*txn=*/ nullptr, no_longer_active, /*clear_without_timeout=*/ true, lock);
+            for (const auto & part : no_longer_active)
                 modifyPartState(part, DataPartState::Deleting, lock);
+            to_remove.insert(to_remove.end(), no_longer_active.begin(), no_longer_active.end());
         }
 
         current_parts_version.store(new_version);
