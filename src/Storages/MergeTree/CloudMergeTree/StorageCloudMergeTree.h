@@ -197,6 +197,23 @@ public:
     /// killed by a concurrent racer).
     CancellationCode killMutation(const String & mutation_id) override;
 
+    /// SYSTEM STOP/START MERGES: wires ActionLocks::PartsMerge to merger_mutator.merges_blocker,
+    /// same as StorageMergeTree::getActionLock(). Without this override, IStorage's default
+    /// (returns an empty, no-op ActionLock for every action_type) makes STOP MERGES silently do
+    /// nothing for CloudMergeTree -- scheduleDataProcessingJob() checks this same blocker before
+    /// selecting merges *or* mutations (see its own comment), so this also pauses mutation
+    /// execution, matching StorageMergeTree's own scheduleDataProcessingJob semantics exactly.
+    /// PartsTTLMerge/PartsMove/Cleanup stay unwired (default no-op): CloudMergeTree has no
+    /// TTL-driven merges, no multi-disk part moves, and no separate cleanup thread yet -- correctly
+    /// reflecting the engine's actual current feature set, not an oversight.
+    ActionLock getActionLock(StorageActionBlockType action_type) override;
+
+    /// SYSTEM START MERGES: without this, background_operations_assignee stays idle until some
+    /// unrelated event (e.g. the next INSERT) happens to trigger a scheduling cycle -- merges/
+    /// mutations paused by STOP MERGES would resume only incidentally, not promptly. Matches
+    /// StorageMergeTree::onActionLockRemove()'s identical trigger() call.
+    void onActionLockRemove(StorageActionBlockType action_type) override;
+
 private:
     MergeTreeDataWriter writer;
     CloudMergeTreeCoordination coordination;

@@ -46,6 +46,11 @@ namespace ProfileEvents
 namespace DB
 {
 
+namespace ActionLocks
+{
+    extern const StorageActionBlockType PartsMerge;
+}
+
 namespace ErrorCodes
 {
     extern const int NOT_IMPLEMENTED;
@@ -58,6 +63,7 @@ namespace ErrorCodes
     extern const int INCOMPATIBLE_COLUMNS;
     extern const int CANNOT_ASSIGN_OPTIMIZE;
     extern const int UNKNOWN_POLICY;
+    extern const int ABORTED;
 }
 
 namespace MergeTreeSetting
@@ -1037,6 +1043,19 @@ CancellationCode StorageCloudMergeTree::killMutation(const String & mutation_id)
     return CancellationCode::CancelSent;
 }
 
+ActionLock StorageCloudMergeTree::getActionLock(StorageActionBlockType action_type)
+{
+    if (action_type == ActionLocks::PartsMerge)
+        return merger_mutator.merges_blocker.cancel();
+    return {};
+}
+
+void StorageCloudMergeTree::onActionLockRemove(StorageActionBlockType action_type)
+{
+    if (action_type == ActionLocks::PartsMerge)
+        background_operations_assignee.trigger();
+}
+
 bool StorageCloudMergeTree::scheduleDataProcessingJob(BackgroundJobsAssignee & assignee)
 {
     if (shutdown_called)
@@ -1049,6 +1068,14 @@ bool StorageCloudMergeTree::scheduleDataProcessingJob(BackgroundJobsAssignee & a
     CloudMutateSelectedEntryPtr mutate_entry;
     {
         std::unique_lock lock(currently_processing_in_background_mutex);
+
+        /// SYSTEM STOP MERGES: matches StorageMergeTree::scheduleDataProcessingJob's own
+        /// merges_blocker.isCancelled() check, which gates mutation selection too, not just merge
+        /// selection -- both use this same background-scheduling cycle. See getActionLock()'s doc
+        /// comment for why this check alone isn't enough without that override.
+        if (merger_mutator.merges_blocker.isCancelled())
+            return false;
+
         auto merge_select_result = selectPartsToMerge(metadata_snapshot, lock);
         if (merge_select_result)
             merge_entry = std::move(merge_select_result.value());
@@ -1118,6 +1145,13 @@ bool StorageCloudMergeTree::optimize(
         throw Exception(ErrorCodes::CANNOT_ASSIGN_OPTIMIZE, "Cannot OPTIMIZE with CLEANUP table: only ReplacingMergeTree can be CLEANUP");
     if (cleanup && !(*getSettings())[MergeTreeSetting::allow_experimental_replacing_merge_with_cleanup])
         throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "Experimental merges with CLEANUP are not allowed");
+
+    /// Matches StorageMergeTree::merge() (called from its own optimize()): an explicit OPTIMIZE
+    /// still must not proceed while SYSTEM STOP MERGES is in effect for this table -- getActionLock()
+    /// only made scheduleDataProcessingJob() (background scheduling) respect the blocker; without
+    /// this check here too, an explicit OPTIMIZE would silently ignore SYSTEM STOP MERGES entirely.
+    if (merger_mutator.merges_blocker.isCancelled())
+        throw Exception(ErrorCodes::ABORTED, "Cancelled merging parts");
 
     auto metadata_snapshot = getInMemoryMetadataPtr(local_context, false);
 
@@ -1622,9 +1656,172 @@ void StorageCloudMergeTree::replacePartitionFrom(const StoragePtr & source_table
         getStorageID().getNameForLogs());
 }
 
-void StorageCloudMergeTree::movePartitionToTable(const StoragePtr &, const ASTPtr &, ContextPtr)
+/// TSA_NO_THREAD_SAFETY_ANALYSIS: the std::lock()+adopt_lock dance below acquires two distinct
+/// mutex instances (this table's and dest_storage's) whose static identity clang's thread-safety
+/// analysis can't verify are always both released by every return path -- same reason upstream's
+/// own StorageMergeTree::movePartitionToTable carries this exact attribute.
+void StorageCloudMergeTree::movePartitionToTable(const StoragePtr & dest_table, const ASTPtr & partition, ContextPtr local_context) TSA_NO_THREAD_SAFETY_ANALYSIS
 {
-    throw Exception(ErrorCodes::NOT_IMPLEMENTED, "MOVE PARTITION is not implemented for CloudMergeTree yet");
+    auto component_guard = Coordination::setCurrentComponent("StorageCloudMergeTree::movePartitionToTable");
+
+    /// Phase 5 Step B: only between two CloudMergeTree tables, same as replacePartitionFrom().
+    auto * dest_storage = dynamic_cast<StorageCloudMergeTree *>(dest_table.get());
+    if (!dest_storage)
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+            "MOVE PARTITION ... TO TABLE is only implemented between two CloudMergeTree tables");
+
+    auto my_metadata_snapshot = getInMemoryMetadataPtr(local_context, false);
+    auto dest_metadata_snapshot = dest_storage->getInMemoryMetadataPtr(local_context, false);
+
+    /// this (self) is the SOURCE here -- opposite role from replacePartitionFrom(), where self was
+    /// the destination. checkStructureAndGetMergeTreeData() is symmetric (column/key/format_version
+    /// equality), so the direction of the call doesn't matter for the check itself.
+    checkStructureAndGetMergeTreeData(*dest_storage, my_metadata_snapshot, dest_metadata_snapshot);
+
+    if (getStoragePolicy()->getName() != dest_storage->getStoragePolicy()->getName())
+        throw Exception(ErrorCodes::UNKNOWN_POLICY,
+            "Source and destination table have different storage policies, cannot MOVE PARTITION between table {} and {}",
+            getStorageID().getNameForLogs(), dest_storage->getStorageID().getNameForLogs());
+
+    String partition_id = getPartitionIDFromQuery(partition, local_context);
+
+    /// Deadlock-free lock ordering across two tables -- MergeTreeData::operation_with_data_parts_mutex
+    /// exists specifically for this (its own doc comment references StorageMergeTree's own
+    /// movePartitionToTable use of std::lock() for exactly this reason). Held for the whole
+    /// select+clone+commit+admit sequence below, so a concurrent MOVE in the opposite direction (or
+    /// a second MOVE overlapping the same parts) can't race destructively.
+    std::lock(operation_with_data_parts_mutex, dest_storage->operation_with_data_parts_mutex);
+    OperationDataPartsLock src_op_lock(operation_with_data_parts_mutex, std::adopt_lock);
+    OperationDataPartsLock dest_op_lock(dest_storage->operation_with_data_parts_mutex, std::adopt_lock);
+
+    DataPartsVector src_parts;
+    for (const auto & part : getDataPartsVectorForInternalUsage({DataPartState::Active}, {DataPartKind::Regular}))
+        if (part->info.getPartitionId() == partition_id)
+            src_parts.push_back(part);
+
+    for (const auto & src_part : src_parts)
+        if (!canReplacePartition(src_part))
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                "Cannot move partition '{}': part '{}' has incompatible granularity for table {}",
+                partition_id, src_part->name, getStorageID().getNameForLogs());
+
+    auto zk = getZooKeeper();
+    auto zk_fault = std::make_shared<ZooKeeperWithFaultInjection>(zk);
+    dest_storage->coordination.ensureBlockNumbersPartition(zk, partition_id);
+
+    /// Clone onto the DESTINATION (it owns the target disk path -- relative_data_path is per-table
+    /// even though both tables share one storage policy per the check above), fresh block numbers
+    /// allocated on the destination's own counter -- matches replacePartitionFrom()'s identical
+    /// choice, and upstream's own dest_table_storage->cloneAndLoadDataPart(...).
+    MutableDataPartsVector new_parts;
+    std::vector<std::pair<String, String>> new_parts_with_headers;
+    std::vector<scope_guard> temp_dir_guards;
+    for (const auto & src_part : src_parts)
+    {
+        auto block_lock = createEphemeralLockInZooKeeper(
+            dest_storage->coordination.blockNumbersPartitionPath(partition_id) + "/block-",
+            dest_storage->coordination.tempPath(), zk_fault, /*deduplication_paths=*/ {}, /*znode_data=*/ std::nullopt);
+        Int64 block_number = block_lock.getNumber();
+        block_lock.unlock();
+
+        auto dst_part_info = src_part->info;
+        dst_part_info.min_block = dst_part_info.max_block = block_number;
+        dst_part_info.level = dest_storage->getLevelForAdoptedPart(*this, src_part->info.level);
+        dst_part_info.mutation = 0;
+
+        IDataPartStorage::ClonePartParams clone_params;
+        clone_params.copy_instead_of_hardlink = true;
+        clone_params.metadata_version_to_write = dest_metadata_snapshot->getMetadataVersion();
+
+        auto [dst_part, temp_dir_guard] = dest_storage->cloneAndLoadDataPart(
+            src_part, "tmp_move_to_table_", dst_part_info, dest_metadata_snapshot, clone_params,
+            local_context->getReadSettings(), local_context->getWriteSettings(), /*must_on_same_disk=*/ true);
+
+        new_parts.push_back(dst_part);
+        new_parts_with_headers.emplace_back(dst_part->name, serializePartHeader(dst_part));
+        temp_dir_guards.push_back(std::move(temp_dir_guard));
+    }
+
+    if (new_parts_with_headers.empty())
+        return; /// Nothing to move: empty source partition.
+
+    /// Bounded retry against a concurrent DROP/merge racing on the SOURCE's own parts in this
+    /// partition: the multi() below fails closed (ZNONODE) if any old part we're moving away was
+    /// already deactivated elsewhere -- same fail-closed/retry shape replacePartitionFrom() already
+    /// established. A failed multi() is all-or-nothing, so new_parts_with_headers (already cloned
+    /// onto the destination) is safe to reuse unchanged on retry.
+    for (int attempt = 0; attempt < 20; ++attempt)
+    {
+        Strings old_part_names_to_remove;
+        for (const auto & part : getDataPartsVectorForInternalUsage({DataPartState::Active}, {DataPartKind::Regular}))
+            if (part->info.getPartitionId() == partition_id)
+                old_part_names_to_remove.push_back(part->name);
+
+        /// No single CloudMergeTreeCoordination instance can build this multi() -- it spans two
+        /// tables' Keeper roots. Built directly here from both instances' already-public path
+        /// helpers (plain string concatenation, safe to call on either instance); one ZooKeeperPtr
+        /// issues the whole multi() regardless, since both roots live in the same Keeper cluster.
+        /// This is the one thing neither StorageReplicatedMergeTree nor StorageMergeTree does
+        /// atomically -- see the Context section.
+        Coordination::Requests ops;
+        for (const auto & [name, header] : new_parts_with_headers)
+            ops.emplace_back(zkutil::makeCreateRequest(dest_storage->coordination.partPath(name), header, zkutil::CreateMode::Persistent));
+
+        const String tombstone_ts = toString(static_cast<Int64>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count()));
+        for (const auto & name : old_part_names_to_remove)
+        {
+            ops.emplace_back(zkutil::makeRemoveRequest(coordination.partPath(name), -1));
+            ops.emplace_back(zkutil::makeCreateRequest(coordination.droppedPartPath(name), tombstone_ts, zkutil::CreateMode::Persistent));
+        }
+
+        Coordination::Responses responses;
+        auto code = zk->tryMultiNoThrow(ops, responses);
+        if (code == Coordination::Error::ZNONODE)
+            continue;
+        if (code != Coordination::Error::ZOK)
+            throw zkutil::KeeperException(code, "Cannot commit MOVE PARTITION in Keeper between table {} and {}",
+                getStorageID().getNameForLogs(), dest_storage->getStorageID().getNameForLogs());
+
+        /// Admit the new parts on the destination.
+        Transaction dest_transaction(*dest_storage, nullptr);
+        DataPartsVector dest_covered_parts;
+        {
+            auto dest_lock = dest_storage->lockParts();
+            for (auto & part : new_parts)
+                dest_storage->renameTempPartAndAdd(part, dest_transaction, dest_lock, /*rename_in_transaction=*/ false);
+            dest_covered_parts = dest_transaction.commit(dest_lock);
+            for (const auto & covered : dest_covered_parts)
+                dest_storage->modifyPartState(covered, DataPartState::Deleting, dest_lock);
+        }
+        if (!dest_covered_parts.empty())
+            dest_storage->removePartsFinally(dest_covered_parts);
+
+        /// Evict the moved-away parts on the source (self).
+        DataPartsVector src_to_remove;
+        {
+            auto src_lock = lockParts();
+            std::unordered_set<std::string> old_names_set(old_part_names_to_remove.begin(), old_part_names_to_remove.end());
+            auto known = getDataPartsVectorForInternalUsage({DataPartState::Active}, {DataPartKind::Regular}, src_lock);
+            for (const auto & part : known)
+                if (old_names_set.contains(part->name))
+                    src_to_remove.push_back(part);
+
+            if (!src_to_remove.empty())
+            {
+                removePartsFromWorkingSet(/*txn=*/ nullptr, src_to_remove, /*clear_without_timeout=*/ true, src_lock);
+                for (const auto & part : src_to_remove)
+                    modifyPartState(part, DataPartState::Deleting, src_lock);
+            }
+        }
+        if (!src_to_remove.empty())
+            removePartsFinally(src_to_remove);
+        return;
+    }
+
+    throw Exception(ErrorCodes::LOGICAL_ERROR,
+        "Failed to commit MOVE PARTITION in Keeper between table {} and {} after repeated concurrent-modification retries",
+        getStorageID().getNameForLogs(), dest_storage->getStorageID().getNameForLogs());
 }
 
 void StorageCloudMergeTree::updatePartSetFromKeeper()

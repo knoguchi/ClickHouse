@@ -1746,3 +1746,265 @@ def test_replace_partition_old_parts_survive_grace_period_then_reclaimed(cluster
     finally:
         node1.query(f"DROP TABLE IF EXISTS {src_table} SYNC")
         node1.query(f"DROP TABLE IF EXISTS {dst_table} SYNC")
+
+
+def test_move_partition_to_table_moves_data(cluster):
+    node1 = cluster.instances["node1"]
+    src_table = "cloud_test_move_src"
+    dst_table = "cloud_test_move_dst"
+    ddl = "(id UInt64, data String) ENGINE = CloudMergeTree ORDER BY id PARTITION BY id % 2 SETTINGS storage_policy = 's3'"
+
+    node1.query(f"DROP TABLE IF EXISTS {src_table} SYNC")
+    node1.query(f"DROP TABLE IF EXISTS {dst_table} SYNC")
+    node1.query(f"CREATE TABLE {src_table} {ddl}")
+    node1.query(f"CREATE TABLE {dst_table} {ddl}")
+    try:
+        # src has data in both partitions; dst already has some data in partition 1.
+        node1.query(f"INSERT INTO {src_table} VALUES (10, 'move0a')")
+        node1.query(f"INSERT INTO {src_table} VALUES (12, 'move0b')")
+        node1.query(f"INSERT INTO {src_table} VALUES (11, 'stay1')")
+        node1.query(f"INSERT INTO {dst_table} VALUES (3, 'existing1')")
+
+        node1.query(f"ALTER TABLE {src_table} MOVE PARTITION 0 TO TABLE {dst_table}")
+
+        # Source: partition 0 is gone entirely, partition 1 untouched.
+        assert node1.query(f"SELECT count() FROM {src_table} WHERE id % 2 = 0").strip() == "0"
+        assert node1.query(f"SELECT data FROM {src_table} WHERE id = 11").strip() == "stay1"
+
+        # Destination: gained partition 0's data, its own partition 1 data untouched.
+        result = sorted(
+            node1.query(f"SELECT data FROM {dst_table} WHERE id % 2 = 0 ORDER BY id")
+            .strip()
+            .splitlines()
+        )
+        assert result == sorted(["move0a", "move0b"])
+        assert node1.query(f"SELECT data FROM {dst_table} WHERE id = 3").strip() == "existing1"
+    finally:
+        node1.query(f"DROP TABLE IF EXISTS {src_table} SYNC")
+        node1.query(f"DROP TABLE IF EXISTS {dst_table} SYNC")
+
+
+def test_move_partition_source_parts_survive_grace_period_then_reclaimed(cluster):
+    node1 = cluster.instances["node1"]
+    src_table = "cloud_test_move_gc_src"
+    dst_table = "cloud_test_move_gc_dst"
+
+    node1.query(f"DROP TABLE IF EXISTS {src_table} SYNC")
+    node1.query(f"DROP TABLE IF EXISTS {dst_table} SYNC")
+    node1.query(
+        f"CREATE TABLE {src_table} (id UInt64, data String) ENGINE = CloudMergeTree "
+        f"ORDER BY id SETTINGS {GC_TABLE_DDL_SETTINGS}"
+    )
+    node1.query(
+        f"CREATE TABLE {dst_table} (id UInt64, data String) ENGINE = CloudMergeTree "
+        f"ORDER BY id SETTINGS storage_policy = 's3'"
+    )
+    try:
+        src_uuid = node1.query(
+            f"SELECT uuid FROM system.tables WHERE table = '{src_table}'"
+        ).strip()
+        node1.query(f"INSERT INTO {src_table} VALUES (1, 'moved')")
+
+        node1.query(f"ALTER TABLE {src_table} MOVE PARTITION ID 'all' TO TABLE {dst_table}")
+        assert node1.query(f"SELECT data FROM {dst_table} WHERE id = 1").strip() == "moved"
+        assert node1.query(f"SELECT count() FROM {src_table}").strip() == "0"
+
+        # The moved-away source part is tombstoned (not deleted inline) -- same lazy-GC path as
+        # DROP PARTITION and REPLACE PARTITION's replaced-away parts.
+        assert (
+            int(
+                node1.query(
+                    f"SELECT count() FROM system.zookeeper WHERE path = "
+                    f"'/clickhouse/cloud_tables/{src_uuid}/dropped_parts'"
+                ).strip()
+            )
+            > 0
+        )
+        assert_eq_with_retry(
+            node1,
+            f"SELECT count() FROM system.zookeeper WHERE path = "
+            f"'/clickhouse/cloud_tables/{src_uuid}/dropped_parts'",
+            "0",
+            retry_count=30,
+            sleep_time=1,
+        )
+
+        # Destination's independent copy is untouched by the source's GC.
+        assert node1.query(f"SELECT data FROM {dst_table} WHERE id = 1").strip() == "moved"
+    finally:
+        node1.query(f"DROP TABLE IF EXISTS {src_table} SYNC")
+        node1.query(f"DROP TABLE IF EXISTS {dst_table} SYNC")
+
+
+def test_move_partition_mismatched_schema_throws(cluster):
+    node1 = cluster.instances["node1"]
+    src_table = "cloud_test_move_schema_src"
+    dst_table = "cloud_test_move_schema_dst"
+
+    node1.query(f"DROP TABLE IF EXISTS {src_table} SYNC")
+    node1.query(f"DROP TABLE IF EXISTS {dst_table} SYNC")
+    node1.query(f"CREATE TABLE {src_table} {TABLE_DDL}")
+    node1.query(
+        f"CREATE TABLE {dst_table} (id UInt64, extra UInt64) ENGINE = CloudMergeTree "
+        f"ORDER BY id SETTINGS storage_policy = 's3'"
+    )
+    try:
+        with pytest.raises(QueryRuntimeException) as exc:
+            node1.query(f"ALTER TABLE {src_table} MOVE PARTITION ID 'all' TO TABLE {dst_table}")
+        assert "INCOMPATIBLE_COLUMNS" in str(exc.value)
+    finally:
+        node1.query(f"DROP TABLE IF EXISTS {src_table} SYNC")
+        node1.query(f"DROP TABLE IF EXISTS {dst_table} SYNC")
+
+
+def test_move_partition_visible_on_both_tables_other_replicas(cluster):
+    node1 = cluster.instances["node1"]
+    node2 = cluster.instances["node2"]
+    src_table = "cloud_test_move_xreplica_src"
+    dst_table = "cloud_test_move_xreplica_dst"
+
+    node1.query(f"DROP TABLE IF EXISTS {src_table} SYNC")
+    node1.query(f"DROP TABLE IF EXISTS {dst_table} SYNC")
+    node1.query(f"CREATE TABLE {src_table} {TABLE_DDL}")
+    node1.query(f"CREATE TABLE {dst_table} {TABLE_DDL}")
+    src_uuid = node1.query(
+        f"SELECT uuid FROM system.tables WHERE table = '{src_table}'"
+    ).strip()
+    dst_uuid = node1.query(
+        f"SELECT uuid FROM system.tables WHERE table = '{dst_table}'"
+    ).strip()
+    node2.query(f"ATTACH TABLE {src_table} UUID '{src_uuid}' {TABLE_DDL}")
+    node2.query(f"ATTACH TABLE {dst_table} UUID '{dst_uuid}' {TABLE_DDL}")
+    try:
+        node1.query(f"INSERT INTO {src_table} VALUES (1, 'moved')")
+        assert_eq_with_retry(node2, f"SELECT count() FROM {src_table}", "1")
+
+        node1.query(f"ALTER TABLE {src_table} MOVE PARTITION ID 'all' TO TABLE {dst_table}")
+
+        # Neither replica of either table ran the MOVE itself -- purely Keeper-watcher-driven.
+        assert_eq_with_retry(node2, f"SELECT count() FROM {src_table}", "0")
+        assert_eq_with_retry(node2, f"SELECT count() FROM {dst_table}", "1")
+        assert_eq_with_retry(node2, f"SELECT data FROM {dst_table} WHERE id = 1", "moved")
+    finally:
+        node2.query(f"DROP TABLE IF EXISTS {src_table} SYNC")
+        node2.query(f"DROP TABLE IF EXISTS {dst_table} SYNC")
+        node1.query(f"DROP TABLE IF EXISTS {src_table} SYNC")
+        node1.query(f"DROP TABLE IF EXISTS {dst_table} SYNC")
+
+
+def test_concurrent_move_partition_opposite_directions_no_deadlock(cluster):
+    node1 = cluster.instances["node1"]
+    node2 = cluster.instances["node2"]
+    table_a = "cloud_test_move_concurrent_a"
+    table_b = "cloud_test_move_concurrent_b"
+    ddl = "(id UInt64, data String) ENGINE = CloudMergeTree ORDER BY id PARTITION BY id % 2 SETTINGS storage_policy = 's3'"
+
+    node1.query(f"DROP TABLE IF EXISTS {table_a} SYNC")
+    node1.query(f"DROP TABLE IF EXISTS {table_b} SYNC")
+    node1.query(f"CREATE TABLE {table_a} {ddl}")
+    node1.query(f"CREATE TABLE {table_b} {ddl}")
+    a_uuid = node1.query(f"SELECT uuid FROM system.tables WHERE table = '{table_a}'").strip()
+    b_uuid = node1.query(f"SELECT uuid FROM system.tables WHERE table = '{table_b}'").strip()
+    node2.query(f"ATTACH TABLE {table_a} UUID '{a_uuid}' {ddl}")
+    node2.query(f"ATTACH TABLE {table_b} UUID '{b_uuid}' {ddl}")
+    try:
+        # a's partition 0 moves to b; b's partition 1 moves to a -- opposite directions between
+        # the same two tables, issued from different replicas at once. Exercises the two-table
+        # operation_with_data_parts_mutex lock-ordering discipline: without deadlock-free
+        # ordering (std::lock()), these two calls could each hold one table's lock while waiting
+        # for the other's, forever.
+        node1.query(f"INSERT INTO {table_a} VALUES (10, 'a0')")
+        node2.query(f"INSERT INTO {table_b} VALUES (11, 'b1')")
+        assert_eq_with_retry(node2, f"SELECT count() FROM {table_a}", "1")
+        assert_eq_with_retry(node1, f"SELECT count() FROM {table_b}", "1")
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [
+                executor.submit(
+                    node1.query, f"ALTER TABLE {table_a} MOVE PARTITION 0 TO TABLE {table_b}"
+                ),
+                executor.submit(
+                    node2.query, f"ALTER TABLE {table_b} MOVE PARTITION 1 TO TABLE {table_a}"
+                ),
+            ]
+            for future in futures:
+                future.result(timeout=60)
+
+        assert_eq_with_retry(node1, f"SELECT data FROM {table_b} WHERE id = 10", "a0")
+        assert_eq_with_retry(node1, f"SELECT data FROM {table_a} WHERE id = 11", "b1")
+        assert_eq_with_retry(node1, f"SELECT count() FROM {table_a} WHERE id % 2 = 0", "0")
+        assert_eq_with_retry(node1, f"SELECT count() FROM {table_b} WHERE id % 2 = 1", "0")
+    finally:
+        node2.query(f"DROP TABLE IF EXISTS {table_a} SYNC")
+        node2.query(f"DROP TABLE IF EXISTS {table_b} SYNC")
+        node1.query(f"DROP TABLE IF EXISTS {table_a} SYNC")
+        node1.query(f"DROP TABLE IF EXISTS {table_b} SYNC")
+
+
+def test_system_stop_merges_prevents_background_merge(cluster):
+    node1 = cluster.instances["node1"]
+
+    node1.query(f"CREATE TABLE {TABLE_NAME} {TABLE_DDL}")
+    try:
+        node1.query(f"SYSTEM STOP MERGES {TABLE_NAME}")
+
+        node1.query(f"INSERT INTO {TABLE_NAME} VALUES (1, 'a')")
+        node1.query(f"INSERT INTO {TABLE_NAME} VALUES (2, 'b')")
+        node1.query(f"INSERT INTO {TABLE_NAME} VALUES (3, 'c')")
+
+        # Before getActionLock() was wired up, IStorage's default no-op ActionLock meant
+        # scheduleDataProcessingJob() never even checked merges_blocker -- STOP MERGES had zero
+        # effect and the background scheduler kept consolidating parts regardless. Give it a
+        # window it would have used.
+        time.sleep(3)
+        assert node1.query(
+            f"SELECT count() FROM system.parts WHERE table = '{TABLE_NAME}' AND active"
+        ).strip() == "3"
+
+        # SYSTEM START MERGES lifts the blocker and wakes the background scheduler immediately
+        # (onActionLockRemove() -> background_operations_assignee.trigger()), but doesn't force a
+        # merge to happen -- ordinary (non-aggressive) background selection has no bounded-time
+        # guarantee of consolidating a handful of small parts (that's why every other merge-
+        # completion test in this file uses an explicit OPTIMIZE TABLE rather than a timing-based
+        # wait on the background scheduler alone). OPTIMIZE TABLE itself also respects the same
+        # blocker (matches StorageMergeTree::merge(), which throws ABORTED if still stopped) -- so
+        # calling it right after START MERGES doubles as direct proof the blocker was genuinely
+        # released, not just that the scheduler woke up.
+        node1.query(f"SYSTEM START MERGES {TABLE_NAME}")
+        node1.query(f"OPTIMIZE TABLE {TABLE_NAME}")
+        assert_eq_with_retry(
+            node1,
+            f"SELECT count() FROM system.parts WHERE table = '{TABLE_NAME}' AND active",
+            "1",
+        )
+        assert node1.query(f"SELECT sum(id) FROM {TABLE_NAME}").strip() == "6"
+    finally:
+        node1.query(f"SYSTEM START MERGES {TABLE_NAME}")
+
+
+def test_optimize_throws_when_merges_stopped(cluster):
+    node1 = cluster.instances["node1"]
+
+    node1.query(f"CREATE TABLE {TABLE_NAME} {TABLE_DDL}")
+    try:
+        node1.query(f"INSERT INTO {TABLE_NAME} VALUES (1, 'a')")
+        node1.query(f"INSERT INTO {TABLE_NAME} VALUES (2, 'b')")
+
+        node1.query(f"SYSTEM STOP MERGES {TABLE_NAME}")
+
+        # An explicit OPTIMIZE must still respect SYSTEM STOP MERGES, matching
+        # StorageMergeTree::merge()'s own merges_blocker.isCancelledForPartition() check -- not
+        # silently proceed just because it bypasses the background scheduler.
+        with pytest.raises(QueryRuntimeException) as exc:
+            node1.query(f"OPTIMIZE TABLE {TABLE_NAME}")
+        assert "ABORTED" in str(exc.value)
+
+        node1.query(f"SYSTEM START MERGES {TABLE_NAME}")
+        node1.query(f"OPTIMIZE TABLE {TABLE_NAME}")
+        assert_eq_with_retry(
+            node1,
+            f"SELECT count() FROM system.parts WHERE table = '{TABLE_NAME}' AND active",
+            "1",
+        )
+    finally:
+        node1.query(f"SYSTEM START MERGES {TABLE_NAME}")
