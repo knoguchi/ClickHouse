@@ -6,6 +6,7 @@
 #include <Storages/StorageFactory.h>
 #include <Storages/StorageMergeTree.h>
 #include <Storages/StorageReplicatedMergeTree.h>
+#include <Storages/MergeTree/CloudMergeTree/StorageCloudMergeTree.h>
 #include <Storages/TableZnodeInfo.h>
 
 #include <Compression/CompressionFactory.h>
@@ -216,12 +217,22 @@ static bool isReplicated(const String & engine_name)
     return engine_name.starts_with("Replicated") && engine_name.ends_with("MergeTree");
 }
 
-/// Returns the part of the name of a table engine between "Replicated" (if any) and "MergeTree".
+/// CloudMergeTree: stateless-replica engine whose part set lives in Keeper and whose data lives on
+/// shared object storage. Phase 0 supports only the Ordinary mode ("CloudMergeTree").
+static bool isCloud(const String & engine_name)
+{
+    return engine_name == "CloudMergeTree";
+}
+
+/// Returns the part of the name of a table engine between the "Replicated"/"Cloud" prefix (if any)
+/// and "MergeTree".
 static std::string_view getNamePart(const String & engine_name)
 {
     std::string_view name_part = engine_name;
     if (name_part.starts_with("Replicated"))
         name_part.remove_prefix(strlen("Replicated"));
+    else if (name_part.starts_with("Cloud"))
+        name_part.remove_prefix(strlen("Cloud"));
 
     if (name_part.ends_with("MergeTree"))
         name_part.remove_suffix(strlen("MergeTree"));
@@ -433,6 +444,7 @@ static StoragePtr create(const StorageFactory::Arguments & args)
     const Settings & local_settings = args.getLocalContext()->getSettingsRef();
 
     bool replicated = isReplicated(args.engine_name);
+    bool cloud = isCloud(args.engine_name);
     std::string_view name_part = getNamePart(args.engine_name);
 
     MergeTreeData::MergingParams merging_params;
@@ -1173,6 +1185,23 @@ static StoragePtr create(const StorageFactory::Arguments & args)
             create_query_zk_retries_info);
     }
 
+    if (cloud)
+    {
+        /// Phase 0: the Keeper root is derived from the table UUID, so CloudMergeTree takes no
+        /// engine arguments (`ENGINE = CloudMergeTree ORDER BY ...`), like SharedMergeTree in Cloud.
+        const String zookeeper_root = "/clickhouse/cloud_tables/" + toString(args.table_id.uuid);
+        return std::make_shared<StorageCloudMergeTree>(
+            zookeeper_root,
+            args.table_id,
+            args.relative_data_path,
+            metadata,
+            args.mode,
+            context,
+            date_column_name,
+            merging_params,
+            std::move(storage_settings));
+    }
+
     return std::make_shared<StorageMergeTree>(
         args.table_id,
         args.relative_data_path,
@@ -1198,6 +1227,16 @@ void registerStorageMergeTree(StorageFactory & factory)
         .supports_unique_key = true,
         .has_builtin_setting_fn = MergeTreeSettings::hasBuiltin,
     };
+
+    factory.registerStorage("CloudMergeTree", create, features, Documentation{
+        .description = R"DOCS_MD(
+A stateless-replica MergeTree whose authoritative set of active parts lives in Keeper and whose
+part data lives on a shared object-storage disk. Replicas own no parts and read the same global
+part set from Keeper. This is the open-source counterpart of the Cloud `SharedMergeTree` engine.
+The Keeper root is derived from the table UUID, so no engine arguments are required.
+)DOCS_MD",
+        .syntax = "ENGINE = CloudMergeTree ORDER BY expr",
+        .related = {"MergeTree", "ReplicatedMergeTree"}});
 
     factory.registerStorage("MergeTree", create, features, Documentation{
         .description = String(R"DOCS_MD(

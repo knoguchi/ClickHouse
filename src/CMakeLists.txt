@@ -176,6 +176,7 @@ add_headers_and_sources(dbms Storages/BigQuery)
 add_headers_and_sources(dbms Core/Streaming)
 add_headers_and_sources(dbms Storages/Streaming)
 add_headers_and_sources(dbms Storages/MergeTree/Streaming)
+add_headers_and_sources(dbms Storages/MergeTree/CloudMergeTree)
 
 if (TARGET ch_contrib::amqp_cpp)
     add_headers_and_sources(dbms Storages/RabbitMQ)
