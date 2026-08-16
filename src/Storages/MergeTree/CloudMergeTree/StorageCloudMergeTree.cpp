@@ -976,6 +976,38 @@ void StorageCloudMergeTree::alter(const AlterCommands & params, ContextPtr local
         table_id.getNameForLogs());
 }
 
+CancellationCode StorageCloudMergeTree::killMutation(const String & mutation_id)
+{
+    auto component_guard = Coordination::setCurrentComponent("StorageCloudMergeTree::killMutation");
+    auto zk = getZooKeeper();
+
+    /// Read before removing: block_numbers is needed below to cancel any currently-running part
+    /// mutations tracked in the MergeList, and tryRemove() doesn't hand back the payload.
+    String entry_text;
+    if (!zk->tryGet(coordination.mutationPath(mutation_id), entry_text))
+        return CancellationCode::NotFound;
+
+    auto code = zk->tryRemove(coordination.mutationPath(mutation_id));
+    if (code == Coordination::Error::ZNONODE)
+        return CancellationCode::NotFound; /// lost a race against a concurrent KILL MUTATION for the same id
+    if (code != Coordination::Error::ZOK)
+        throw zkutil::KeeperException(code, "Cannot remove mutation {} from Keeper for table {}", mutation_id, getStorageID().getNameForLogs());
+
+    try
+    {
+        auto entry = ReplicatedMergeTreeMutationEntry::parse(entry_text, mutation_id);
+        for (const auto & [partition_id, block_number] : entry.block_numbers)
+            getContext()->getMergeList().cancelPartMutations(getStorageID(), partition_id, block_number);
+    }
+    catch (const Exception &)
+    {
+        /// Malformed entry text -- already removed from Keeper above regardless, nothing more to
+        /// safely clean up, but the mutation is genuinely gone either way.
+    }
+
+    return CancellationCode::CancelSent;
+}
+
 bool StorageCloudMergeTree::scheduleDataProcessingJob(BackgroundJobsAssignee & assignee)
 {
     if (shutdown_called)

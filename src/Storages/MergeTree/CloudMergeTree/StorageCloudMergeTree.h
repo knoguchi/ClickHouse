@@ -185,6 +185,18 @@ public:
     /// StorageReplicatedMergeTree::alter()'s own atomic-together shape (DESIGN.md invariant 3).
     void alter(const AlterCommands & params, ContextPtr context, AlterLockHolder & alter_lock_holder) override;
 
+    /// KILL MUTATION: removes the mutations/<mutation_id> znode outright (CloudMergeTree has no
+    /// persistent per-engine mutation bookkeeping to reconcile the way StorageMergeTree's
+    /// current_mutations_by_version or StorageReplicatedMergeTree's queue does -- every status/
+    /// selection call already derives live state straight from Keeper via loadSortedMutations(),
+    /// see getMutationsStatus()/selectPartsToMutate()). Once the znode is gone, no *new*
+    /// CloudMergeMutateTask is ever selected for it; an already in-flight execution for it still
+    /// finishes its current attempt rather than being interrupted mid-flight -- the same
+    /// coarser-grained, best-effort cancellation model StorageMergeTree/StorageReplicatedMergeTree
+    /// themselves settle for. Returns NotFound if the mutation was already gone (finished, or
+    /// killed by a concurrent racer).
+    CancellationCode killMutation(const String & mutation_id) override;
+
 private:
     MergeTreeDataWriter writer;
     CloudMergeTreeCoordination coordination;

@@ -1369,3 +1369,84 @@ def test_detached_part_survives_grace_period_and_can_be_reattached(cluster):
         assert node1.query(f"SELECT data FROM {table} WHERE id = 1").strip() == "a"
     finally:
         node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
+
+
+def test_kill_mutation_prevents_data_rewrite(cluster):
+    node1 = cluster.instances["node1"]
+    table = "cloud_test_kill_mutation"
+
+    node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
+    node1.query(
+        f"CREATE TABLE {table} (id UInt64, data String) ENGINE = CloudMergeTree "
+        f"ORDER BY id SETTINGS storage_policy = 's3'"
+    )
+    try:
+        node1.query(f"INSERT INTO {table} VALUES (1, 'orig')")
+
+        # Pause background scheduling so the submitted mutation cannot start executing before we
+        # kill it -- otherwise this test would race the background CloudMergeMutateTask.
+        node1.query(f"SYSTEM STOP MERGES {table}")
+
+        node1.query(f"ALTER TABLE {table} UPDATE data = 'mutated' WHERE 1")
+        mutation_id = node1.query(
+            f"SELECT mutation_id FROM system.mutations WHERE table = '{table}' AND NOT is_done"
+        ).strip()
+        assert mutation_id != ""
+
+        node1.query(f"KILL MUTATION WHERE table = '{table}' AND mutation_id = '{mutation_id}'")
+
+        assert_eq_with_retry(
+            node1,
+            f"SELECT count() FROM system.mutations WHERE table = '{table}' AND mutation_id = '{mutation_id}'",
+            "0",
+        )
+
+        node1.query(f"SYSTEM START MERGES {table}")
+
+        # Give the (now mutation-less) background scheduler a moment to run, then confirm the kill
+        # stuck -- the row was never rewritten.
+        time.sleep(3)
+        assert node1.query(f"SELECT data FROM {table} WHERE id = 1").strip() == "orig"
+    finally:
+        node1.query(f"SYSTEM START MERGES {table}")
+        node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
+
+
+def test_kill_mutation_on_finished_mutation_removes_it_from_system_mutations(cluster):
+    node1 = cluster.instances["node1"]
+
+    node1.query(f"CREATE TABLE {TABLE_NAME} {TABLE_DDL}")
+    node1.query(f"INSERT INTO {TABLE_NAME} VALUES (1, 'a')")
+
+    node1.query(f"ALTER TABLE {TABLE_NAME} UPDATE data = 'b' WHERE 1")
+    assert_eq_with_retry(node1, f"SELECT data FROM {TABLE_NAME} WHERE id = 1", "b")
+
+    mutation_id = node1.query(
+        f"SELECT mutation_id FROM system.mutations WHERE table = '{TABLE_NAME}' AND is_done = 1"
+    ).strip()
+    assert mutation_id != ""
+
+    # CloudMergeTree never automatically removes a mutations/<id> znode once its work is done (a
+    # documented, separate gap from this fix) -- KILL MUTATION on an already-finished mutation is
+    # therefore also the only way to manually reclaim it today. Must succeed cleanly, not throw,
+    # and actually remove the (now inert) Keeper entry.
+    node1.query(f"KILL MUTATION WHERE table = '{TABLE_NAME}' AND mutation_id = '{mutation_id}'")
+    assert_eq_with_retry(
+        node1,
+        f"SELECT count() FROM system.mutations WHERE table = '{TABLE_NAME}' AND mutation_id = '{mutation_id}'",
+        "0",
+    )
+    # The already-applied data is untouched by killing the (already-finished) mutation entry.
+    assert node1.query(f"SELECT data FROM {TABLE_NAME} WHERE id = 1").strip() == "b"
+
+
+def test_kill_mutation_on_nonexistent_id_is_a_no_op(cluster):
+    node1 = cluster.instances["node1"]
+
+    node1.query(f"CREATE TABLE {TABLE_NAME} {TABLE_DDL}")
+    node1.query(f"INSERT INTO {TABLE_NAME} VALUES (1, 'a')")
+
+    # KILL MUTATION targeting an id that was never submitted for this table at all must be a safe
+    # no-op, not an error.
+    node1.query(f"KILL MUTATION WHERE table = '{TABLE_NAME}' AND mutation_id = '99999999'")
+    assert node1.query(f"SELECT data FROM {TABLE_NAME} WHERE id = 1").strip() == "a"
