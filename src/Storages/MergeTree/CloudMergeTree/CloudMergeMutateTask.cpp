@@ -70,6 +70,7 @@ bool CloudMergeMutateTask::executeStep()
                 if (!heartbeatLeaseIfDue())
                 {
                     write_part_log(ExecutionStatus(0, "Lost the mutation lease to another replica (went stale)"));
+                    lease_lost = true;
                     state = State::NEED_FINISH;
                     return true;
                 }
@@ -165,6 +166,19 @@ void CloudMergeMutateTask::prepare()
 
 void CloudMergeMutateTask::finish()
 {
+    if (lease_lost)
+    {
+        /// mutate_task never ran to completion when NEED_EXECUTE bailed here via a lost lease --
+        /// its std::future promise is only fulfilled on successful completion (MutateTask::execute()
+        /// last iteration), so the unconditional getFuture().get() below would block this thread
+        /// forever waiting for a result that will never arrive. Nothing was produced to commit;
+        /// release mutate_task and finalize, mirroring cancel()'s own cleanup.
+        if (mutate_task)
+            mutate_task->cancel();
+        mutate_entry->finalize();
+        return;
+    }
+
     new_part = mutate_task->getFuture().get();
 
     bool committed = storage.commitMergedPart(

@@ -110,6 +110,7 @@ bool CloudMergePlainMergeTreeTask::executeStep()
                     /// Another replica's staleness check stole this lease out from under us --
                     /// stop immediately rather than finish work that can never commit.
                     write_part_log(ExecutionStatus(0, "Lost the merge lease to another replica (went stale)"));
+                    lease_lost = true;
                     state = State::NEED_FINISH;
                     return true;
                 }
@@ -225,6 +226,19 @@ void CloudMergePlainMergeTreeTask::prepare()
 
 void CloudMergePlainMergeTreeTask::finish()
 {
+    if (lease_lost)
+    {
+        /// merge_task never ran to completion when NEED_EXECUTE bailed here via a lost lease --
+        /// its std::future promise is only fulfilled on successful completion (MergeTask::execute()
+        /// last iteration), so the unconditional getFuture().get() below would block this thread
+        /// forever waiting for a result that will never arrive. Nothing was produced to commit;
+        /// release merge_task and finalize, mirroring cancel()'s own cleanup.
+        if (merge_task)
+            merge_task->cancel();
+        merge_mutate_entry->finalize();
+        return;
+    }
+
     new_part = merge_task->getFuture().get();
 
     bool committed = storage.commitMergedPart(

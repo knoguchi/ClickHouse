@@ -2519,3 +2519,43 @@ def test_optimize_partition_visible_on_second_replica(cluster):
     )
     assert_eq_with_retry(node2, f"SELECT count() FROM {TABLE_NAME}", "4")
     assert_eq_with_retry(node2, f"SELECT sum(id) FROM {TABLE_NAME}", "13")
+
+
+def test_lease_loss_during_optimize_does_not_hang(cluster):
+    node1 = cluster.instances["node1"]
+    node2 = cluster.instances["node2"]
+    table = "cloud_test_lease_loss"
+    ddl = (
+        "(id UInt64, data String) ENGINE = CloudMergeTree ORDER BY id "
+        "SETTINGS storage_policy = 's3', cloud_merge_tree_lease_staleness_ms = 0"
+    )
+
+    node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
+    node1.query(f"CREATE TABLE {table} {ddl}")
+    table_uuid = node1.query(f"SELECT uuid FROM system.tables WHERE table = '{table}'").strip()
+    node2.query(f"ATTACH TABLE {table} UUID '{table_uuid}' {ddl}")
+    try:
+        for i in range(1, 6):
+            node1.query(f"INSERT INTO {table} VALUES ({i}, 'v{i}')")
+        assert_eq_with_retry(node2, f"SELECT count() FROM {table}", "5")
+
+        # cloud_merge_tree_lease_staleness_ms = 0: any concurrent lease acquisition attempt treats
+        # an existing lease as immediately stale and steals it, so two replicas racing the same
+        # OPTIMIZE reliably drive one side's executeStep() into the lost-lease branch. OPTIMIZE
+        # runs synchronously on the query's own thread (see optimizeUntilConverged()'s
+        # executeHere() call, not the background pool), so without the finish()/lease_lost fix,
+        # that side's query would hang forever inside the unconditional
+        # merge_task->getFuture().get() -- surfacing here as a client-side timeout, not a
+        # server-side symptom this test would otherwise have to poll for.
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [
+                executor.submit(node1.query, f"OPTIMIZE TABLE {table}"),
+                executor.submit(node2.query, f"OPTIMIZE TABLE {table}"),
+            ]
+            for future in futures:
+                future.result(timeout=60)
+
+        assert_eq_with_retry(node1, f"SELECT count() FROM {table}", "5")
+        assert_eq_with_retry(node2, f"SELECT count() FROM {table}", "5")
+    finally:
+        node1.query(f"DROP TABLE IF EXISTS {table} SYNC")

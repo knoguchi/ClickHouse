@@ -151,6 +151,11 @@ private:
     int32_t current_lease_version{0};
     UInt64 last_heartbeat_ms{0};
 
+    /// Set when NEED_EXECUTE bails into NEED_FINISH via a lost lease rather than merge_task
+    /// actually completing -- see finish()'s own doc comment on why this must be checked before
+    /// touching merge_task->getFuture().
+    bool lease_lost = false;
+
     /// Bumps the lease's mtime/version so another replica's staleness check won't steal it out
     /// from under an in-progress merge. Returns false if the lease was already stolen (ZBADVERSION)
     /// -- the caller must abort immediately in that case.
