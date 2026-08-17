@@ -44,9 +44,7 @@ void CloudMergeTreeCoordination::createRootNodes(const zkutil::ZooKeeperPtr & zk
     zk->createIfNotExists(tempPath(), "");
     zk->createIfNotExists(droppedPartsPath(), "");
     zk->createIfNotExists(detachedPartsPath(), "");
-    /// Must match DeduplicationHash::HashType::UNIFIED's directory name literally (see
-    /// Interpreters/InsertDeduplication.cpp) -- createUnifiedHash()'s produced paths land here.
-    zk->createIfNotExists(root_path + "/deduplication_hashes", "");
+    zk->createIfNotExists(deduplicationHashesPath(), "");
 }
 
 void CloudMergeTreeCoordination::ensureBlockNumbersPartition(const zkutil::ZooKeeperPtr & zk, const String & partition_id) const
@@ -191,6 +189,27 @@ Coordination::Error CloudMergeTreeCoordination::tryRemoveParts(
 
     Coordination::Responses responses;
     return zk->tryMultiNoThrow(ops, responses);
+}
+
+void CloudMergeTreeCoordination::clearDeduplicationHashes(const zkutil::ZooKeeperPtr & zk, const String & partition_id) const
+{
+    /// DeduplicationHash::getBlockId() names each znode "<partition_id>_<hash0>_<hash1>" (a flat
+    /// namespace, not a per-partition subtree) -- filter by that exact prefix (with the separating
+    /// "_") rather than a raw substring match, so partition_id "1" can never falsely match "10"'s
+    /// entries.
+    const String prefix = partition_id.empty() ? String{} : partition_id + "_";
+
+    Strings names = zk->getChildren(deduplicationHashesPath());
+    Coordination::Requests ops;
+    for (const auto & name : names)
+        if (prefix.empty() || name.starts_with(prefix))
+            ops.emplace_back(zkutil::makeRemoveRequest(deduplicationHashesPath() + "/" + name, -1));
+
+    if (ops.empty())
+        return;
+
+    Coordination::Responses responses;
+    zk->tryMultiNoThrow(ops, responses);
 }
 
 Coordination::Error CloudMergeTreeCoordination::tryDetachParts(

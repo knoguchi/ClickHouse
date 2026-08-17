@@ -95,6 +95,9 @@ public:
     String droppedPartClaimPath(const String & part_name) const { return droppedPartPath(part_name) + "/claim"; }
     String detachedPartsPath() const { return root_path + "/detached_parts"; }
     String detachedPartPath(const String & part_name) const { return detachedPartsPath() + "/" + part_name; }
+    /// Must match DeduplicationHash::HashType::UNIFIED's directory name literally (see
+    /// Interpreters/InsertDeduplication.cpp) -- createUnifiedHash()'s produced paths land here.
+    String deduplicationHashesPath() const { return root_path + "/deduplication_hashes"; }
 
     /// Idempotently create the root node hierarchy. Safe to call from every replica on startup.
     void createRootNodes(const zkutil::ZooKeeperPtr & zk) const;
@@ -171,6 +174,15 @@ public:
 
     /// DROP: atomically deactivate parts. Object data is left for GC, never deleted inline.
     Coordination::Error tryRemoveParts(const zkutil::ZooKeeperPtr & zk, const Strings & part_names) const;
+
+    /// TRUNCATE/DROP PARTITION/the destination side of REPLACE PARTITION: deduplication_hashes/
+    /// znodes are otherwise permanent (see the class doc comment above) -- without this, the exact
+    /// same content re-inserted after one of these commands is silently discarded as a dedup hit
+    /// against data that no longer exists. Mirrors StorageReplicatedMergeTree::clearBlocksInPartition,
+    /// adapted to this table's flat "<partition_id>_<hash0>_<hash1>" naming (see DeduplicationHash::
+    /// getBlockId(), Interpreters/InsertDeduplication.h) instead of a per-partition subtree: an empty
+    /// partition_id clears every hash in the table (TRUNCATE), a non-empty one only that partition's.
+    void clearDeduplicationHashes(const zkutil::ZooKeeperPtr & zk, const String & partition_id = {}) const;
 
     /// DETACH: atomically deactivate parts, same as tryRemoveParts, but records the removal under
     /// detached_parts/ instead of dropped_parts/ -- the parts-killer GC task never scans that

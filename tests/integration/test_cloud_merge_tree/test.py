@@ -554,6 +554,33 @@ def test_drop_partition_removes_only_target_partition_and_gets_collected(cluster
     )
 
 
+def test_drop_partition_then_reinsert_identical_content_is_not_deduplicated(cluster):
+    node1 = cluster.instances["node1"]
+    ddl = (
+        "(id UInt64, data String) ENGINE = CloudMergeTree "
+        "PARTITION BY id % 2 ORDER BY id SETTINGS storage_policy = 's3'"
+    )
+    node1.query(f"CREATE TABLE {TABLE_NAME} {ddl}")
+
+    # Same reasoning as test_truncate_then_reinsert_identical_content_is_not_deduplicated, scoped
+    # to one partition: a real DROP PARTITION (not DETACH, which keeps the data recoverable) must
+    # also clear that partition's deduplication_hashes/ entries, or re-inserting the exact same
+    # content into the same partition afterwards is silently discarded.
+    node1.query(f"INSERT INTO {TABLE_NAME} VALUES (2, 'a')")
+    even_partition_id = node1.query(
+        f"SELECT DISTINCT partition_id FROM system.parts "
+        f"WHERE table = '{TABLE_NAME}' AND active AND partition = '0'"
+    ).strip()
+    assert even_partition_id != ""
+
+    node1.query(f"ALTER TABLE {TABLE_NAME} DROP PARTITION ID '{even_partition_id}'")
+    assert node1.query(f"SELECT count() FROM {TABLE_NAME}").strip() == "0"
+
+    node1.query(f"INSERT INTO {TABLE_NAME} VALUES (2, 'a')")
+    assert node1.query(f"SELECT count() FROM {TABLE_NAME}").strip() == "1"
+    assert node1.query(f"SELECT sum(id) FROM {TABLE_NAME}").strip() == "2"
+
+
 def test_drop_part_removes_single_part_and_no_such_part_throws(cluster):
     node1 = cluster.instances["node1"]
     node2 = cluster.instances["node2"]
@@ -624,6 +651,27 @@ def test_truncate_empties_table_and_allows_further_inserts(cluster):
     node1.query(f"INSERT INTO {TABLE_NAME} VALUES (100, 'z')")
     assert_eq_with_retry(node2, f"SELECT count() FROM {TABLE_NAME}", "1")
     assert node1.query(f"SELECT sum(id) FROM {TABLE_NAME}").strip() == "100"
+
+
+def test_truncate_then_reinsert_identical_content_is_not_deduplicated(cluster):
+    node1 = cluster.instances["node1"]
+
+    node1.query(f"CREATE TABLE {TABLE_NAME} {TABLE_DDL}")
+
+    # insert_deduplicate defaults on: deduplication_hashes/ znodes are keyed by content hash and
+    # are never cleared by TRUNCATE (unlike ReplicatedMergeTree's clearBlocksInPartition on every
+    # drop-range path) -- so the same content inserted again after a TRUNCATE must still be
+    # treated as new data, not silently discarded as a dedup hit against pre-TRUNCATE state. This
+    # is the canonical staging-table reload workflow: TRUNCATE then re-INSERT the same batch.
+    node1.query(f"INSERT INTO {TABLE_NAME} VALUES (1, 'a')")
+    assert node1.query(f"SELECT count() FROM {TABLE_NAME}").strip() == "1"
+
+    node1.query(f"TRUNCATE TABLE {TABLE_NAME}")
+    assert node1.query(f"SELECT count() FROM {TABLE_NAME}").strip() == "0"
+
+    node1.query(f"INSERT INTO {TABLE_NAME} VALUES (1, 'a')")
+    assert node1.query(f"SELECT count() FROM {TABLE_NAME}").strip() == "1"
+    assert node1.query(f"SELECT sum(id) FROM {TABLE_NAME}").strip() == "1"
 
 
 def test_concurrent_optimize_and_drop_partition_no_corruption(cluster):
@@ -1632,6 +1680,37 @@ def test_replace_partition_from_replaces_destination_partition(cluster):
         node1.query(f"DROP TABLE IF EXISTS {dst_table} SYNC")
 
 
+def test_replace_partition_then_reinsert_discarded_content_is_not_deduplicated(cluster):
+    node1 = cluster.instances["node1"]
+    src_table = "cloud_test_replace_dedup_src"
+    dst_table = "cloud_test_replace_dedup_dst"
+    ddl = "(id UInt64, data String) ENGINE = CloudMergeTree ORDER BY id PARTITION BY id % 2 SETTINGS storage_policy = 's3'"
+
+    node1.query(f"DROP TABLE IF EXISTS {src_table} SYNC")
+    node1.query(f"DROP TABLE IF EXISTS {dst_table} SYNC")
+    node1.query(f"CREATE TABLE {src_table} {ddl}")
+    node1.query(f"CREATE TABLE {dst_table} {ddl}")
+    try:
+        # dst's original row registers a deduplication_hashes/ entry for (2, 'old') in partition 0.
+        node1.query(f"INSERT INTO {dst_table} VALUES (2, 'old')")
+
+        # REPLACE discards that row -- src's differently-content'd row takes its place.
+        node1.query(f"INSERT INTO {src_table} VALUES (2, 'new')")
+        node1.query(f"ALTER TABLE {dst_table} REPLACE PARTITION 0 FROM {src_table}")
+        assert node1.query(f"SELECT data FROM {dst_table} WHERE id = 2").strip() == "new"
+
+        # Re-inserting the exact content REPLACE just discarded must be treated as new data, not
+        # silently dropped as a dedup hit against a row that no longer exists in dst.
+        node1.query(f"INSERT INTO {dst_table} VALUES (2, 'old')")
+        assert node1.query(f"SELECT count() FROM {dst_table}").strip() == "2"
+        assert sorted(
+            node1.query(f"SELECT data FROM {dst_table} ORDER BY data").strip().splitlines()
+        ) == ["new", "old"]
+    finally:
+        node1.query(f"DROP TABLE IF EXISTS {src_table} SYNC")
+        node1.query(f"DROP TABLE IF EXISTS {dst_table} SYNC")
+
+
 def test_attach_partition_from_adds_alongside_existing_data(cluster):
     node1 = cluster.instances["node1"]
     src_table = "cloud_test_attach_from_src"
@@ -2111,11 +2190,15 @@ def test_optimize_partition_final_skips_already_merged_partition(cluster):
 
     # PARTITION ... FINAL on an already-single-merged-part partition must complete without
     # producing a redundant self-merge -- the part name (and thus the underlying data) must be
-    # exactly the one just observed above, not a freshly produced one. No retry needed here: a
-    # genuine optimize_skip_merged_partitions no-op and a watcher-lag no-op (see
-    # _optimize_query_until above) are observationally identical -- both leave the part name
-    # unchanged, which is exactly what this assertion checks.
-    node1.query(f"OPTIMIZE TABLE {TABLE_NAME} PARTITION ID '{even_partition_id}' FINAL")
+    # exactly the one just observed above, not a freshly produced one. optimize_skip_merged_partitions
+    # must be explicitly enabled here: it defaults to off, and with it off FINAL unconditionally
+    # re-merges even a lone already-merged part every call (upstream's own "materializing" self-merge
+    # semantics) -- omitting the setting made this assertion race the unrelated watcher-staleness
+    # gate instead of actually exercising the skip path (flaked once in 6 full-suite runs).
+    node1.query(
+        f"OPTIMIZE TABLE {TABLE_NAME} PARTITION ID '{even_partition_id}' FINAL "
+        f"SETTINGS optimize_skip_merged_partitions = 1"
+    )
     part_name_after = node1.query(
         f"SELECT name FROM system.parts WHERE table = '{TABLE_NAME}' AND active AND partition = '0'"
     ).strip()

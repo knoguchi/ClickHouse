@@ -587,11 +587,19 @@ void StorageCloudMergeTree::drop()
 
 void StorageCloudMergeTree::truncate(const ASTPtr &, const StorageMetadataPtr &, ContextPtr, TableExclusiveLockHolder &)
 {
+    auto component_guard = Coordination::setCurrentComponent("StorageCloudMergeTree::truncate");
+
     /// Unlike drop(), the table itself stays alive: no markTableDropped(), no root-directory
     /// teardown. The GC task's trailing-teardown check is gated specifically on the `dropped`
     /// marker, so a plain TRUNCATE correctly leaves the table's Keeper root nodes and directory
     /// intact for future inserts -- only the parts themselves are deactivated and tombstoned.
     removeActivePartsMatching([](const String &) { return true; });
+
+    /// deduplication_hashes/ znodes are otherwise permanent: without this, the exact same content
+    /// re-inserted after TRUNCATE is silently discarded as a dedup hit against data that no longer
+    /// exists -- the canonical staging-table reload workflow would appear to succeed while leaving
+    /// the table empty. See CloudMergeTreeCoordination::clearDeduplicationHashes()'s doc comment.
+    coordination.clearDeduplicationHashes(getZooKeeper());
 }
 
 StorageCloudMergeTree::MutationsSnapshotPtr StorageCloudMergeTree::getMutationsSnapshot(const IMutationsSnapshot::Params & /*params*/) const
@@ -1472,6 +1480,8 @@ void StorageCloudMergeTree::dropPart(const String & part_name, bool detach, Cont
 
 void StorageCloudMergeTree::dropPartition(const ASTPtr & partition, bool detach, ContextPtr local_context)
 {
+    auto component_guard = Coordination::setCurrentComponent("StorageCloudMergeTree::dropPartition");
+
     String partition_id = getPartitionIDFromQuery(partition, local_context);
     auto predicate = [&](const String & name)
     {
@@ -1480,7 +1490,13 @@ void StorageCloudMergeTree::dropPartition(const ASTPtr & partition, bool detach,
     if (detach)
         detachActivePartsMatching(predicate);
     else
+    {
         removeActivePartsMatching(predicate);
+        /// Only for the real DROP -- DETACH keeps the data recoverable (see attachPartition()), so
+        /// a later re-ATTACH of the exact same content must still be able to correctly dedup
+        /// against itself if inserted again meanwhile. Same reasoning as truncate()'s identical call.
+        coordination.clearDeduplicationHashes(getZooKeeper(), partition_id);
+    }
 }
 
 PartitionCommandsResultInfo StorageCloudMergeTree::attachPartition(
@@ -1703,6 +1719,14 @@ void StorageCloudMergeTree::replacePartitionFrom(const StoragePtr & source_table
         }
         if (!covered_parts.empty())
             removePartsFinally(covered_parts);
+
+        /// Only for REPLACE (which discards this partition's prior content), not plain ATTACH ...
+        /// FROM (which only adds alongside it) -- same reasoning as dropPartition()'s identical
+        /// call. Without this, re-inserting content byte-identical to what REPLACE just discarded
+        /// is silently deduplicated against it.
+        if (replace)
+            coordination.clearDeduplicationHashes(zk, partition_id);
+
         return;
     }
 
