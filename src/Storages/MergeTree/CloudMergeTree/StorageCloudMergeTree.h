@@ -5,6 +5,7 @@
 #include <Storages/MergeTree/MergeTreeDataMergerMutator.h>
 #include <Storages/MergeTree/Compaction/PartProperties.h>
 #include <Storages/MergeTree/CloudMergeTree/CloudMergeTreeCoordination.h>
+#include <Interpreters/InsertDeduplication.h>
 #include <Common/ZooKeeper/ZooKeeper.h>
 #include <Core/BackgroundSchedulePool.h>
 #include <expected>
@@ -103,11 +104,14 @@ public:
 
     /// Commit a freshly written part: register it in Keeper, then flip it Active in the cache.
     /// Throws on a Keeper failure so the INSERT fails closed (no silent local-only commit).
+    /// deduplication_hashes is token-aware (see Interpreters/InsertDeduplication.h) -- honors
+    /// insert_deduplication_token when the caller's DeduplicationInfo carries one, falls back to
+    /// a whole-content hash otherwise, and is empty when dedup is disabled for this insert.
     /// Returns false (part discarded via removeIfNeeded(), nothing touched in Keeper's active set
-    /// or the local cache) if insert_deduplicate is enabled and this exact block content was
-    /// already committed by some part -- same silent-no-op contract as ReplicatedMergeTreeSink,
-    /// not a query failure. Returns true once the part is genuinely active.
-    bool commitInsertedPart(MutableDataPartPtr & part, ContextPtr context);
+    /// or the local cache) if any of deduplication_hashes was already committed by some part --
+    /// same silent-no-op contract as ReplicatedMergeTreeSink, not a query failure. Returns true
+    /// once the part is genuinely active.
+    bool commitInsertedPart(MutableDataPartPtr & part, const std::vector<DeduplicationHash> & deduplication_hashes, ContextPtr context);
 
     /// Returns the maximum level of all outdated parts strictly between left and right, or 0 for
     /// an empty range. Used by the merge predicate to reject a merge that would paper over a gap

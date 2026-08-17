@@ -1,6 +1,9 @@
 #include <Storages/MergeTree/CloudMergeTree/CloudMergeTreeSink.h>
 #include <Storages/MergeTree/CloudMergeTree/StorageCloudMergeTree.h>
 #include <Storages/MergeTree/MergeTreeDataWriter.h>
+#include <Interpreters/InsertDeduplication.h>
+#include <Interpreters/Context.h>
+#include <Core/DeduplicateInsert.h>
 
 namespace DB
 {
@@ -24,19 +27,45 @@ void CloudMergeTreeSink::consume(Chunk & chunk)
 {
     auto block = getHeader().cloneWithColumns(chunk.getColumns());
 
-    auto part_blocks = MergeTreeDataWriter::splitBlockIntoParts(std::move(block), max_parts_per_block, metadata_snapshot, context);
+    /// Present whenever the query pipeline attaches insert-dedup bookkeeping to the chunk (e.g.
+    /// to honor insert_deduplication_token) -- absent for pipelines that never set one up. Either
+    /// way, commitInsertedPart() below tolerates an empty hash list as "dedup disabled for this
+    /// part", matching the pre-existing behavior when the caller wants no deduplication at all.
+    auto deduplication_info = chunk.getChunkInfos().getSafe<DeduplicationInfo>();
+    IColumn::Selector partition_selector;
+    auto part_blocks = MergeTreeDataWriter::splitBlockIntoParts(
+        std::move(block), max_parts_per_block, metadata_snapshot, context, &partition_selector);
 
-    for (auto & current_block : part_blocks)
+    const bool dedup_enabled = isDeduplicationEnabledForInsert(/*is_async_insert=*/ false, context->getSettingsRef());
+
+    for (size_t part_index = 0; part_index < part_blocks.size(); ++part_index)
     {
+        auto & current_block = part_blocks[part_index];
         auto temp_part = storage.writer.writeTempPart(current_block, metadata_snapshot, context);
 
         /// Wait for all (possibly asynchronous, for object storage) writes to land before we
         /// advertise the part in Keeper.
         temp_part->finalize();
 
+        /// Token-aware dedup hash for just this part's share of the chunk: honors
+        /// insert_deduplication_token when the caller set one (via DeduplicationInfo::setUserToken
+        /// upstream), falls back to a whole-content hash of this part's own rows otherwise -- see
+        /// DeduplicationInfo::getDeduplicationHashes()'s own doc comment. Unlike MergeTreeSink,
+        /// there is no self-deduplication pass (async-insert token coalescing) or retry-with-
+        /// partial-rows-removed loop on conflict: CloudMergeTree doesn't support async insert yet
+        /// (is_async_insert is hard-coded false above, matching its current feature scope), and a
+        /// dedup collision here already means "discard the whole part", not "rewrite a smaller
+        /// one" -- matching this sink's existing all-or-nothing part commit model.
+        std::vector<DeduplicationHash> deduplication_hashes;
+        if (deduplication_info && dedup_enabled)
+        {
+            auto current_info = deduplication_info->filterToPartition(partition_selector, part_index, dedup_enabled);
+            deduplication_hashes = current_info->getDeduplicationHashes(current_block.partition_id, dedup_enabled);
+        }
+
         /// Keeper-first commit: register the part as active in the canonical set, then flip it
         /// Active in this replica's cache. Throws (INSERT fails) if Keeper rejects it.
-        storage.commitInsertedPart(temp_part->part, context);
+        storage.commitInsertedPart(temp_part->part, deduplication_hashes, context);
     }
 }
 

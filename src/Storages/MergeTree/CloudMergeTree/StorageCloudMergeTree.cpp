@@ -435,7 +435,7 @@ SinkToStoragePtr StorageCloudMergeTree::write(const ASTPtr & /*query*/, const St
         *this, metadata_snapshot, settings[MergeTreeSetting::parts_to_throw_insert], local_context);
 }
 
-bool StorageCloudMergeTree::commitInsertedPart(MutableDataPartPtr & part, ContextPtr local_context)
+bool StorageCloudMergeTree::commitInsertedPart(MutableDataPartPtr & part, const std::vector<DeduplicationHash> & deduplication_hashes, ContextPtr local_context)
 {
     auto component_guard = Coordination::setCurrentComponent("StorageCloudMergeTree::commitInsertedPart");
     auto zk = getZooKeeper();
@@ -448,18 +448,16 @@ bool StorageCloudMergeTree::commitInsertedPart(MutableDataPartPtr & part, Contex
     const String partition_id = part->info.getPartitionId();
     coordination.ensureBlockNumbersPartition(zk, partition_id);
 
-    /// Whole-part-content insert dedup, same semantics as insert_deduplicate on
-    /// ReplicatedMergeTree: identical block content (e.g. a client retry after a timeout) becomes
-    /// a silent no-op rather than a duplicate row. Reuses the exact same hash and Keeper CAS
-    /// primitives ReplicatedMergeTreeSink does (see DeduplicationHash, Interpreters/InsertDeduplication.h).
-    const bool dedup_enabled = isDeduplicationEnabledForInsert(/*is_async_insert=*/ false, local_context->getSettingsRef());
-    std::optional<DeduplicationHash> dedup_hash;
-    std::vector<String> deduplication_paths;
-    if (dedup_enabled)
-    {
-        dedup_hash.emplace(DeduplicationHash::createUnifiedHash(part->checksums.getTotalChecksumUInt128(), partition_id));
-        deduplication_paths.push_back(dedup_hash->getPath(coordination.getRootPath()));
-    }
+    /// Insert dedup, same semantics as insert_deduplicate on ReplicatedMergeTree: identical block
+    /// content (e.g. a client retry after a timeout) becomes a silent no-op rather than a
+    /// duplicate row. deduplication_hashes is already token-aware (the caller derives it via
+    /// DeduplicationInfo::getDeduplicationHashes(), which honors insert_deduplication_token when
+    /// set and falls back to a whole-content hash otherwise -- see CloudMergeTreeSink::consume());
+    /// empty here means dedup is disabled for this insert. Reuses the exact same Keeper CAS
+    /// primitive ReplicatedMergeTreeSink does (see Interpreters/InsertDeduplication.h) -- already
+    /// designed for more than one path per part (one per distinct token), not just the single
+    /// whole-content hash this used to always pass.
+    std::vector<String> deduplication_paths = getDeduplicationPaths(coordination.getRootPath(), deduplication_hashes);
 
     auto block_lock = createEphemeralLockInZooKeeper(
         coordination.blockNumbersPartitionPath(partition_id) + "/block-",
@@ -483,14 +481,14 @@ bool StorageCloudMergeTree::commitInsertedPart(MutableDataPartPtr & part, Contex
     part->info.min_block = part->info.max_block = block_lock.getNumber();
     part->setName(part->getNewName(part->info));
 
-    /// The dedup-path create (if any) always goes first, so its index within tryCommitInsert's
-    /// full multi() is fixed at 1 (index 0 is always the part znode itself) -- required to tell a
-    /// dedup collision apart from a genuine part-name collision below. The lock's unlock op rides
-    /// along in the same multi() as the part commit, so allocation and commit land atomically
-    /// together (mirrors ReplicatedMergeTreeSink::commitPart).
+    /// The dedup-path creates (if any) always go first, so their indices within tryCommitInsert's
+    /// full multi() are fixed at 1..deduplication_paths.size() (index 0 is always the part znode
+    /// itself) -- required to tell a dedup collision apart from a genuine part-name collision
+    /// below. The lock's unlock op rides along in the same multi() as the part commit, so
+    /// allocation and commit land atomically together (mirrors ReplicatedMergeTreeSink::commitPart).
     Coordination::Requests extra_ops;
-    if (dedup_enabled)
-        extra_ops.emplace_back(zkutil::makeCreateRequest(deduplication_paths.front(), part->name, zkutil::CreateMode::Persistent));
+    for (const auto & path : deduplication_paths)
+        extra_ops.emplace_back(zkutil::makeCreateRequest(path, part->name, zkutil::CreateMode::Persistent));
     block_lock.getUnlockOp(extra_ops);
 
     Transaction transaction(*this, local_context->getCurrentTransaction().get());
@@ -503,7 +501,8 @@ bool StorageCloudMergeTree::commitInsertedPart(MutableDataPartPtr & part, Contex
         auto code = coordination.tryCommitInsert(zk, part->name, serializePartHeader(part), extra_ops, responses);
         if (code == Coordination::Error::ZNODEEXISTS)
         {
-            if (dedup_enabled && zkutil::getFailedOpIndex(code, responses) == 1)
+            const size_t failed_idx = zkutil::getFailedOpIndex(code, responses);
+            if (!deduplication_paths.empty() && failed_idx >= 1 && failed_idx <= deduplication_paths.size())
             {
                 /// Lost a race against another replica's concurrent insert of the same content
                 /// between our pre-check above and this commit -- same outcome as the pre-check
@@ -2328,20 +2327,42 @@ try
         && coordination.listTombstones(zk).empty())
     {
         auto table_path = getRelativeDataPath();
-        if (disk->existsDirectory(table_path))
+        try
         {
-            disk->removeFileIfExists(std::filesystem::path(table_path) / MergeTreeData::FORMAT_VERSION_FILE_NAME);
+            /// Another replica's own DROP TABLE ... SYNC can concurrently remove this same table
+            /// directory via DatabaseCatalog's generic (engine-agnostic) teardown -- existsDirectory()
+            /// above is not enough to fully rule that race out on plain_rewritable object storage,
+            /// so a "such object doesn't exist" exception here just means the other replica's
+            /// SYNC drop already won; don't let it abort the whole GC cycle (in particular, the
+            /// detached_parts/ znode cleanup below must still run).
+            if (disk->existsDirectory(table_path))
+            {
+                disk->removeFileIfExists(std::filesystem::path(table_path) / MergeTreeData::FORMAT_VERSION_FILE_NAME);
 
-            auto detached_path = std::filesystem::path(table_path) / MergeTreeData::DETACHED_DIR_NAME;
-            if (disk->existsDirectory(detached_path))
-                disk->removeRecursive(detached_path);
+                auto detached_path = std::filesystem::path(table_path) / MergeTreeData::DETACHED_DIR_NAME;
+                if (disk->existsDirectory(detached_path))
+                    disk->removeRecursive(detached_path);
 
-            auto moving_path = std::filesystem::path(table_path) / MergeTreeData::MOVING_DIR_NAME;
-            if (disk->existsDirectory(moving_path))
-                disk->removeRecursive(moving_path);
+                auto moving_path = std::filesystem::path(table_path) / MergeTreeData::MOVING_DIR_NAME;
+                if (disk->existsDirectory(moving_path))
+                    disk->removeRecursive(moving_path);
 
-            disk->removeRecursive(table_path);
+                disk->removeRecursive(table_path);
+            }
         }
+        catch (...)
+        {
+            tryLogCurrentException(getLogger("StorageCloudMergeTree"),
+                fmt::format("Failed to remove table directory {} while tearing down dropped table, will retry", table_path));
+        }
+
+        /// detached_parts/ is deliberately never scanned by the tombstone loop above -- a detached
+        /// part must survive for as long as the table is alive (see tryDetachParts()'s own doc
+        /// comment) -- but once the table itself is gone, nothing will ever re-ATTACH or manually
+        /// clean up whatever is still recorded here. Left alone, these znodes (and, before the
+        /// removeRecursive(detached_path) above, the objects they refer to) would accumulate in
+        /// Keeper forever across repeated DETACH-then-DROP-TABLE cycles.
+        zk->tryRemoveChildrenRecursive(coordination.detachedPartsPath(), /*probably_flat=*/true);
     }
 
     parts_killer_task->scheduleAfter(interval_ms);

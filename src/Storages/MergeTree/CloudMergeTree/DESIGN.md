@@ -126,7 +126,8 @@ projections, FINAL), `MergeTreePartInfo`, checksums, `MergeTreeSettings`,
   under the destination, deregister from the source), for the standard
   ClickHouse bulk-swap/archival use cases (`REPLACE PARTITION ... FROM` for
   atomic staging-table reloads; `MOVE PARTITION ... TO TABLE` for archiving
-  into cold-storage tables sharing the same schema). Not yet started.
+  into cold-storage tables sharing the same schema). Done: `REPLACE`/`ATTACH
+  PARTITION ... FROM` and `MOVE PARTITION ... TO TABLE` are both implemented.
 
 Deferred (the SMT periphery, not correctness): sequential-consistency read
 fencing, per-AZ leader fan-out, snapshot cleaner tuning, backup/restore

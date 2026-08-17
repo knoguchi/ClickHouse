@@ -771,6 +771,39 @@ def test_insert_deduplication_can_be_disabled(cluster):
     assert node1.query(f"SELECT count() FROM {TABLE_NAME}").strip() == "2"
 
 
+def test_insert_deduplication_token_distinguishes_identical_content(cluster):
+    node1 = cluster.instances["node1"]
+
+    node1.query(f"CREATE TABLE {TABLE_NAME} {TABLE_DDL}")
+
+    # insert_deduplication_token is the documented way to tell two byte-identical inserts apart
+    # (e.g. two genuinely distinct events that happen to produce the same row) -- a *different*
+    # token must not be deduplicated against, even though the content hash alone would collide.
+    node1.query(
+        f"INSERT INTO {TABLE_NAME} VALUES (1, 'a')",
+        settings={"insert_deduplication_token": "batch-1"},
+    )
+    node1.query(
+        f"INSERT INTO {TABLE_NAME} VALUES (1, 'a')",
+        settings={"insert_deduplication_token": "batch-2"},
+    )
+    assert node1.query(f"SELECT count() FROM {TABLE_NAME}").strip() == "2"
+
+    # The *same* token, on the other hand, is still deduplicated -- the token-aware hash isn't
+    # just "always distinct", it's keyed on the token when one is present (the documented
+    # retry-safety use case: the same token resubmitted after a client-side timeout must still be
+    # a no-op).
+    node1.query(
+        f"INSERT INTO {TABLE_NAME} VALUES (2, 'b')",
+        settings={"insert_deduplication_token": "batch-3"},
+    )
+    node1.query(
+        f"INSERT INTO {TABLE_NAME} VALUES (2, 'b')",
+        settings={"insert_deduplication_token": "batch-3"},
+    )
+    assert node1.query(f"SELECT count() FROM {TABLE_NAME}").strip() == "3"
+
+
 def test_concurrent_identical_insert_from_both_replicas_deduplicates_to_one(cluster):
     node1 = cluster.instances["node1"]
     node2 = cluster.instances["node2"]
@@ -1688,6 +1721,63 @@ def test_detached_part_survives_grace_period_and_can_be_reattached(cluster):
         assert node1.query(f"SELECT count() FROM {table}").strip() == "1"
         assert node1.query(f"SELECT data FROM {table} WHERE id = 1").strip() == "a"
     finally:
+        node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
+
+
+def test_drop_table_after_detach_reclaims_detached_parts_objects(cluster):
+    node1 = cluster.instances["node1"]
+    node2 = cluster.instances["node2"]
+    table = "cloud_test_drop_after_detach_gc"
+
+    node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
+    node2.query(f"DROP TABLE IF EXISTS {table} SYNC")
+    node1.query(
+        f"CREATE TABLE {table} (id UInt64, data String) ENGINE = CloudMergeTree "
+        f"ORDER BY id SETTINGS {GC_TABLE_DDL_SETTINGS}"
+    )
+    table_uuid = node1.query(f"SELECT uuid FROM system.tables WHERE table = '{table}'").strip()
+    node2.query(
+        f"ATTACH TABLE {table} UUID '{table_uuid}' (id UInt64, data String) "
+        f"ENGINE = CloudMergeTree ORDER BY id SETTINGS {GC_TABLE_DDL_SETTINGS}"
+    )
+    try:
+        node1.query(f"INSERT INTO {table} VALUES (1, 'a')")
+        assert_eq_with_retry(node2, f"SELECT count() FROM {table}", "1")
+
+        # A detached part is deliberately exempt from the parts-killer's normal scan (recorded
+        # under detached_parts/, not dropped_parts/ -- see
+        # test_detached_part_survives_grace_period_and_can_be_reattached, which checks the
+        # opposite invariant: a detached part's objects must NOT be collected while the table is
+        # still alive). But once the whole table is DROPped, nothing will ever re-ATTACH or
+        # manually clean up that part again -- its objects must not be orphaned forever just
+        # because they happened to be sitting under detached_parts/ instead of parts/ at the
+        # moment DROP TABLE ran.
+        node1.query(f"ALTER TABLE {table} DETACH PARTITION ID 'all'")
+
+        # Drop only on node1 -- node2 keeps its own StorageCloudMergeTree object (and
+        # parts-killer task) alive to actually perform the physical/Keeper cleanup below. If
+        # every replica dropped the table, no live GC task would remain to drain it (same
+        # documented liveness gap as test_drop_table_objects_survive_grace_period_then_get_collected).
+        # Also: node1's own DROP TABLE SYNC removes its local copy of the data directory
+        # synchronously via DatabaseCatalog's generic teardown -- unrelated to this engine's own
+        # Keeper-side detached_parts/ znode, which only node2's still-running parts-killer task
+        # (via the trailing table-directory teardown in its GC loop) can ever clean up.
+        node1.query(f"DROP TABLE {table} SYNC")
+
+        # Past grace_period_seconds + gc_interval_ms (see GC_TABLE_DDL_SETTINGS) and several
+        # parts-killer cycles on node2 -- the detached_parts/ znode itself must be cleaned up, not
+        # just the objects it referred to, otherwise repeated DETACH-then-DROP-TABLE cycles
+        # accumulate orphaned znodes in Keeper forever.
+        assert_eq_with_retry(
+            node2,
+            f"SELECT count() FROM system.zookeeper WHERE path = "
+            f"'/clickhouse/cloud_tables/{table_uuid}/detached_parts'",
+            "0",
+            retry_count=30,
+            sleep_time=1,
+        )
+    finally:
+        node2.query(f"DROP TABLE IF EXISTS {table} SYNC")
         node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
 
 
