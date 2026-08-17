@@ -1,4 +1,5 @@
 import logging
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, wait
 
@@ -2619,33 +2620,85 @@ def test_lease_loss_during_optimize_does_not_hang(cluster):
         "(id UInt64, data String) ENGINE = CloudMergeTree ORDER BY id "
         "SETTINGS storage_policy = 's3', cloud_merge_tree_lease_staleness_ms = 0"
     )
+    failpoint = "cloud_merge_tree_merge_lease_acquired"
+    gate = "cloud_merge_tree_schedule_pause"
 
     node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
     node1.query(f"CREATE TABLE {table} {ddl}")
     table_uuid = node1.query(f"SELECT uuid FROM system.tables WHERE table = '{table}'").strip()
     node2.query(f"ATTACH TABLE {table} UUID '{table_uuid}' {ddl}")
     try:
-        for i in range(1, 6):
-            node1.query(f"INSERT INTO {table} VALUES ({i}, 'v{i}')")
-        assert_eq_with_retry(node2, f"SELECT count() FROM {table}", "5")
+        # Neither replica's *background scheduler* must be the one to reach the merge-lease
+        # failpoint below -- only the explicit OPTIMIZE call this test issues on node1 must be,
+        # since that's the one whose client-side result() call actually observes a hang.
+        # cloud_merge_tree_schedule_pause (added for finding #6) gates every
+        # scheduleDataProcessingJob call at its very entry, unconditionally, independent of SYSTEM
+        # STOP/START MERGES -- so enabling it up front on *both* nodes (and never resuming it until
+        # the very end) fully removes both background schedulers as candidates; explicit OPTIMIZE
+        # goes through a completely separate call path (optimizeUntilConverged), unaffected on
+        # either node. Gating node1 alone isn't enough: node2 independently sees all 5 rows via
+        # replication and, left ungated, its own background scheduler merges them on its own well
+        # before node1's explicit OPTIMIZE even runs -- confirmed via server logs the first time
+        # this test was written (node2's own merge, reflected onto node1 via the watcher, before
+        # node1's OPTIMIZE reached the failpoint at all).
+        node1.query(f"SYSTEM ENABLE FAILPOINT {gate}")
+        node2.query(f"SYSTEM ENABLE FAILPOINT {gate}")
+        node1.query(f"SYSTEM ENABLE FAILPOINT {failpoint}")
+        try:
+            for i in range(1, 6):
+                node1.query(f"INSERT INTO {table} VALUES ({i}, 'v{i}')")
+            assert_eq_with_retry(node2, f"SELECT count() FROM {table}", "5")
 
-        # cloud_merge_tree_lease_staleness_ms = 0: any concurrent lease acquisition attempt treats
-        # an existing lease as immediately stale and steals it, so two replicas racing the same
-        # OPTIMIZE reliably drive one side's executeStep() into the lost-lease branch. OPTIMIZE
-        # runs synchronously on the query's own thread (see optimizeUntilConverged()'s
-        # executeHere() call, not the background pool), so without the finish()/lease_lost fix,
-        # that side's query would hang forever inside the unconditional
-        # merge_task->getFuture().get() -- surfacing here as a client-side timeout, not a
-        # server-side symptom this test would otherwise have to poll for.
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            futures = [
-                executor.submit(node1.query, f"OPTIMIZE TABLE {table}"),
-                executor.submit(node2.query, f"OPTIMIZE TABLE {table}"),
-            ]
-            for future in futures:
-                future.result(timeout=60)
+            # node1's own OPTIMIZE is made to genuinely park right after acquiring the merge's
+            # lease, so node2's own OPTIMIZE is guaranteed -- not just likely -- to steal it
+            # (cloud_merge_tree_lease_staleness_ms = 0: any concurrent acquisition attempt treats
+            # an existing lease as immediately stale) while node1 is still paused: natural
+            # two-replica timing was tried first and never reproduced the race, since node1's own
+            # merge of these few rows reliably finished before node2 could genuinely contend for
+            # the lease. OPTIMIZE runs synchronously on the query's own thread (see
+            # optimizeUntilConverged()'s executeHere() call, not the background pool), so without
+            # the finish()/lease_lost fix, node1's query would hang forever inside the
+            # unconditional merge_task->getFuture().get() once it resumes and discovers its lease
+            # is gone -- surfacing here as a client-side timeout, not a server-side symptom to poll
+            # for.
+            # A plain thread (not ThreadPoolExecutor), and daemon=True: on the pre-fix hang, the
+            # submitted query never returns and this thread stays blocked on its socket read
+            # forever, with no way to cancel a thread that's already running -- a non-daemon
+            # thread would then block the whole pytest worker process from exiting even after
+            # this test itself finishes and reports failed.
+            node1_result = {}
+
+            def run_node1_optimize():
+                try:
+                    node1_result["value"] = node1.query(f"OPTIMIZE TABLE {table}")
+                except Exception as e:  # noqa: BLE001
+                    node1_result["error"] = e
+
+            node1_thread = threading.Thread(target=run_node1_optimize, daemon=True)
+            node1_thread.start()
+
+            _wait_failpoint_paused(node1, failpoint)
+            node2.query(f"OPTIMIZE TABLE {table}")
+            assert_eq_with_retry(node2, f"SELECT count() FROM {table}", "5")
+            assert (
+                node2.query(f"SELECT count() FROM system.parts WHERE table = '{table}' AND active").strip() == "1"
+            )
+
+            node1.query(f"SYSTEM NOTIFY FAILPOINT {failpoint}")
+            node1_thread.join(timeout=30)
+            if node1_thread.is_alive():
+                raise AssertionError("node1's OPTIMIZE did not return within 30s after losing its lease")
+            if "error" in node1_result:
+                raise node1_result["error"]
+        finally:
+            node1.query(f"SYSTEM DISABLE FAILPOINT {failpoint}")
+            node1.query(f"SYSTEM DISABLE FAILPOINT {gate}")
+            node2.query(f"SYSTEM DISABLE FAILPOINT {gate}")
 
         assert_eq_with_retry(node1, f"SELECT count() FROM {table}", "5")
         assert_eq_with_retry(node2, f"SELECT count() FROM {table}", "5")
     finally:
+        node1.query(f"SYSTEM DISABLE FAILPOINT {failpoint}")
+        node1.query(f"SYSTEM DISABLE FAILPOINT {gate}")
+        node2.query(f"SYSTEM DISABLE FAILPOINT {gate}")
         node1.query(f"DROP TABLE IF EXISTS {table} SYNC")

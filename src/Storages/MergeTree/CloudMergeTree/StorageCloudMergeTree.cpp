@@ -60,6 +60,7 @@ namespace ActionLocks
 namespace FailPoints
 {
     extern const char cloud_merge_tree_mutate_lease_acquired[];
+    extern const char cloud_merge_tree_merge_lease_acquired[];
     extern const char cloud_merge_tree_schedule_pause[];
 }
 
@@ -797,6 +798,12 @@ std::expected<CloudMergeMutateSelectedEntryPtr, SelectMergeFailure> StorageCloud
             .explanation = PreformattedMessage::create(
                 "Lease for {} is already held by another replica: {}", future_part->name, lease.error()),
         });
+
+    /// Test-only pause point (see CODE_REVIEW.md finding #7's regression test): lets a test
+    /// deterministically hold this merge's lease across a real gap, instead of relying on two
+    /// replicas' independent OPTIMIZE calls racing to overlap by chance. No-op unless the test
+    /// explicitly enables it via SYSTEM ENABLE FAILPOINT.
+    FailPointInjection::pauseFailPoint(FailPoints::cloud_merge_tree_merge_lease_acquired);
 
     try
     {
