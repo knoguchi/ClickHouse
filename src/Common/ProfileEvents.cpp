@@ -526,6 +526,7 @@
     M(MergePrewarmStageExecuteMilliseconds, "Total busy time spent for execution of prewarm stage of background merges", ValueType::Milliseconds) \
     \
     M(MergesRejectedByMemoryLimit, "Number of background merges rejected due to memory limit", ValueType::Number) \
+    M(CloudMergeTreeMergeSelectionAttempts, "CloudMergeTree only: number of times a replica's background scheduler attempted merge/mutation selection against Keeper. With per-AZ leader fan-out active, a non-leader replica's count should stay flat, since it skips selection entirely instead of racing (and losing) a lease it was never going to win.", ValueType::Number) \
     M(MergingSortedMilliseconds, "Total time spent while merging sorted columns", ValueType::Milliseconds) \
     M(AggregatingSortedMilliseconds, "Total time spent while aggregating sorted columns", ValueType::Milliseconds) \
     M(CoalescingSortedMilliseconds, "Total time spent while coalescing sorted columns", ValueType::Milliseconds) \

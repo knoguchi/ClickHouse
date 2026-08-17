@@ -89,6 +89,8 @@ public:
     String mutationsPath() const { return root_path + "/mutations"; }
     String mutationPath(const String & mutation_id) const { return mutationsPath() + "/" + mutation_id; }
     String metadataPath() const { return root_path + "/metadata"; }
+    String replicasPath() const { return root_path + "/replicas"; }
+    String replicasAzPath(const String & az) const { return replicasPath() + "/" + az; }
     String dropMarkerPath() const { return root_path + "/dropped"; }
     String droppedPartsPath() const { return root_path + "/dropped_parts"; }
     String droppedPartPath(const String & part_name) const { return droppedPartsPath() + "/" + part_name; }
@@ -171,6 +173,25 @@ public:
 
     /// Best-effort release after a successful commit. Safe (silently ignored) if already gone.
     void releaseLease(const zkutil::ZooKeeperPtr & zk, const String & lease_path, int32_t lease_version) const;
+
+    /// Per-AZ merge-selection leader election (see StorageCloudMergeTree::az_leadership_recheck_task
+    /// for why): registers this replica under replicas/<az>/ with an ephemeral-sequential node,
+    /// creating that AZ's subtree first if this is the first replica to register in it. The node
+    /// name itself is a fixed literal prefix plus Keeper's zero-padded sequence number, identical
+    /// for every replica in the AZ -- required so plain lexicographic comparison in
+    /// isLowestSequenceInAz() actually orders by sequence number; display_name is only the node's
+    /// *value*, for introspection. Returns the created node's full path, which the caller must
+    /// remember: both to recognize its own node in isLowestSequenceInAz()'s listing, and to
+    /// remove it explicitly on a clean shutdown.
+    String registerReplicaForAzElection(const zkutil::ZooKeeperPtr & zk, const String & az, const String & display_name) const;
+
+    /// Whether own_node_path (as returned by registerReplicaForAzElection()) currently holds the
+    /// lowest sequence number among replicas/<az>/'s children -- the standard ZK leader-election
+    /// recipe. A crashed leader's node is already gone from this listing (ephemeral, tied to its
+    /// session), so this alone is enough to detect failover on the next call; no staleness
+    /// threshold needed here, unlike acquireOrStealLease()'s merge leases (see its own doc comment
+    /// for why that one does).
+    bool isLowestSequenceInAz(const zkutil::ZooKeeperPtr & zk, const String & az, const String & own_node_path) const;
 
     /// DROP: atomically deactivate parts. Object data is left for GC, never deleted inline.
     Coordination::Error tryRemoveParts(const zkutil::ZooKeeperPtr & zk, const Strings & part_names) const;

@@ -50,6 +50,28 @@ def cluster():
             stay_alive=True,
         )
 
+        # AZ-aware nodes, used only by the per-AZ leader fan-out tests below -- node1/node2 above
+        # deliberately have no <placement> config, so every other test in this file keeps exercising
+        # today's no-AZ-info-configured (gate is a no-op) behavior unchanged.
+        cluster.add_instance(
+            "node_az_a1",
+            main_configs=["configs/config.d/storage_conf.xml", "configs/config.d/az_a.xml"],
+            with_zookeeper=True,
+            stay_alive=True,
+        )
+        cluster.add_instance(
+            "node_az_a2",
+            main_configs=["configs/config.d/storage_conf.xml", "configs/config.d/az_a.xml"],
+            with_zookeeper=True,
+            stay_alive=True,
+        )
+        cluster.add_instance(
+            "node_az_b1",
+            main_configs=["configs/config.d/storage_conf.xml", "configs/config.d/az_b.xml"],
+            with_zookeeper=True,
+            stay_alive=True,
+        )
+
         logging.info("Starting cluster...")
         cluster.start()
         logging.info("Cluster started")
@@ -2978,3 +3000,110 @@ def test_select_sequential_consistency_sees_fresh_insert_despite_stalled_watcher
         node2.query(f"SYSTEM DISABLE FAILPOINT {gate}")
         node2.query(f"DROP TABLE IF EXISTS {table} SYNC")
         node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
+
+
+def _merge_selection_attempts(node):
+    # CloudMergeTreeMergeSelectionAttempts is incremented once per scheduleDataProcessingJob()
+    # cycle that passes the per-AZ leader gate (see StorageCloudMergeTree.cpp) -- system.events
+    # only has a row for an event once it has fired at least once on this node.
+    result = node.query(
+        "SELECT value FROM system.events WHERE event = 'CloudMergeTreeMergeSelectionAttempts'"
+    ).strip()
+    return int(result) if result else 0
+
+
+def _attach_shared_table(creator, attacher, ddl=TABLE_DDL, table=TABLE_NAME):
+    creator.query(f"CREATE TABLE {table} {ddl}")
+    table_uuid = creator.query(f"SELECT uuid FROM system.tables WHERE table = '{table}'").strip()
+    attacher.query(f"ATTACH TABLE {table} UUID '{table_uuid}' {ddl}")
+
+
+def test_az_leader_election_only_one_leader_per_az(cluster):
+    node_a1 = cluster.instances["node_az_a1"]
+    node_a2 = cluster.instances["node_az_a2"]
+
+    _attach_shared_table(node_a1, node_a2)
+    try:
+        # A few separate parts so the background scheduler has something to consider every cycle,
+        # not just idle-poll ticks.
+        for i in range(1, 4):
+            node_a1.query(f"INSERT INTO {TABLE_NAME} VALUES ({i}, 'v{i}')")
+
+        before_a1 = _merge_selection_attempts(node_a1)
+        before_a2 = _merge_selection_attempts(node_a2)
+
+        # Comfortably longer than cloud_merge_tree_az_leader_recheck_ms's 5s default and the
+        # scheduler's own much-shorter idle-poll interval.
+        time.sleep(8)
+
+        attempted_a1 = _merge_selection_attempts(node_a1) > before_a1
+        attempted_a2 = _merge_selection_attempts(node_a2) > before_a2
+
+        # Same-AZ replicas: exactly one must be attempting selection, the other's count must stay
+        # completely flat (not just "attempted less") -- proves the gate actually skips selection
+        # on the non-leader rather than merely losing the lease race more often.
+        assert attempted_a1 != attempted_a2, (
+            f"expected exactly one of node_az_a1/node_az_a2 to attempt merge selection, "
+            f"got attempted_a1={attempted_a1}, attempted_a2={attempted_a2}"
+        )
+    finally:
+        node_a1.query(f"DROP TABLE IF EXISTS {TABLE_NAME} SYNC")
+        node_a2.query(f"DROP TABLE IF EXISTS {TABLE_NAME} SYNC")
+
+
+def test_az_leader_failover_on_restart(cluster):
+    node_a1 = cluster.instances["node_az_a1"]
+    node_a2 = cluster.instances["node_az_a2"]
+
+    _attach_shared_table(node_a1, node_a2)
+    try:
+        for i in range(1, 4):
+            node_a1.query(f"INSERT INTO {TABLE_NAME} VALUES ({i}, 'v{i}')")
+
+        before_a1 = _merge_selection_attempts(node_a1)
+        before_a2 = _merge_selection_attempts(node_a2)
+        time.sleep(8)
+        attempted_a1 = _merge_selection_attempts(node_a1) > before_a1
+        attempted_a2 = _merge_selection_attempts(node_a2) > before_a2
+        assert attempted_a1 != attempted_a2, "expected exactly one leader before restart"
+
+        leader, follower = (node_a1, node_a2) if attempted_a1 else (node_a2, node_a1)
+
+        # The leader's ephemeral election node dies with its session on restart (or is removed
+        # explicitly by shutdown()'s own best-effort cleanup for a clean stop) -- either way,
+        # leadership must move to the surviving same-AZ replica, not stay stuck orphaned.
+        leader.restart_clickhouse()
+
+        before_follower = _merge_selection_attempts(follower)
+        time.sleep(8)
+        after_follower = _merge_selection_attempts(follower)
+        assert after_follower > before_follower, (
+            "surviving same-AZ replica did not take over merge-selection leadership "
+            "after the previous leader restarted"
+        )
+    finally:
+        node_a1.query(f"DROP TABLE IF EXISTS {TABLE_NAME} SYNC")
+        node_a2.query(f"DROP TABLE IF EXISTS {TABLE_NAME} SYNC")
+
+
+def test_az_leader_multi_az_no_global_bottleneck(cluster):
+    node_a1 = cluster.instances["node_az_a1"]
+    node_b1 = cluster.instances["node_az_b1"]
+
+    _attach_shared_table(node_a1, node_b1)
+    try:
+        for i in range(1, 4):
+            node_a1.query(f"INSERT INTO {TABLE_NAME} VALUES ({i}, 'v{i}')")
+
+        before_a1 = _merge_selection_attempts(node_a1)
+        before_b1 = _merge_selection_attempts(node_b1)
+        time.sleep(8)
+
+        # Each is the sole replica of its own AZ, so each must be its own AZ's leader
+        # simultaneously -- confirms this is genuinely per-AZ, not a single global leader
+        # excluding replicas in other AZs.
+        assert _merge_selection_attempts(node_a1) > before_a1
+        assert _merge_selection_attempts(node_b1) > before_b1
+    finally:
+        node_a1.query(f"DROP TABLE IF EXISTS {TABLE_NAME} SYNC")
+        node_b1.query(f"DROP TABLE IF EXISTS {TABLE_NAME} SYNC")

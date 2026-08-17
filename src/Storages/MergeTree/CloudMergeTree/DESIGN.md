@@ -54,7 +54,9 @@ things relative to it:
   mutations/<id>                mutation commands + target version
   leases/                       merge/mutation assignment leases (ephemeral)
     <part_range>                holder session writes here before producing a result
-  replicas/<replica_session>    ephemeral liveness nodes. NO per-replica parts.
+  replicas/<az>/<seq>            ephemeral-sequential per-AZ election nodes (only when this
+                                replica's availability zone is known). NO per-replica parts;
+                                doubles as the per-AZ merge-selection leader election.
   temp/                         in-flight part registrations for crash cleanup
 ```
 

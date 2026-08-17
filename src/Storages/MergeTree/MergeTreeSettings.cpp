@@ -110,6 +110,13 @@ part left Keeper's canonical set, not a local refcount.
 `CloudMergeTree` only. How often (in milliseconds) the parts-killer GC
 background task scans for tombstoned parts past their grace period.
 )", 0) \
+    DECLARE(UInt64, cloud_merge_tree_az_leader_recheck_ms, 5000, R"(
+`CloudMergeTree` only. How often (in milliseconds) a replica rechecks
+whether it is the elected per-availability-zone merge-selection leader.
+Only takes effect when this replica's availability zone is known; every
+replica otherwise keeps attempting merge selection, as if this setting
+did not exist.
+)", 0) \
     DECLARE(Float, ratio_of_defaults_for_sparse_serialization, 0.9375f, R"(
 Minimal ratio of the number of _default_ values to the number of _all_ values
 in a column. Setting this value causes the column to be stored using sparse

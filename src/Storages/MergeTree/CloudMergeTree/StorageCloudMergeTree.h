@@ -273,6 +273,39 @@ private:
     BackgroundSchedulePoolTaskHolder parts_killer_task;
     void runPartsKillerCycle();
 
+    /// Per-AZ merge-selection leader election (DESIGN.md's "per-AZ leader fan-out"): every
+    /// replica racing selectPartsToMerge()/acquireOrStealLease() independently every scheduling
+    /// cycle is redundant Keeper traffic, since only one replica can ever win a given lease. When
+    /// this replica's availability zone is known (PlacementInfo::getAvailabilityZone() is
+    /// non-empty), only the elected leader *within that AZ* attempts selection; a table with no
+    /// AZ info configured keeps today's every-replica-races behavior unchanged (see
+    /// scheduleDataProcessingJob()'s own comment on why is_az_leader defaults to true).
+    /// Deliberately per-AZ, not a single global leader: zkutil::checkNoOldLeaders
+    /// (Storages/MergeTree/LeaderElection.h) documents upstream removing single-leader merge
+    /// assignment specifically because a lone leader is a bottleneck/SPOF -- a global
+    /// CloudMergeTree leader would reintroduce exactly that. Per-AZ keeps as many concurrent
+    /// leaders as there are distinct AZs.
+    String az_election_node_path;
+
+    /// Cached result of the last az_leadership_recheck_task cycle -- scheduleDataProcessingJob()
+    /// reads this directly (no Keeper call on that hot path, which is the whole point). Defaults
+    /// to true: until the first recheck completes, or if AZ info is absent so the feature never
+    /// activates, every replica must behave as it does today and participate in selection.
+    /// Defaulting to false would leave a freshly-started table doing no merge selection at all
+    /// until the first recheck runs -- an availability regression for what's meant to be a pure
+    /// efficiency optimization.
+    std::atomic<bool> is_az_leader{true};
+
+    /// Periodically re-derives is_az_leader via coordination.isLowestSequenceInAz(). Not created/
+    /// activated at all when this replica's AZ is unknown. A *live but wedged* leader (session
+    /// healthy, its own scheduling loop hung) keeps "winning" the election and silently starves
+    /// merge selection for its whole AZ until it recovers or the process dies -- the same
+    /// tradeoff already accepted for merge leases (see CloudMergeTreeCoordination::acquireOrStealLease()'s
+    /// own doc comment on live-but-stuck holders); not solved here, consistent with this design's
+    /// phased, minimal-first approach elsewhere.
+    BackgroundSchedulePoolTaskHolder az_leadership_recheck_task;
+    void runAzLeadershipRecheckCycle();
+
     /// Shared primitive behind dropPartition/dropPart/truncate (Phase 4 Step A): removes every
     /// currently-active part whose name matches `predicate` via one or more coordination.tryRemoveParts()
     /// multi()s (each atomically deactivates + tombstones its parts, same as drop() already does for

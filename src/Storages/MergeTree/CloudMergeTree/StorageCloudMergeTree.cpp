@@ -11,6 +11,7 @@
 #include <Backups/BackupEntriesCollector.h>
 #include <Parsers/ASTLiteral.h>
 #include <Interpreters/DatabaseCatalog.h>
+#include <Server/CloudPlacementInfo.h>
 
 #include <Storages/MergeTree/MergeTreeDataSelectExecutor.h>
 #include <Storages/MergeTree/ReplicatedMergeTreePartHeader.h>
@@ -49,6 +50,7 @@
 namespace ProfileEvents
 {
     extern const Event MergesRejectedByMemoryLimit;
+    extern const Event CloudMergeTreeMergeSelectionAttempts;
 }
 
 namespace DB
@@ -89,6 +91,7 @@ namespace MergeTreeSetting
     extern const MergeTreeSettingsUInt64 cloud_merge_tree_lease_staleness_ms;
     extern const MergeTreeSettingsUInt64 cloud_merge_tree_gc_grace_period_seconds;
     extern const MergeTreeSettingsUInt64 cloud_merge_tree_gc_interval_ms;
+    extern const MergeTreeSettingsUInt64 cloud_merge_tree_az_leader_recheck_ms;
     extern const MergeTreeSettingsSeconds lock_acquire_timeout_for_background_operations;
     extern const MergeTreeSettingsBool allow_experimental_replacing_merge_with_cleanup;
 }
@@ -285,6 +288,23 @@ StorageCloudMergeTree::StorageCloudMergeTree(
             getStorageID(), getStorageID().getFullTableName() + " (CloudMergeTree::partsKillerTask)",
             [this] { runPartsKillerCycle(); });
         parts_killer_task->deactivate();
+
+        /// Per-AZ merge-selection leader election (see az_leadership_recheck_task's own doc
+        /// comment): only register and start rechecking when this replica's AZ is actually known.
+        /// Left entirely unset (az_election_node_path empty, az_leadership_recheck_task null,
+        /// is_az_leader stays at its default true) otherwise, so every replica keeps racing
+        /// exactly as before this feature existed -- see DESIGN.md's own reasoning for why
+        /// collapsing every AZ-less replica into one implicit bucket would be wrong.
+        const String az = PlacementInfo::PlacementInfo::instance().getAvailabilityZone();
+        if (!az.empty())
+        {
+            az_election_node_path = coordination.registerReplicaForAzElection(zk, az, getStorageID().getFullTableName());
+
+            az_leadership_recheck_task = getContext()->getSchedulePool()->createTask(
+                getStorageID(), getStorageID().getFullTableName() + " (CloudMergeTree::azLeadershipRecheckTask)",
+                [this] { runAzLeadershipRecheckCycle(); });
+            az_leadership_recheck_task->deactivate();
+        }
     }
     else
     {
@@ -407,6 +427,8 @@ void StorageCloudMergeTree::startup()
 
     part_set_updating_task->activateAndSchedule();
     parts_killer_task->activateAndSchedule();
+    if (az_leadership_recheck_task)
+        az_leadership_recheck_task->activateAndSchedule();
     background_operations_assignee.start();
 }
 
@@ -420,6 +442,30 @@ void StorageCloudMergeTree::shutdown(bool)
 
     if (parts_killer_task)
         parts_killer_task->deactivate();
+
+    if (az_leadership_recheck_task)
+    {
+        az_leadership_recheck_task->deactivate();
+
+        /// Best-effort explicit removal: makes the next-lowest-sequence replica in this AZ take
+        /// over immediately on a clean shutdown, instead of waiting out the full Keeper session
+        /// timeout. Safe to skip on failure (e.g. no Keeper connection at shutdown time) -- the
+        /// ephemeral node still self-cleans on session death either way.
+        if (!az_election_node_path.empty())
+        {
+            try
+            {
+                auto component_guard = Coordination::setCurrentComponent("StorageCloudMergeTree::shutdown");
+                if (auto zk = getContext()->getZooKeeper())
+                    zk->tryRemove(az_election_node_path);
+            }
+            catch (...)
+            {
+                tryLogCurrentException(getLogger("StorageCloudMergeTree"),
+                    "Failed to remove AZ election node on shutdown, will self-clean via session death");
+            }
+        }
+    }
 
     background_operations_assignee.finish();
 
@@ -1317,6 +1363,24 @@ bool StorageCloudMergeTree::scheduleDataProcessingJob(BackgroundJobsAssignee & a
         /// comment for why this check alone isn't enough without that override.
         if (merger_mutator.merges_blocker.isCancelled())
             return false;
+
+        /// Per-AZ merge-selection leader fan-out (see az_leadership_recheck_task's own doc
+        /// comment): a non-leader replica in an AZ that has a leader skips selection entirely --
+        /// it would only ever lose the lease race anyway, so attempting it is pure wasted Keeper
+        /// traffic. Defaults to true (every replica participates) until the first recheck
+        /// completes, or permanently when this replica's AZ is unknown -- see is_az_leader's own
+        /// doc comment for why. Deliberately does NOT gate explicit OPTIMIZE TABLE (a separate
+        /// code path, optimize() below) -- a user running OPTIMIZE against a specific replica
+        /// must still work regardless of AZ leadership, same as SYSTEM STOP MERGES above only
+        /// gates this background scheduler.
+        if (!is_az_leader.load())
+            return false;
+
+        /// Observability for the gate above: lets a test (and an operator) confirm a non-leader
+        /// replica's count stays flat instead of climbing every cycle like a leader's (or every
+        /// replica's, when no AZ is configured and this gate is a no-op) -- see the event's own
+        /// registered description.
+        ProfileEvents::increment(ProfileEvents::CloudMergeTreeMergeSelectionAttempts);
 
         auto merge_select_result = selectPartsToMerge(metadata_snapshot, lock);
         if (merge_select_result)
@@ -2542,6 +2606,35 @@ catch (...)
 {
     tryLogCurrentException(getLogger("StorageCloudMergeTree"), __PRETTY_FUNCTION__);
     parts_killer_task->scheduleAfter((*getSettings())[MergeTreeSetting::cloud_merge_tree_gc_interval_ms]);
+}
+
+void StorageCloudMergeTree::runAzLeadershipRecheckCycle()
+try
+{
+    /// Only ever created/scheduled when az_election_node_path was set in the constructor (see
+    /// its own doc comment) -- this function never runs otherwise.
+    auto component_guard = Coordination::setCurrentComponent("StorageCloudMergeTree::runAzLeadershipRecheckCycle");
+    auto zk = getZooKeeper();
+
+    const String az = PlacementInfo::PlacementInfo::instance().getAvailabilityZone();
+    is_az_leader.store(coordination.isLowestSequenceInAz(zk, az, az_election_node_path));
+
+    const UInt64 interval_ms = (*getSettings())[MergeTreeSetting::cloud_merge_tree_az_leader_recheck_ms];
+    az_leadership_recheck_task->scheduleAfter(interval_ms);
+}
+catch (const Coordination::Exception & e)
+{
+    tryLogCurrentException(getLogger("StorageCloudMergeTree"), __PRETTY_FUNCTION__);
+    /// A transient Keeper hiccup here must not silently strip this replica of leadership (or
+    /// falsely grant it) -- leave is_az_leader at whatever it last was and just retry, same
+    /// fail-safe-by-doing-nothing shape runPartsKillerCycle() uses for the identical situation.
+    az_leadership_recheck_task->scheduleAfter(Coordination::isHardwareError(e.code)
+        ? 10000 : (*getSettings())[MergeTreeSetting::cloud_merge_tree_az_leader_recheck_ms]);
+}
+catch (...)
+{
+    tryLogCurrentException(getLogger("StorageCloudMergeTree"), __PRETTY_FUNCTION__);
+    az_leadership_recheck_task->scheduleAfter((*getSettings())[MergeTreeSetting::cloud_merge_tree_az_leader_recheck_ms]);
 }
 
 }

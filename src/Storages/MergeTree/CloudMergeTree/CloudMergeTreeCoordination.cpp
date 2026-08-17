@@ -5,6 +5,7 @@
 #include <Common/ZooKeeper/ZooKeeperWithFaultInjection.h>
 #include <IO/ReadHelpers.h>
 #include <IO/WriteHelpers.h>
+#include <base/sort.h>
 #include <chrono>
 
 namespace DB
@@ -40,7 +41,7 @@ void CloudMergeTreeCoordination::createRootNodes(const zkutil::ZooKeeperPtr & zk
     zk->createIfNotExists(blockNumbersPath(), "");
     zk->createIfNotExists(root_path + "/mutations", "");
     zk->createIfNotExists(root_path + "/leases", "");
-    zk->createIfNotExists(root_path + "/replicas", "");
+    zk->createIfNotExists(replicasPath(), "");
     zk->createIfNotExists(tempPath(), "");
     zk->createIfNotExists(droppedPartsPath(), "");
     zk->createIfNotExists(detachedPartsPath(), "");
@@ -174,6 +175,30 @@ std::expected<int32_t, Coordination::Error> CloudMergeTreeCoordination::touchLea
 void CloudMergeTreeCoordination::releaseLease(const zkutil::ZooKeeperPtr & zk, const String & lease_path, int32_t lease_version) const
 {
     zk->tryRemove(lease_path, lease_version);
+}
+
+String CloudMergeTreeCoordination::registerReplicaForAzElection(
+    const zkutil::ZooKeeperPtr & zk, const String & az, const String & display_name) const
+{
+    zk->createIfNotExists(replicasPath(), "");
+    zk->createIfNotExists(replicasAzPath(az), "");
+    return zk->create(replicasAzPath(az) + "/replica-", display_name, zkutil::CreateMode::EphemeralSequential);
+}
+
+bool CloudMergeTreeCoordination::isLowestSequenceInAz(
+    const zkutil::ZooKeeperPtr & zk, const String & az, const String & own_node_path) const
+{
+    Strings children = zk->getChildren(replicasAzPath(az));
+    if (children.empty())
+        return false;
+
+    /// Every node under this AZ shares the identical "replica-" prefix and Keeper's fixed-width
+    /// zero-padded sequence suffix (see registerReplicaForAzElection()'s own comment), so plain
+    /// lexicographic sort here is equivalent to sorting by sequence number.
+    ::sort(children.begin(), children.end());
+
+    const String own_name = own_node_path.substr(own_node_path.find_last_of('/') + 1);
+    return children.front() == own_name;
 }
 
 Coordination::Error CloudMergeTreeCoordination::tryRemoveParts(
