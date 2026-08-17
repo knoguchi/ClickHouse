@@ -39,6 +39,7 @@
 #include <IO/WriteBufferFromString.h>
 #include <IO/VarInt.h>
 #include <base/defines.h>
+#include <Common/FailPoint.h>
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
@@ -54,6 +55,11 @@ namespace DB
 namespace ActionLocks
 {
     extern const StorageActionBlockType PartsMerge;
+}
+
+namespace FailPoints
+{
+    extern const char cloud_merge_tree_mutate_lease_acquired[];
 }
 
 namespace ErrorCodes
@@ -896,14 +902,26 @@ std::expected<CloudMutateSelectedEntryPtr, SelectMergeFailure> StorageCloudMerge
             /// Same lease namespace merges use -- a mutated part's name (bumped .mutation field)
             /// never collides with any concurrent merge's result name, so no separate namespace
             /// is needed. Losing this race is NOTHING_TO_MERGE for this part, not fatal -- try the
-            /// next part instead of giving up the whole selection cycle.
+            /// next part instead of giving up the whole selection cycle. That means breaking out
+            /// of this inner loop (mutations, ascending by id) on a lost race, not continuing it:
+            /// continuing would try the *next, higher* mutation id against this same part, which
+            /// stamps info.mutation past the lower one we just lost the race for -- permanently
+            /// hiding it from partNeedsMutation() (part.info.mutation >= mutation_id short-circuits
+            /// true for the lower id forever, even though its commands were never applied).
             const String lease_path = coordination.leasePath(future_part->name);
             const String holder_data = toString(ServerUUID::get());
             const Int64 staleness_ms = static_cast<Int64>((*getSettings())[MergeTreeSetting::cloud_merge_tree_lease_staleness_ms]);
 
             auto lease = coordination.acquireOrStealLease(zk, lease_path, holder_data, staleness_ms);
             if (!lease)
-                continue;
+                break;
+
+            /// Test-only pause point (see CODE_REVIEW.md finding #8's regression test): lets a
+            /// test deterministically hold this mutation's lease across a real gap, instead of
+            /// relying on two replicas' independent background schedulers racing to overlap by
+            /// chance within a couple hundred milliseconds -- which they reliably don't. No-op
+            /// unless the test explicitly enables it via SYSTEM ENABLE FAILPOINT.
+            FailPointInjection::pauseFailPoint(FailPoints::cloud_merge_tree_mutate_lease_acquired);
 
             try
             {

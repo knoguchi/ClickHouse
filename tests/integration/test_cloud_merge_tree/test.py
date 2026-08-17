@@ -1,6 +1,6 @@
 import logging
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 
 import pytest
 
@@ -916,6 +916,93 @@ def test_two_sequential_mutations_both_apply(cluster):
         )
         assert node1.query(f"SELECT data FROM {table} WHERE id = 1").strip() == "c"
     finally:
+        node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
+
+
+def _wait_failpoint_paused(node, failpoint, timeout=60):
+    # SYSTEM WAIT FAILPOINT ... PAUSE blocks, so it runs on a worker thread: a failpoint that is
+    # never reached must fail the test rather than hang it. The executor is not joined on the
+    # failure path, because its worker is still stuck inside the blocking query.
+    pool = ThreadPoolExecutor(max_workers=1)
+    future = pool.submit(node.query, f"SYSTEM WAIT FAILPOINT {failpoint} PAUSE")
+    done, _ = wait([future], timeout=timeout)
+    if not done:
+        pool.shutdown(wait=False, cancel_futures=True)
+        raise AssertionError(f"failpoint {failpoint} was not reached within {timeout}s")
+    pool.shutdown(wait=False)
+    future.result()
+
+
+def test_concurrent_mutation_selection_from_both_replicas_applies_all(cluster):
+    node1 = cluster.instances["node1"]
+    node2 = cluster.instances["node2"]
+    table = "cloud_test_concurrent_mutation_select"
+    ddl = "(id UInt64, data String) ENGINE = CloudMergeTree ORDER BY id SETTINGS storage_policy = 's3'"
+
+    node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
+    node1.query(f"CREATE TABLE {table} {ddl}")
+    table_uuid = node1.query(f"SELECT uuid FROM system.tables WHERE table = '{table}'").strip()
+    node2.query(f"ATTACH TABLE {table} UUID '{table_uuid}' {ddl}")
+    failpoint = "cloud_merge_tree_mutate_lease_acquired"
+    try:
+        node1.query(f"INSERT INTO {table} VALUES (1, 'a')")
+        assert_eq_with_retry(node2, f"SELECT count() FROM {table}", "1")
+
+        # Two mutations pending on the same single part at once. node1's own background scheduler
+        # is made to genuinely park right after acquiring a mutation's lease (via the
+        # cloud_merge_tree_mutate_lease_acquired failpoint). node2's own scheduler is held off with
+        # SYSTEM STOP MERGES (which also gates mutation selection, matching upstream's own
+        # merges_blocker.isCancelled() check in scheduleDataProcessingJob) until node1 is confirmed
+        # paused -- otherwise which replica's scheduler reaches mutation 1 first, and therefore
+        # which mutation node1 ends up paused on, isn't controlled, and the two schedulers'
+        # natural timing never reliably contends for the same lease at all. selectPartsToMutate()'s
+        # former bug `continue`d the mutation loop past a lost lease instead of `break`ing it,
+        # silently applying mutation 2 while mutation 1 was still held elsewhere, which permanently
+        # hides mutation 1 as "done" (partNeedsMutation() only checks the stamped version) even
+        # though its command was never applied.
+        node2.query(f"SYSTEM STOP MERGES {table}")
+        node1.query(f"SYSTEM ENABLE FAILPOINT {failpoint}")
+        try:
+            node1.query(f"ALTER TABLE {table} UPDATE data = concat(data, '-m1') WHERE id = 1")
+            node1.query(f"ALTER TABLE {table} UPDATE data = concat(data, '-m2') WHERE id = 1")
+
+            # node2 is stopped, so node1 -- uncontended -- is guaranteed to select mutations in
+            # ascending id order and pause on mutation 1 specifically, holding its lease.
+            _wait_failpoint_paused(node1, failpoint)
+            node2.query(f"SYSTEM START MERGES {table}")
+
+            # node1 genuinely holds mutation 1's lease (parked, not yet committed) for the whole
+            # sleep below -- node2's own scheduler gets a generous number of cycles to (incorrectly,
+            # pre-fix) race ahead to mutation 2 on the same part.
+            time.sleep(5)
+            assert node2.query(f"SELECT data FROM {table} WHERE id = 1").strip() == "a", (
+                "node2 must not apply mutation 2 while node1 still holds mutation 1's lease"
+            )
+
+            node1.query(f"SYSTEM NOTIFY FAILPOINT {failpoint}")
+        finally:
+            node1.query(f"SYSTEM DISABLE FAILPOINT {failpoint}")
+            node2.query(f"SYSTEM START MERGES {table}")
+
+        assert_eq_with_retry(
+            node1,
+            f"SELECT count() FROM system.mutations WHERE table = '{table}' AND is_done = 1",
+            "2",
+            retry_count=40,
+            sleep_time=1,
+        )
+        assert_eq_with_retry(
+            node2,
+            f"SELECT count() FROM system.mutations WHERE table = '{table}' AND is_done = 1",
+            "2",
+            retry_count=40,
+            sleep_time=1,
+        )
+        assert node1.query(f"SELECT data FROM {table} WHERE id = 1").strip() == "a-m1-m2"
+        assert_eq_with_retry(node2, f"SELECT data FROM {table} WHERE id = 1", "a-m1-m2")
+    finally:
+        node1.query(f"SYSTEM DISABLE FAILPOINT {failpoint}")
+        node2.query(f"DROP TABLE IF EXISTS {table} SYNC")
         node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
 
 
