@@ -1899,18 +1899,23 @@ void StorageCloudMergeTree::movePartitionToTable(const StoragePtr & dest_table, 
     if (new_parts_with_headers.empty())
         return; /// Nothing to move: empty source partition.
 
-    /// Bounded retry against a concurrent DROP/merge racing on the SOURCE's own parts in this
-    /// partition: the multi() below fails closed (ZNONODE) if any old part we're moving away was
-    /// already deactivated elsewhere -- same fail-closed/retry shape replacePartitionFrom() already
-    /// established. A failed multi() is all-or-nothing, so new_parts_with_headers (already cloned
-    /// onto the destination) is safe to reuse unchanged on retry.
+    /// Fixed to src_parts, computed once, matching exactly what was cloned above -- NOT
+    /// re-scanned per retry attempt. A partition-wide re-scan on each retry would pick up any part
+    /// concurrently added to this partition after src_parts was captured (e.g. another replica's
+    /// INSERT, adopted by this replica's watcher in the meantime) and tombstone it as if it were
+    /// one of the moved parts, even though it was never cloned to the destination -- the row data
+    /// then exists in neither table, a silent, permanent loss. The bounded retry below still
+    /// handles the (unrelated) case where one of *these* parts was independently deactivated by a
+    /// concurrent DROP/merge: the multi() fails closed (ZNONODE) and retries this same fixed list,
+    /// same fail-closed/retry shape replacePartitionFrom() established -- reusing it unchanged is
+    /// safe since a failed multi() is all-or-nothing.
+    Strings old_part_names_to_remove;
+    old_part_names_to_remove.reserve(src_parts.size());
+    for (const auto & src_part : src_parts)
+        old_part_names_to_remove.push_back(src_part->name);
+
     for (int attempt = 0; attempt < 20; ++attempt)
     {
-        Strings old_part_names_to_remove;
-        for (const auto & part : getDataPartsVectorForInternalUsage({DataPartState::Active}, {DataPartKind::Regular}))
-            if (part->info.getPartitionId() == partition_id)
-                old_part_names_to_remove.push_back(part->name);
-
         /// No single CloudMergeTreeCoordination instance can build this multi() -- it spans two
         /// tables' Keeper roots. Built directly here from both instances' already-public path
         /// helpers (plain string concatenation, safe to call on either instance); one ZooKeeperPtr

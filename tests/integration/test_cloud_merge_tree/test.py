@@ -1953,6 +1953,81 @@ def test_move_partition_to_table_moves_data(cluster):
         node1.query(f"DROP TABLE IF EXISTS {dst_table} SYNC")
 
 
+def test_concurrent_insert_during_move_partition_is_not_lost(cluster):
+    node1 = cluster.instances["node1"]
+    node2 = cluster.instances["node2"]
+    src_table = "cloud_test_move_race_src"
+    dst_table = "cloud_test_move_race_dst"
+    ddl = "(id UInt64, data String) ENGINE = CloudMergeTree ORDER BY id PARTITION BY id % 2 SETTINGS storage_policy = 's3'"
+
+    node1.query(f"DROP TABLE IF EXISTS {src_table} SYNC")
+    node1.query(f"DROP TABLE IF EXISTS {dst_table} SYNC")
+    node1.query(f"CREATE TABLE {src_table} {ddl}")
+    node1.query(f"CREATE TABLE {dst_table} {ddl}")
+    src_uuid = node1.query(f"SELECT uuid FROM system.tables WHERE table = '{src_table}'").strip()
+    node2.query(f"ATTACH TABLE {src_table} UUID '{src_uuid}' {ddl}")
+    try:
+        # SYSTEM STOP MERGES: isolate the concurrent-INSERT race under test from an unrelated one
+        # -- a background merge opportunistically consolidating two of the several small parts
+        # below while the MOVE is in flight hits the exact same "one of these parts is no longer
+        # active" retry path for a completely different reason, unrelated to this test's actual
+        # target.
+        node1.query(f"SYSTEM STOP MERGES {src_table}")
+
+        # Several parts in partition 0 -- movePartitionToTable's clone loop (one
+        # cloneAndLoadDataPart() object-storage copy per part) takes long enough to give the
+        # concurrent INSERT below a real chance to land inside the race window between that loop
+        # and the commit multi().
+        for i in (2, 4, 6, 8, 10):
+            node1.query(f"INSERT INTO {src_table} VALUES ({i}, 'v{i}')")
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            move_future = executor.submit(
+                node1.query, f"ALTER TABLE {src_table} MOVE PARTITION 0 TO TABLE {dst_table}"
+            )
+            # node2, not node1: a genuinely different replica's INSERT, adopted through node1's
+            # own watcher -- exactly CODE_REVIEW.md finding #4's failure scenario
+            # (movePartitionToTable rebuilt its removal list from a fresh partition-wide scan on
+            # every attempt, so a part that showed up in the meantime got tombstoned on the source
+            # without ever having been cloned to the destination -- lost from both tables).
+            insert_future = executor.submit(
+                node2.query, f"INSERT INTO {src_table} VALUES (100, 'racing')"
+            )
+            move_future.result(timeout=60)
+            insert_future.result(timeout=60)
+
+        # The racing row must land in exactly one of the two tables -- never both (double-counted)
+        # and never neither (lost). Which table depends on exactly where the race landed relative
+        # to movePartitionToTable's internal snapshot, which this test deliberately does not pin
+        # down -- only that the row isn't silently dropped.
+        def total_for_id_100():
+            src_count = int(node1.query(f"SELECT count() FROM {src_table} WHERE id = 100").strip())
+            dst_count = int(node1.query(f"SELECT count() FROM {dst_table} WHERE id = 100").strip())
+            return src_count + dst_count
+
+        deadline = time.time() + 30
+        total = total_for_id_100()
+        while total != 1 and time.time() < deadline:
+            time.sleep(0.5)
+            total = total_for_id_100()
+        assert total == 1, f"row id=100 present in {total} of {{src_table, dst_table}} combined, expected exactly 1"
+
+        # The rest of partition 0's original content must still have moved over intact regardless.
+        assert_eq_with_retry(
+            node1,
+            f"SELECT count() FROM {dst_table} WHERE id % 2 = 0 AND id != 100",
+            "5",
+        )
+        assert (
+            node1.query(f"SELECT count() FROM {src_table} WHERE id % 2 = 0 AND id != 100").strip()
+            == "0"
+        )
+    finally:
+        node2.query(f"DROP TABLE IF EXISTS {src_table} SYNC")
+        node1.query(f"DROP TABLE IF EXISTS {src_table} SYNC")
+        node1.query(f"DROP TABLE IF EXISTS {dst_table} SYNC")
+
+
 def test_move_partition_source_parts_survive_grace_period_then_reclaimed(cluster):
     node1 = cluster.instances["node1"]
     src_table = "cloud_test_move_gc_src"
