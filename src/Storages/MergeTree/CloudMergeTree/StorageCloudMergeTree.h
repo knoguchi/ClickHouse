@@ -84,8 +84,14 @@ public:
     /// calls .value() on them unconditionally for every MergeTreeData-derived table, so a
     /// MergeTreeData subclass that doesn't override these throws (and, at server startup, before
     /// the metrics thread's own steady-state try/catch is established, crashes the whole process).
-    std::optional<UInt64> totalRows(ContextPtr) const override { return getTotalActiveSizeInRows(); }
-    std::optional<UInt64> totalBytes(ContextPtr) const override { return getTotalActiveSizeInBytes(); }
+    /// Each honors select_sequential_consistency via ensureSequentialConsistency() -- ClickHouse's
+    /// own trivial-count/trivial-size optimizations route a plain SELECT count()/equivalent
+    /// straight through these instead of read(), so the same staleness guard read() has isn't
+    /// enough on its own. Defined out-of-line (not inline like the old one-liners) since calling
+    /// ContextPtr::getSettingsRef() needs the full Context definition, which this header doesn't
+    /// otherwise pull in.
+    std::optional<UInt64> totalRows(ContextPtr local_context) const override;
+    std::optional<UInt64> totalBytes(ContextPtr local_context) const override;
     std::optional<UInt64> totalBytesUncompressed(const Settings &) const override;
 
     /// data.insert_increment is a per-process counter, meant to give temp part directories
@@ -248,6 +254,15 @@ private:
     /// this piggybacks on the existing task rather than adding a second one.
     BackgroundSchedulePoolTaskHolder part_set_updating_task;
     void updatePartSetFromKeeper();
+
+    /// select_sequential_consistency support: if set in `settings`, synchronously catches this
+    /// replica's local part-set cache up to Keeper's current version before read()/totalRows()/
+    /// totalBytes()/totalBytesUncompressed() proceed. Cheap no-op otherwise (a single
+    /// zk->exists() call via getPartsVersion()) or if already caught up. Throws STALE_VERSION if
+    /// a catch-up attempt doesn't fully succeed. const so it can be called from totalRows()/
+    /// totalBytes()'s inherited const IStorage signatures -- see its own .cpp doc comment for why
+    /// that's safe.
+    void ensureSequentialConsistency(const Settings & settings) const;
 
     /// Phase 3 "parts killer": periodically scans dropped_parts/ (tombstones written atomically
     /// whenever a part leaves the active Keeper set -- merge sources, or a dropped table's parts)

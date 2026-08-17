@@ -129,6 +129,12 @@ projections, FINAL), `MergeTreePartInfo`, checksums, `MergeTreeSettings`,
   into cold-storage tables sharing the same schema). Done: `REPLACE`/`ATTACH
   PARTITION ... FROM` and `MOVE PARTITION ... TO TABLE` are both implemented.
 
-Deferred (the SMT periphery, not correctness): sequential-consistency read
-fencing, per-AZ leader fan-out, snapshot cleaner tuning, backup/restore
-conversion.
+Deferred (the SMT periphery, not correctness): per-AZ leader fan-out,
+snapshot cleaner tuning, backup/restore conversion.
+
+Sequential-consistency read fencing is done: `select_sequential_consistency`
+(the same global setting `StorageReplicatedMergeTree` uses) makes
+`read()`/`totalRows()`/`totalBytes()`/`totalBytesUncompressed()`
+synchronously catch this replica's local part-set cache up to Keeper's
+current version first, instead of relying on the async background watcher
+alone.

@@ -39,6 +39,7 @@
 #include <IO/WriteBufferFromString.h>
 #include <IO/VarInt.h>
 #include <base/defines.h>
+#include <base/sleep.h>
 #include <Common/FailPoint.h>
 #include <algorithm>
 #include <chrono>
@@ -62,6 +63,7 @@ namespace FailPoints
     extern const char cloud_merge_tree_mutate_lease_acquired[];
     extern const char cloud_merge_tree_merge_lease_acquired[];
     extern const char cloud_merge_tree_schedule_pause[];
+    extern const char cloud_merge_tree_part_set_watcher_pause[];
 }
 
 namespace ErrorCodes
@@ -77,6 +79,7 @@ namespace ErrorCodes
     extern const int CANNOT_ASSIGN_OPTIMIZE;
     extern const int UNKNOWN_POLICY;
     extern const int ABORTED;
+    extern const int STALE_VERSION;
 }
 
 namespace MergeTreeSetting
@@ -92,6 +95,7 @@ namespace MergeTreeSetting
 namespace Setting
 {
     extern const SettingsBool optimize_skip_merged_partitions;
+    extern const SettingsUInt64 select_sequential_consistency;
 }
 
 /// Minimal mutations snapshot: CloudMergeTree has no mutations in Phase 0, so the snapshot is
@@ -254,7 +258,16 @@ StorageCloudMergeTree::StorageCloudMergeTree(
 
         part_set_updating_task = getContext()->getSchedulePool()->createTask(
             getStorageID(), getStorageID().getFullTableName() + " (CloudMergeTree::partSetUpdatingTask)",
-            [this] { updatePartSetFromKeeper(); });
+            [this]
+            {
+                /// Test-only pause point (see the select_sequential_consistency regression test):
+                /// gates only this background-triggered invocation, not read()'s own direct call
+                /// to updatePartSetFromKeeper() below -- that one must stay unblocked for the test
+                /// to prove sequential-consistency reads catch up on their own. No-op unless a
+                /// test explicitly enables it via SYSTEM ENABLE FAILPOINT.
+                FailPointInjection::pauseFailPoint(FailPoints::cloud_merge_tree_part_set_watcher_pause);
+                updatePartSetFromKeeper();
+            });
         part_set_updating_task->deactivate();
 
         parts_killer_task = getContext()->getSchedulePool()->createTask(
@@ -402,6 +415,63 @@ void StorageCloudMergeTree::shutdown(bool)
     stopOutdatedAndUnexpectedDataPartsLoadingTask();
 }
 
+void StorageCloudMergeTree::ensureSequentialConsistency(const Settings & settings) const
+{
+    if (!settings[Setting::select_sequential_consistency])
+        return;
+
+    /// This replica's local part-set cache is kept in sync with Keeper only asynchronously
+    /// (part_set_updating_task's background watcher), so a caller here can otherwise miss a part
+    /// another replica just committed. Catch up synchronously first -- getPartsVersion() is a
+    /// single cheap zk->exists() call (same one selectPartsToMerge() already uses for its own
+    /// staleness check), and updatePartSetFromKeeper() is already established as safe to call
+    /// synchronously off a query thread (see optimize()'s own whole-table FINAL loop).
+    auto component_guard = Coordination::setCurrentComponent("StorageCloudMergeTree::ensureSequentialConsistency");
+    auto zk = getZooKeeper();
+    const int32_t target_version = coordination.getPartsVersion(zk);
+    if (target_version == current_parts_version.load())
+        return;
+
+    /// updatePartSetFromKeeper() is a function-try-block whose catch swallows *hardware* Keeper
+    /// errors (logs + reschedules for later -- correct for its normal role as a resilient
+    /// recurring background task, wrong here: silently proceeding with stale data on a transient
+    /// Keeper hiccup is exactly what this setting exists to prevent). Re-checking the version
+    /// afterward catches that and fails closed, without touching the function's own resilience
+    /// behavior.
+    ///
+    /// It also doesn't always advance current_parts_version in one call: a part can be active in
+    /// Keeper but not yet visible on this replica's own in-memory disk listing (plain_rewritable
+    /// object storage's own eventual-consistency window, not a bug -- see the "not yet adoptable
+    /// from the shared disk; will retry" log line updatePartSetFromKeeper() emits for exactly
+    /// this). Its own internal disk->refresh(not_sooner_than_milliseconds) is throttled to at most
+    /// once per that many milliseconds (DiskObjectStorage::refresh()) -- calling
+    /// updatePartSetFromKeeper() again immediately just hits the same throttle and re-checks the
+    /// same stale listing, so retries here must be spaced at least that far apart to have any
+    /// chance of seeing a genuinely fresh one. This is not "sleep to paper over a race": it's
+    /// honoring an existing, explicit rate limit in a function this method calls, the same way a
+    /// caller of any other rate-limited API would.
+    ///
+    /// const_cast: this method physically refreshes data_parts_indexes/current_parts_version as a
+    /// side effect, but is logically const from every caller's point of view -- "give me a
+    /// consistent view" -- matching totalRows()/totalBytes()'s inherited const IStorage
+    /// signatures, which can't be changed.
+    static constexpr size_t max_attempts = 3;
+    static constexpr UInt64 retry_delay_ms = 1100; // just over disk->refresh()'s own 1000ms throttle window
+    for (size_t attempt = 0; attempt < max_attempts && current_parts_version.load() < target_version; ++attempt)
+    {
+        if (attempt > 0)
+            sleepForMilliseconds(retry_delay_ms);
+        const_cast<StorageCloudMergeTree *>(this)->updatePartSetFromKeeper();
+    }
+
+    if (current_parts_version.load() < target_version)
+        throw Exception(ErrorCodes::STALE_VERSION,
+            "Cannot achieve sequential consistency for table {}: local part set is still behind "
+            "Keeper after {} refresh attempts. Retry the query, or disable "
+            "'select_sequential_consistency'.",
+            getStorageID().getNameForLogs(), max_attempts);
+}
+
 void StorageCloudMergeTree::read(
     QueryPlan & query_plan,
     const Names & column_names,
@@ -412,6 +482,8 @@ void StorageCloudMergeTree::read(
     size_t max_block_size,
     size_t num_streams)
 {
+    ensureSequentialConsistency(local_context->getSettingsRef());
+
     /// Phase 0: the local read path only. Sparse primary index, skip indexes, projections and
     /// FINAL all come for free from the shared MergeTree read machinery.
     QueryPlanPtr plan = MergeTreeDataSelectExecutor(*this).read(
@@ -604,8 +676,22 @@ std::string StorageCloudMergeTree::getPostfixForTempInsertName() const
     return toString(UUIDHelpers::generateV4());
 }
 
-std::optional<UInt64> StorageCloudMergeTree::totalBytesUncompressed(const Settings &) const
+std::optional<UInt64> StorageCloudMergeTree::totalRows(ContextPtr local_context) const
 {
+    ensureSequentialConsistency(local_context->getSettingsRef());
+    return getTotalActiveSizeInRows();
+}
+
+std::optional<UInt64> StorageCloudMergeTree::totalBytes(ContextPtr local_context) const
+{
+    ensureSequentialConsistency(local_context->getSettingsRef());
+    return getTotalActiveSizeInBytes();
+}
+
+std::optional<UInt64> StorageCloudMergeTree::totalBytesUncompressed(const Settings & settings) const
+{
+    ensureSequentialConsistency(settings);
+
     UInt64 res = 0;
     for (const auto & part : getDataPartsForInternalUsage())
         res += part->getBytesUncompressedOnDisk();

@@ -2792,3 +2792,57 @@ def test_lease_loss_during_optimize_does_not_hang(cluster):
         node1.query(f"SYSTEM DISABLE FAILPOINT {gate}")
         node2.query(f"SYSTEM DISABLE FAILPOINT {gate}")
         node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
+
+
+def test_select_sequential_consistency_sees_fresh_insert_despite_stalled_watcher(cluster):
+    node1 = cluster.instances["node1"]
+    node2 = cluster.instances["node2"]
+    table = "cloud_test_sequential_consistency"
+    gate = "cloud_merge_tree_part_set_watcher_pause"
+
+    node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
+    node1.query(
+        f"CREATE TABLE {table} (id UInt64, data String) ENGINE = CloudMergeTree "
+        f"ORDER BY id SETTINGS storage_policy = 's3'"
+    )
+    table_uuid = node1.query(f"SELECT uuid FROM system.tables WHERE table = '{table}'").strip()
+    node2.query(
+        f"ATTACH TABLE {table} UUID '{table_uuid}' (id UInt64, data String) "
+        f"ENGINE = CloudMergeTree ORDER BY id SETTINGS storage_policy = 's3'"
+    )
+    try:
+        # node2's own background watcher (part_set_updating_task) is what normally picks up
+        # node1's INSERT asynchronously -- gating it (before it can ever call
+        # updatePartSetFromKeeper()) proves read()'s own synchronous catch-up path under
+        # select_sequential_consistency works independently of it, not just "usually fast enough"
+        # under natural timing (which this session's earlier findings showed is not reliable
+        # proof on its own).
+        node2.query(f"SYSTEM ENABLE FAILPOINT {gate}")
+        try:
+            node1.query(f"INSERT INTO {table} VALUES (1, 'a')")
+
+            # Confirms node2's watcher genuinely got triggered by the insert (via its Keeper
+            # watch) and is now stuck at the gate -- i.e. it would *not* have caught up on its
+            # own within this test, so the assertions below aren't just a timing fluke.
+            _wait_failpoint_paused(node2, gate)
+
+            # Without the setting, node2 genuinely does not see the row yet: the local cache is
+            # stale and the background watcher that would normally refresh it is blocked.
+            assert node2.query(f"SELECT count() FROM {table}").strip() == "0"
+
+            # With the setting, read() does its own direct, synchronous catch-up -- a separate
+            # call to updatePartSetFromKeeper() than the one the gate above is blocking -- and
+            # sees the row despite the background watcher still being completely stuck.
+            assert (
+                node2.query(f"SELECT count() FROM {table} SETTINGS select_sequential_consistency = 1").strip()
+                == "1"
+            )
+        finally:
+            node2.query(f"SYSTEM DISABLE FAILPOINT {gate}")
+
+        # Sanity: with the gate released, the background watcher also converges normally.
+        assert_eq_with_retry(node2, f"SELECT count() FROM {table}", "1")
+    finally:
+        node2.query(f"SYSTEM DISABLE FAILPOINT {gate}")
+        node2.query(f"DROP TABLE IF EXISTS {table} SYNC")
+        node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
