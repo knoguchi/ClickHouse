@@ -959,6 +959,71 @@ def test_concurrent_mutation_and_optimize_no_corruption(cluster):
         node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
 
 
+def test_merge_rejects_combining_differently_mutated_parts(cluster):
+    node1 = cluster.instances["node1"]
+    table = "cloud_test_merge_mutation_version"
+
+    node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
+    node1.query(
+        f"CREATE TABLE {table} (id UInt64, data String) ENGINE = CloudMergeTree "
+        f"ORDER BY id SETTINGS storage_policy = 's3'"
+    )
+    try:
+        # SYSTEM STOP MERGES during setup only -- without it, background merging consolidates most
+        # of these rows' parts together *during* the insert loop itself (100 sequential INSERTs
+        # take long enough for that), so few enough parts are left by the time the mutation below
+        # is even submitted that it completes faster than any external polling could observe.
+        node1.query(f"SYSTEM STOP MERGES {table}")
+
+        row_count = 100
+        for i in range(1, row_count + 1):
+            node1.query(f"INSERT INTO {table} VALUES ({i}, 'v{i}')")
+
+        node1.query(f"ALTER TABLE {table} UPDATE data = 'mutated' WHERE 1")
+
+        # Merges and mutations both run via the same background scheduler and share one blocker
+        # (SYSTEM STOP MERGES blocks mutation selection too, matching upstream), so both start
+        # racing over these 100 fresh, still all-unmutated parts the moment this fires -- exactly
+        # the interleaving canMergeParts must stay safe under.
+        node1.query(f"SYSTEM START MERGES {table}")
+
+        # Catch the transient window where the background mutation scheduler has applied the
+        # mutation to some, but not all, of the several parts above -- canMergeParts must reject a
+        # merge combining an already-mutated part with a not-yet-mutated one: the merge result
+        # stamps mutation = max(sources), which would make partNeedsMutation() falsely report the
+        # merged part as already covering data that was never actually transformed.
+        deadline = time.time() + 30
+        mutated_rows = 0
+        while time.time() < deadline:
+            mutated_rows = int(
+                node1.query(f"SELECT count() FROM {table} WHERE data = 'mutated'").strip()
+            )
+            if 0 < mutated_rows < row_count:
+                break
+            time.sleep(0.05)
+        assert 0 < mutated_rows < row_count, (
+            "never observed a partially-mutated state to test the merge guard against "
+            f"(mutated_rows={mutated_rows})"
+        )
+
+        node1.query(f"OPTIMIZE TABLE {table}")
+
+        # Whatever OPTIMIZE did (merged some parts or not), every row must eventually show the
+        # mutated value once the mutation itself finishes -- not silently skipped for some rows
+        # because a merge stamped a part as "mutation done" without ever actually running the
+        # mutation's commands on part of its data.
+        assert_eq_with_retry(
+            node1,
+            f"SELECT count() FROM {table} WHERE data = 'mutated'",
+            str(row_count),
+            retry_count=60,
+            sleep_time=1,
+        )
+        assert node1.query(f"SELECT count() FROM {table}").strip() == str(row_count)
+    finally:
+        node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
+
+
 def test_add_column_default_applies_to_old_and_new_parts_cross_replica(cluster):
     node1 = cluster.instances["node1"]
     node2 = cluster.instances["node2"]

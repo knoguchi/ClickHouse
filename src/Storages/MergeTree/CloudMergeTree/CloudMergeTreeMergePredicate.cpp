@@ -27,6 +27,18 @@ std::expected<void, PreformattedMessage> CloudMergeTreeMergePredicate::canMergeP
             left.projection_names, left.name, right.projection_names, right.name));
     }
 
+    if (left.info.mutation != right.info.mutation)
+    {
+        /// A merge result is stamped mutation = max(left.info.mutation, right.info.mutation) (see
+        /// FutureMergedMutatedPart), which would make partNeedsMutation() treat it as already
+        /// covering every mutation up to the higher of the two -- true for whichever source
+        /// already had it applied, false for the other, whose data would then silently keep its
+        /// pre-mutation content forever while system.mutations reports the mutation done. Matches
+        /// upstream's own equal-current-mutation-version requirement in canMergeParts.
+        return std::unexpected(PreformattedMessage::create(
+            "Parts {} and {} have different mutation version", left.name, right.name));
+    }
+
     {
         uint32_t max_possible_level = storage.getMaxLevelInBetween(left, right);
 
