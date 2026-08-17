@@ -129,8 +129,7 @@ projections, FINAL), `MergeTreePartInfo`, checksums, `MergeTreeSettings`,
   into cold-storage tables sharing the same schema). Done: `REPLACE`/`ATTACH
   PARTITION ... FROM` and `MOVE PARTITION ... TO TABLE` are both implemented.
 
-Deferred (the SMT periphery, not correctness): per-AZ leader fan-out,
-snapshot cleaner tuning, backup/restore conversion.
+Deferred (the SMT periphery, not correctness): per-AZ leader fan-out.
 
 Sequential-consistency read fencing is done: `select_sequential_consistency`
 (the same global setting `StorageReplicatedMergeTree` uses) makes
@@ -138,3 +137,12 @@ Sequential-consistency read fencing is done: `select_sequential_consistency`
 synchronously catch this replica's local part-set cache up to Keeper's
 current version first, instead of relying on the async background watcher
 alone.
+
+Snapshot cleaner tuning is done.
+
+`BACKUP`/`RESTORE` is done for part data: `backupData()` wraps each active
+part (optionally partition-filtered) via the inherited `backupParts()`;
+`attachRestoredParts()` commits restored parts through the same
+`commitInsertedPart()` Keeper-commit hook `INSERT` uses, giving each a
+fresh identity in the destination table. Pending (not-yet-applied)
+mutations are not backed up -- a smaller, separate follow-up.

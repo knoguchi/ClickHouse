@@ -38,14 +38,14 @@ def cluster():
 
         cluster.add_instance(
             "node1",
-            main_configs=["configs/config.d/storage_conf.xml"],
+            main_configs=["configs/config.d/storage_conf.xml", "configs/config.d/backups_disk.xml"],
             with_minio=True,
             with_zookeeper=True,
             stay_alive=True,
         )
         cluster.add_instance(
             "node2",
-            main_configs=["configs/config.d/storage_conf.xml"],
+            main_configs=["configs/config.d/storage_conf.xml", "configs/config.d/backups_disk.xml"],
             with_zookeeper=True,
             stay_alive=True,
         )
@@ -71,6 +71,115 @@ def list_objects(cluster, path="data/"):
     objects = list(minio.list_objects(cluster.minio_bucket, path, recursive=True))
     logging.info(f"list_objects ({len(objects)}): {[x.object_name for x in objects]}")
     return objects
+
+
+_backup_id_counter = 0
+
+
+def _new_backup_name():
+    global _backup_id_counter
+    _backup_id_counter += 1
+    return f"Disk('backups', 'cloud_merge_tree_{_backup_id_counter}/')"
+
+
+def test_backup_restore_roundtrip(cluster):
+    node1 = cluster.instances["node1"]
+    table = "cloud_test_backup_basic"
+    restored = "cloud_test_backup_basic_restored"
+
+    node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
+    node1.query(f"DROP TABLE IF EXISTS {restored} SYNC")
+    node1.query(
+        f"CREATE TABLE {table} (id UInt64, data String) ENGINE = CloudMergeTree "
+        f"ORDER BY id SETTINGS storage_policy = 's3'"
+    )
+    try:
+        # Several separate INSERTs -- several parts -- so this also proves
+        # attachRestoredParts() handles a multi-part MutableDataPartsVector batch, not just the
+        # trivial single-part case.
+        row_count = 5
+        for i in range(1, row_count + 1):
+            node1.query(f"INSERT INTO {table} VALUES ({i}, 'v{i}')")
+        expected_sum = str(row_count * (row_count + 1) // 2)
+
+        backup_name = _new_backup_name()
+        node1.query(f"BACKUP TABLE {table} TO {backup_name}")
+        node1.query(f"RESTORE TABLE {table} AS {restored} FROM {backup_name}")
+
+        assert node1.query(f"SELECT count() FROM {restored}").strip() == str(row_count)
+        assert node1.query(f"SELECT sum(id) FROM {restored}").strip() == expected_sum
+
+        # The original table is untouched by taking a backup of it.
+        assert node1.query(f"SELECT count() FROM {table}").strip() == str(row_count)
+    finally:
+        node1.query(f"DROP TABLE IF EXISTS {restored} SYNC")
+        node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
+
+
+def test_backup_restore_partition_only_restores_that_partition(cluster):
+    node1 = cluster.instances["node1"]
+    table = "cloud_test_backup_partition"
+    restored = "cloud_test_backup_partition_restored"
+
+    node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
+    node1.query(f"DROP TABLE IF EXISTS {restored} SYNC")
+    node1.query(
+        f"CREATE TABLE {table} (id UInt64, data String) ENGINE = CloudMergeTree "
+        f"PARTITION BY id % 2 ORDER BY id SETTINGS storage_policy = 's3'"
+    )
+    try:
+        for i in range(1, 5):
+            node1.query(f"INSERT INTO {table} VALUES ({i}, 'v{i}')")
+        # Partition '0' holds the even ids (2, 4).
+
+        backup_name = _new_backup_name()
+        node1.query(f"BACKUP TABLE {table} PARTITION 0 TO {backup_name}")
+        node1.query(f"RESTORE TABLE {table} AS {restored} FROM {backup_name}")
+
+        assert node1.query(f"SELECT count() FROM {restored}").strip() == "2"
+        assert (
+            node1.query(f"SELECT arraySort(groupArray(id)) FROM {restored}").strip()
+            == "[2,4]"
+        )
+    finally:
+        node1.query(f"DROP TABLE IF EXISTS {restored} SYNC")
+        node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
+
+
+def test_restored_table_visible_on_second_replica(cluster):
+    node1 = cluster.instances["node1"]
+    node2 = cluster.instances["node2"]
+    table = "cloud_test_backup_cross_replica"
+    restored = "cloud_test_backup_cross_replica_restored"
+
+    node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
+    node1.query(f"DROP TABLE IF EXISTS {restored} SYNC")
+    node2.query(f"DROP TABLE IF EXISTS {restored} SYNC")
+    node1.query(
+        f"CREATE TABLE {table} (id UInt64, data String) ENGINE = CloudMergeTree "
+        f"ORDER BY id SETTINGS storage_policy = 's3'"
+    )
+    try:
+        node1.query(f"INSERT INTO {table} VALUES (1, 'a'), (2, 'b')")
+
+        backup_name = _new_backup_name()
+        node1.query(f"BACKUP TABLE {table} TO {backup_name}")
+        node1.query(f"RESTORE TABLE {table} AS {restored} FROM {backup_name}")
+
+        # attachRestoredParts() commits through the same Keeper path a normal INSERT does -- node2
+        # must be able to see the restored rows purely via its own watcher, same as after any
+        # other write, with no special-casing needed for "this part arrived via RESTORE."
+        restored_uuid = node1.query(f"SELECT uuid FROM system.tables WHERE table = '{restored}'").strip()
+        node2.query(
+            f"ATTACH TABLE {restored} UUID '{restored_uuid}' (id UInt64, data String) "
+            f"ENGINE = CloudMergeTree ORDER BY id SETTINGS storage_policy = 's3'"
+        )
+        assert_eq_with_retry(node2, f"SELECT count() FROM {restored}", "2")
+        assert_eq_with_retry(node2, f"SELECT sum(id) FROM {restored}", "3")
+    finally:
+        node2.query(f"DROP TABLE IF EXISTS {restored} SYNC")
+        node1.query(f"DROP TABLE IF EXISTS {restored} SYNC")
+        node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
 
 
 def test_second_replica_sees_inserts_without_peer_fetch(cluster):

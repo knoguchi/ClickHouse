@@ -346,6 +346,7 @@ private:
     void replacePartitionFrom(const StoragePtr & source_table, const ASTPtr & partition, bool replace, ContextPtr context) override;
     void movePartitionToTable(const StoragePtr & dest_table, const ASTPtr & partition, ContextPtr context) override;
     bool partIsAssignedToBackgroundOperation(const DataPartPtr & part) const override;
+    void backupData(BackupEntriesCollector & backup_entries_collector, const String & data_path_in_backup, const std::optional<ASTs> & partitions) override;
     void attachRestoredParts(MutableDataPartsVector && parts, const std::optional<ZooKeeperRetriesInfo> & zookeeper_retries_info) override;
     void startBackgroundMovesIfNeeded() override;
     std::unique_ptr<MergeTreeSettings> getDefaultSettings() const override;

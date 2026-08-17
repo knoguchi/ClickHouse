@@ -8,6 +8,7 @@
 #include <Storages/MergeTree/ReplicatedMergeTreeTableMetadata.h>
 #include <Storages/AlterCommands.h>
 #include <Storages/ColumnsDescription.h>
+#include <Backups/BackupEntriesCollector.h>
 #include <Parsers/ASTLiteral.h>
 #include <Interpreters/DatabaseCatalog.h>
 
@@ -238,6 +239,16 @@ StorageCloudMergeTree::StorageCloudMergeTree(
         int32_t loaded_version = 0;
         Strings active_names = coordination.loadActivePartNames(zk, loaded_version);
         std::unordered_set<std::string> expected_parts(active_names.begin(), active_names.end());
+
+        /// This replica's own DiskObjectStorage in-memory listing cache can predate a part another
+        /// replica committed to Keeper moments ago (e.g. a RESTORE landing on one replica just
+        /// before this replica's own CREATE/ATTACH runs) -- the same plain_rewritable
+        /// eventual-consistency window updatePartSetFromKeeper()'s own disk->refresh(1000) call
+        /// handles reactively, after a miss, for its watcher path. This is a one-time startup
+        /// load, not a hot path, so refresh unconditionally up front instead: cheaper than loading
+        /// twice, and avoids throwing NO_SUCH_DATA_PART below for a part that is really there.
+        if (!expected_parts.empty())
+            getStoragePolicy()->getDisks().front()->refresh(1000);
 
         loadDataParts(LoadingStrictnessLevel::FORCE_RESTORE <= mode, expected_parts);
 
@@ -1541,9 +1552,63 @@ bool StorageCloudMergeTree::partIsAssignedToBackgroundOperation(const DataPartPt
     return false;
 }
 
-void StorageCloudMergeTree::attachRestoredParts(MutableDataPartsVector &&, const std::optional<ZooKeeperRetriesInfo> &)
+void StorageCloudMergeTree::backupData(
+    BackupEntriesCollector & backup_entries_collector, const String & data_path_in_backup, const std::optional<ASTs> & partitions)
 {
-    throw Exception(ErrorCodes::NOT_IMPLEMENTED, "RESTORE is not implemented for CloudMergeTree yet");
+    auto local_context = backup_entries_collector.getContext();
+    const auto & backup_settings = backup_entries_collector.getBackupSettings();
+
+    /// getDataPartsVectorForInternalUsage()/getDataPartsVectorInPartitionForInternalUsage(), not
+    /// getVisibleDataPartsVector()/getVisibleDataPartsVectorInPartitions(): the latter are
+    /// MVCC-transaction-visibility aware, and CloudMergeTree has no transactions anywhere -- every
+    /// part is stamped Tx::NonTransactionalTID (see the same note elsewhere in this file).
+    DataPartsVector data_parts;
+    if (partitions)
+    {
+        /// getPartitionIDsFromQuery() evaluates the PARTITION expression(s) against this table's
+        /// partition-by key -- deliberately computed before taking lockParts() below, not while
+        /// holding it: data_parts_mutex is non-recursive (see updatePartSetFromKeeper()'s own
+        /// note on this), so calling into anything that might itself need the lock while already
+        /// holding it would deadlock this thread against itself.
+        auto partition_ids = getPartitionIDsFromQuery(*partitions, local_context);
+        auto lock = lockParts();
+        for (const auto & partition_id : partition_ids)
+        {
+            auto in_partition = getDataPartsVectorInPartitionForInternalUsage(DataPartState::Active, partition_id, lock);
+            data_parts.insert(data_parts.end(), in_partition.begin(), in_partition.end());
+        }
+    }
+    else
+        data_parts = getDataPartsVectorForInternalUsage({DataPartState::Active}, {DataPartKind::Regular});
+
+    /// backupParts() (inherited from MergeTreeData, unchanged) wraps each part file as a
+    /// BackupEntryFromImmutableFile rather than copying eagerly, and can use S3 CopyObject instead
+    /// of re-uploading when the destination is also S3 (BackupSettings::allow_s3_native_copy) --
+    /// nothing CloudMergeTree-specific needed for that, it's inherited for free.
+    auto parts_backup_entries = backupParts(data_parts, data_path_in_backup, backup_settings, local_context);
+    for (auto & part_backup_entries : parts_backup_entries)
+        backup_entries_collector.addBackupEntries(std::move(part_backup_entries.backup_entries));
+
+    /// Pending (not-yet-applied) mutations are not backed up -- CloudMergeTree's mutations live
+    /// entirely in Keeper (mutations/<id>), not in a local in-memory map like StorageMergeTree's
+    /// own backupMutations() reads from. Already-applied mutations are baked into the part data
+    /// above regardless; a real but separate, smaller gap for a future pass.
+}
+
+void StorageCloudMergeTree::attachRestoredParts(MutableDataPartsVector && parts, const std::optional<ZooKeeperRetriesInfo> &)
+{
+    /// commitInsertedPart() is the same Keeper-commit hook CloudMergeTreeSink::consume() already
+    /// uses for INSERT: allocates a fresh block number/name for the part (restored parts get a
+    /// new identity in the destination table, not their original backed-up one -- matches
+    /// StorageMergeTree::attachRestoredParts()'s own fillNewPartName() call for the same reason),
+    /// renames it into place, and commits it to the canonical Keeper part set. An empty
+    /// deduplication_hashes list means getDeduplicationPaths() yields no paths to pre-check
+    /// against, so this never spuriously dedup-rejects a restored part. getContext() (this
+    /// table's own persistent context, not a per-query one) is used only for
+    /// commitInsertedPart()'s internal getCurrentTransaction() call, which returns null here --
+    /// consistent with CloudMergeTree having no transactions anywhere.
+    for (auto & part : parts)
+        commitInsertedPart(part, /*deduplication_hashes=*/{}, getContext());
 }
 
 size_t StorageCloudMergeTree::removeActivePartsMatching(const std::function<bool(const String &)> & predicate)
