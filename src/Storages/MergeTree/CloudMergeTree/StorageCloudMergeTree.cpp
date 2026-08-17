@@ -5,6 +5,7 @@
 #include <Storages/MergeTree/CloudMergeTree/CloudMergePlainMergeTreeTask.h>
 #include <Storages/MergeTree/CloudMergeTree/CloudMergeMutateTask.h>
 #include <Storages/MergeTree/ReplicatedMergeTreeMutationEntry.h>
+#include <Storages/MergeTree/ReplicatedMergeTreeTableMetadata.h>
 #include <Storages/AlterCommands.h>
 #include <Storages/ColumnsDescription.h>
 #include <Parsers/ASTLiteral.h>
@@ -34,6 +35,9 @@
 #include <Core/UUID.h>
 #include <Core/ServerUUID.h>
 #include <IO/ReadHelpers.h>
+#include <IO/ReadBufferFromString.h>
+#include <IO/WriteBufferFromString.h>
+#include <IO/VarInt.h>
 #include <base/defines.h>
 #include <algorithm>
 #include <chrono>
@@ -93,6 +97,57 @@ struct StorageCloudMergeTree::MutationsSnapshot final : public MergeTreeData::Mu
     std::shared_ptr<IMutationsSnapshot> cloneEmpty() const override { return std::make_shared<MutationsSnapshot>(); }
 };
 
+namespace
+{
+    /// Keeper's metadata znode combines ReplicatedMergeTreeTableMetadata's serialized non-column
+    /// schema fields (sorting key, TTL, indices, projections, constraints, ...) with the columns
+    /// text that follows it. Storing both together, versioned by the one znode's CAS version,
+    /// keeps the atomicity CloudMergeTree already relies on elsewhere: a reader can never observe
+    /// a metadata_version whose columns and non-column schema fields came from two different
+    /// ALTERs. The table-metadata portion is length-prefixed rather than relying on
+    /// ReplicatedMergeTreeTableMetadata::read() to stop exactly at its own last field: its own doc
+    /// comment only promises no two of *its* fields share a prefix, not that none of them collide
+    /// with ColumnsDescription's own header -- "columns to sum: " (one of its optional trailing
+    /// fields) shares an 8-byte prefix with ColumnsDescription::toString()'s "columns format
+    /// version: 1" header, and checkString() consumes on a partial match before failing, so a
+    /// shared-cursor parse silently corrupts the columns text that follows. An explicit length
+    /// prefix sidesteps the collision entirely by never asking either format to detect its own end.
+    String serializeTableMetadata(const ReplicatedMergeTreeTableMetadata & table_metadata, const String & columns_text)
+    {
+        String table_metadata_text = table_metadata.toString();
+        WriteBufferFromOwnString out;
+        writeVarUInt(table_metadata_text.size(), out);
+        out.write(table_metadata_text.data(), table_metadata_text.size());
+        out.write(columns_text.data(), columns_text.size());
+        return out.str();
+    }
+
+    struct ParsedTableMetadata
+    {
+        ReplicatedMergeTreeTableMetadata table_metadata;
+        ColumnsDescription columns;
+    };
+
+    ParsedTableMetadata parseTableMetadata(const String & serialized)
+    {
+        ReadBufferFromString buf(serialized);
+
+        UInt64 table_metadata_size = 0;
+        readVarUInt(table_metadata_size, buf);
+        String table_metadata_text(table_metadata_size, '\0');
+        buf.readStrict(table_metadata_text.data(), table_metadata_size);
+
+        ParsedTableMetadata result;
+        ReadBufferFromString table_metadata_buf(table_metadata_text);
+        result.table_metadata.read(table_metadata_buf);
+
+        String columns_text;
+        readStringUntilEOF(columns_text, buf);
+        result.columns = ColumnsDescription::parse(columns_text);
+        return result;
+    }
+}
+
 StorageCloudMergeTree::StorageCloudMergeTree(
     const String & zookeeper_root_,
     const StorageID & table_id_,
@@ -148,15 +203,17 @@ StorageCloudMergeTree::StorageCloudMergeTree(
         /// current version regardless of who won the initial race, and this replica's in-memory
         /// metadata_version is corrected to match so parts it writes stamp metadata_version.txt
         /// correctly. Only later ALTERs are picked up incrementally via the watcher below.
-        coordination.ensureInitialMetadata(zk, metadata_.getColumns().toString(/*include_comments=*/ true));
+        ReplicatedMergeTreeTableMetadata initial_table_metadata(*this, std::make_shared<StorageInMemoryMetadata>(metadata_));
+        coordination.ensureInitialMetadata(zk,
+            serializeTableMetadata(initial_table_metadata, metadata_.getColumns().toString(/*include_comments=*/ true)));
 
-        auto [canonical_columns_text, canonical_metadata_version] = coordination.getMetadata(zk);
-        auto canonical_columns = ColumnsDescription::parse(canonical_columns_text);
-        if (!(canonical_columns == metadata_.getColumns()))
+        auto [canonical_metadata_text, canonical_metadata_version] = coordination.getMetadata(zk);
+        auto canonical = parseTableMetadata(canonical_metadata_text);
+        if (!(canonical.columns == metadata_.getColumns()))
             throw Exception(ErrorCodes::INCOMPATIBLE_COLUMNS,
                 "Table columns structure in Keeper is different from local table structure for table {}. "
                 "Local columns:\n{}\nKeeper columns:\n{}",
-                table_id_.getNameForLogs(), metadata_.getColumns().toString(/*include_comments=*/ true), canonical_columns_text);
+                table_id_.getNameForLogs(), metadata_.getColumns().toString(/*include_comments=*/ true), canonical.columns.toString(/*include_comments=*/ true));
 
         current_metadata_version.store(canonical_metadata_version);
         if (canonical_metadata_version != metadata_.getMetadataVersion())
@@ -937,7 +994,7 @@ void StorageCloudMergeTree::checkMutationIsPossible(const MutationCommands &, co
     /// every CloudMergeTree table outright.
 }
 
-void StorageCloudMergeTree::alter(const AlterCommands & params, ContextPtr local_context, AlterLockHolder &)
+void StorageCloudMergeTree::alter(const AlterCommands & params, ContextPtr local_context, AlterLockHolder & alter_lock_holder)
 {
     auto component_guard = Coordination::setCurrentComponent("StorageCloudMergeTree::alter");
 
@@ -954,9 +1011,12 @@ void StorageCloudMergeTree::alter(const AlterCommands & params, ContextPtr local
     /// already landed there), the CAS succeeds immediately since Keeper only checks the version
     /// number, not that our payload actually derives from that version's content -- overwriting
     /// the other replica's change instead of stacking on top of it, with no ZBADVERSION to catch
-    /// it. Reproduced reliably under two concurrent ALTERs from different replicas.
+    /// it. Reproduced reliably under two concurrent ALTERs from different replicas. This applies to
+    /// every field ReplicatedMergeTreeTableMetadata tracks (sorting key, TTL, indices,
+    /// projections, constraints), not just columns -- a concurrent ALTER might have changed any of
+    /// them.
     auto initial = coordination.getMetadata(zk);
-    String columns_text = initial.first;
+    String metadata_text = initial.first;
     int32_t expected_version = initial.second;
 
     /// Bounded retry against a concurrent ALTER from another replica: trySetMetadata()'s (and
@@ -965,8 +1025,17 @@ void StorageCloudMergeTree::alter(const AlterCommands & params, ContextPtr local
     /// commitMergedPart() already rely on elsewhere in this file.
     for (int attempt = 0; attempt < 20; ++attempt)
     {
-        StorageInMemoryMetadata new_metadata = *metadata_snapshot;
-        new_metadata.columns = ColumnsDescription::parse(columns_text);
+        auto parsed = parseTableMetadata(metadata_text);
+
+        /// Rebuild this attempt's baseline entirely from Keeper's canonical state -- both columns
+        /// and the non-column schema fields ReplicatedMergeTreeTableMetadata tracks -- via the same
+        /// Diff/getNewMetadata() machinery updatePartSetFromKeeper() uses to apply a remote ALTER.
+        /// metadata_snapshot supplies fields Keeper doesn't track at all (comment, MergeTreeSettings),
+        /// which never need resyncing here since only this replica's own alter() call can change them.
+        auto local_table_metadata = ReplicatedMergeTreeTableMetadata(*this, metadata_snapshot);
+        auto baseline_diff = local_table_metadata.checkAndFindDiff(
+            parsed.table_metadata, parsed.columns, metadata_snapshot->virtuals, table_id.getNameForLogs(), local_context);
+        StorageInMemoryMetadata new_metadata = baseline_diff.getNewMetadata(parsed.columns, metadata_snapshot->virtuals, local_context, *metadata_snapshot);
 
         /// getMutationCommands() must be recomputed against THIS attempt's own baseline every time
         /// (not just once, up front) -- the same content/version-consistency reasoning as above: a
@@ -976,11 +1045,13 @@ void StorageCloudMergeTree::alter(const AlterCommands & params, ContextPtr local
         auto mutation_commands = params.getMutationCommands(new_metadata, /*materialize_ttl=*/ false, local_context, /*with_alters=*/ false);
         params.apply(new_metadata, local_context);
         String new_columns_text = new_metadata.getColumns().toString(/*include_comments=*/ true);
+        ReplicatedMergeTreeTableMetadata new_table_metadata(*this, std::make_shared<StorageInMemoryMetadata>(new_metadata));
+        String new_metadata_text = serializeTableMetadata(new_table_metadata, new_columns_text);
 
         if (mutation_commands.empty())
         {
             int32_t new_version = 0;
-            auto code = coordination.trySetMetadata(zk, new_columns_text, expected_version, new_version);
+            auto code = coordination.trySetMetadata(zk, new_metadata_text, expected_version, new_version);
 
             if (code == Coordination::Error::ZOK)
             {
@@ -990,7 +1061,9 @@ void StorageCloudMergeTree::alter(const AlterCommands & params, ContextPtr local
                 /// called, same as every other MergeTree engine).
                 DatabaseCatalog::instance().getDatabase(table_id.database_name)
                     ->alterTable(local_context, table_id, new_metadata, /*validate_new_create_query=*/ true);
-                setInMemoryMetadata(new_metadata);
+                setProperties(new_metadata, *metadata_snapshot, /*attach=*/ false, local_context);
+                if (new_metadata.settings_changes)
+                    changeSettings(new_metadata.settings_changes, alter_lock_holder);
                 current_metadata_version.store(new_version);
                 return;
             }
@@ -1009,14 +1082,16 @@ void StorageCloudMergeTree::alter(const AlterCommands & params, ContextPtr local
             /// naming a metadata state that was never actually published.
             int32_t new_version_if_success = expected_version + 1;
             auto entry = buildMutationEntry(mutation_commands, local_context, new_version_if_success);
-            auto result = coordination.trySetMetadataAndCreateMutation(zk, new_columns_text, expected_version, entry.toString());
+            auto result = coordination.trySetMetadataAndCreateMutation(zk, new_metadata_text, expected_version, entry.toString());
 
             if (result.has_value())
             {
                 new_metadata.setMetadataVersion(result->new_metadata_version);
                 DatabaseCatalog::instance().getDatabase(table_id.database_name)
                     ->alterTable(local_context, table_id, new_metadata, /*validate_new_create_query=*/ true);
-                setInMemoryMetadata(new_metadata);
+                setProperties(new_metadata, *metadata_snapshot, /*attach=*/ false, local_context);
+                if (new_metadata.settings_changes)
+                    changeSettings(new_metadata.settings_changes, alter_lock_holder);
                 current_metadata_version.store(result->new_metadata_version);
                 return;
             }
@@ -1026,12 +1101,12 @@ void StorageCloudMergeTree::alter(const AlterCommands & params, ContextPtr local
                     "Cannot update metadata and create mutation in Keeper for table {}", table_id.getNameForLogs());
         }
 
-        /// Someone else's ALTER landed first: reload the actual current columns and version, and
+        /// Someone else's ALTER landed first: reload the actual current metadata and version, and
         /// retry from the top of the loop, which rebuilds new_metadata/mutation_commands against
         /// THAT fresh baseline -- not our now-stale snapshot, otherwise we'd silently clobber their
         /// change instead of stacking on it.
         auto latest = coordination.getMetadata(zk);
-        columns_text = latest.first;
+        metadata_text = latest.first;
         expected_version = latest.second;
     }
 
@@ -1913,18 +1988,66 @@ try
     /// a second background task -- see current_metadata_version's doc comment in the header.
     /// Checked unconditionally, before the parts-version early-return below, so an ALTER issued on
     /// another replica (no part-set change of its own) still gets picked up this cycle instead of
-    /// being skipped. setInMemoryMetadata() is a lock-free MultiVersion swap, safe to call from
-    /// this background thread concurrently with query threads reading getInMemoryMetadataPtr().
+    /// being skipped. setProperties()/setInMemoryMetadata() are safe to call from this background
+    /// thread concurrently with query threads reading getInMemoryMetadataPtr() -- same lock-free
+    /// MultiVersion swap upstream's own replication-queue-processing background thread relies on
+    /// for the identical purpose (see StorageReplicatedMergeTree::setTableStructure(), which this
+    /// block mirrors).
     {
-        auto [columns_text, new_metadata_version] = coordination.getMetadata(zk, part_set_updating_task->getWatchCallback());
+        auto [metadata_text, new_metadata_version] = coordination.getMetadata(zk, part_set_updating_task->getWatchCallback());
         if (new_metadata_version != current_metadata_version.load())
         {
-            auto metadata_snapshot = getInMemoryMetadataPtr(getContext(), false);
-            StorageInMemoryMetadata new_metadata = *metadata_snapshot;
-            new_metadata.columns = ColumnsDescription::parse(columns_text);
-            new_metadata.setMetadataVersion(new_metadata_version);
-            setInMemoryMetadata(new_metadata);
-            current_metadata_version.store(new_metadata_version);
+            /// A replica's own write also triggers its own watch (self-notification), so this
+            /// cycle can race a LOCAL alter() call that just committed this exact change and is
+            /// still applying it -- without waiting here, this thread's own DatabaseCatalog::
+            /// alterTable() call below can race alter()'s already-in-flight one for the same
+            /// table's .sql file rename (reproduced as ATOMIC_RENAME_FAIL: the .sql.tmp file
+            /// alter() already renamed away no longer exists by the time this call goes looking
+            /// for it). alter() holds this same lock for its whole duration and stores the new
+            /// version into current_metadata_version before releasing it, so re-checking the
+            /// version below, once acquired, correctly turns this into a no-op when that's what
+            /// just happened.
+            auto alter_lock = lockForAlter((*getSettings())[MergeTreeSetting::lock_acquire_timeout_for_background_operations]);
+            if (new_metadata_version != current_metadata_version.load())
+            {
+                auto metadata_snapshot = getInMemoryMetadataPtr(getContext(), false);
+                auto parsed = parseTableMetadata(metadata_text);
+
+                /// Full diff-and-apply, not just columns: a non-column ALTER (MODIFY ORDER BY, ADD
+                /// INDEX, MODIFY TTL, ...) must reach every replica's actual in-memory sorting
+                /// key/TTL/indices/projections/constraints, not just its columns -- otherwise two
+                /// replicas register differently-sorted parts in the same shared part set, and a
+                /// merge feeds mis-sorted input into MergeTask, producing a part whose primary
+                /// index disagrees with its data.
+                auto local_table_metadata = ReplicatedMergeTreeTableMetadata(*this, metadata_snapshot);
+                auto diff = local_table_metadata.checkAndFindDiff(
+                    parsed.table_metadata, parsed.columns, metadata_snapshot->virtuals, getStorageID().getNameForLogs(), getContext());
+                StorageInMemoryMetadata new_metadata = diff.getNewMetadata(parsed.columns, metadata_snapshot->virtuals, getContext(), *metadata_snapshot);
+                new_metadata.setMetadataVersion(new_metadata_version);
+
+                checkTTLExpressions(new_metadata, *metadata_snapshot);
+                setProperties(new_metadata, *metadata_snapshot, /*attach=*/ false, getContext());
+
+                try
+                {
+                    /// Persist to this replica's own CREATE query (.sql file) too, not just the
+                    /// in-memory snapshot -- otherwise a restart re-parses the stale pre-ALTER
+                    /// schema, which the constructor's own columns check then throws
+                    /// INCOMPATIBLE_COLUMNS against (Keeper's canonical metadata reflects the
+                    /// ALTER regardless of which replica issued it or whether it has restarted
+                    /// since).
+                    DatabaseCatalog::instance().getDatabase(getStorageID().database_name)
+                        ->alterTable(getContext(), getStorageID(), new_metadata, /*validate_new_create_query=*/ false);
+                }
+                catch (...)
+                {
+                    LOG_ERROR(getLogger("StorageCloudMergeTree"), "Failed to persist replicated metadata change, reverting in-memory changes");
+                    setProperties(*metadata_snapshot, new_metadata, /*attach=*/ false, getContext());
+                    throw;
+                }
+
+                current_metadata_version.store(new_metadata_version);
+            }
         }
     }
 

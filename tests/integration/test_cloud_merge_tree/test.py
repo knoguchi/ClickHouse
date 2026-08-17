@@ -40,11 +40,13 @@ def cluster():
             main_configs=["configs/config.d/storage_conf.xml"],
             with_minio=True,
             with_zookeeper=True,
+            stay_alive=True,
         )
         cluster.add_instance(
             "node2",
             main_configs=["configs/config.d/storage_conf.xml"],
             with_zookeeper=True,
+            stay_alive=True,
         )
 
         logging.info("Starting cluster...")
@@ -1041,6 +1043,76 @@ def test_alter_issued_on_second_replica_is_picked_up_by_first(cluster):
         node1,
         f"SELECT count() FROM system.columns WHERE table = '{TABLE_NAME}' AND name = 'extra'",
         "1",
+    )
+
+
+def test_alter_modify_order_by_propagates_to_second_replica(cluster):
+    node1 = cluster.instances["node1"]
+    node2 = cluster.instances["node2"]
+    ddl = "(id UInt64, data String) ENGINE = CloudMergeTree ORDER BY id SETTINGS storage_policy = 's3'"
+
+    node1.query(f"CREATE TABLE {TABLE_NAME} {ddl}")
+    table_uuid = node1.query(
+        f"SELECT uuid FROM system.tables WHERE table = '{TABLE_NAME}'"
+    ).strip()
+    node2.query(f"ATTACH TABLE {TABLE_NAME} UUID '{table_uuid}' {ddl}")
+
+    # A non-column ALTER (MODIFY ORDER BY here; also ADD INDEX/MODIFY TTL/MODIFY SETTING) only
+    # serialized columns text into the Keeper metadata znode -- a non-issuing replica's watcher
+    # bumped its own metadata_version but only ever re-parsed those (unchanged) columns, so it
+    # never actually adopted the new sorting key. Two replicas would then register
+    # differently-sorted parts in the same shared part set. is_in_sorting_key (not the sorting_key
+    # expression string) so this doesn't depend on how the key gets formatted.
+    node1.query(f"ALTER TABLE {TABLE_NAME} ADD COLUMN extra UInt64, MODIFY ORDER BY (id, extra)")
+
+    assert_eq_with_retry(
+        node2,
+        f"SELECT is_in_sorting_key FROM system.columns "
+        f"WHERE table = '{TABLE_NAME}' AND name = 'extra'",
+        "1",
+    )
+    assert (
+        node1.query(
+            f"SELECT is_in_sorting_key FROM system.columns "
+            f"WHERE table = '{TABLE_NAME}' AND name = 'extra'"
+        ).strip()
+        == "1"
+    )
+
+
+def test_alter_modify_order_by_survives_restart_on_second_replica(cluster):
+    node1 = cluster.instances["node1"]
+    node2 = cluster.instances["node2"]
+    ddl = "(id UInt64, data String) ENGINE = CloudMergeTree ORDER BY id SETTINGS storage_policy = 's3'"
+
+    node1.query(f"CREATE TABLE {TABLE_NAME} {ddl}")
+    table_uuid = node1.query(
+        f"SELECT uuid FROM system.tables WHERE table = '{TABLE_NAME}'"
+    ).strip()
+    node2.query(f"ATTACH TABLE {TABLE_NAME} UUID '{table_uuid}' {ddl}")
+
+    node1.query(f"ALTER TABLE {TABLE_NAME} ADD COLUMN extra UInt64, MODIFY ORDER BY (id, extra)")
+    assert_eq_with_retry(
+        node2,
+        f"SELECT is_in_sorting_key FROM system.columns "
+        f"WHERE table = '{TABLE_NAME}' AND name = 'extra'",
+        "1",
+    )
+
+    # The watcher must persist the new schema to node2's own CREATE query (.sql file), not just
+    # its in-memory metadata snapshot -- otherwise a restart re-parses the stale pre-ALTER schema,
+    # which the constructor's own columns check throws INCOMPATIBLE_COLUMNS against (Keeper's
+    # canonical metadata reflects the ALTER regardless of which replica issued it).
+    node2.restart_clickhouse()
+
+    node1.query(f"INSERT INTO {TABLE_NAME} VALUES (1, 'a', 5)")
+    assert_eq_with_retry(node2, f"SELECT count() FROM {TABLE_NAME}", "1")
+    assert (
+        node2.query(
+            f"SELECT is_in_sorting_key FROM system.columns "
+            f"WHERE table = '{TABLE_NAME}' AND name = 'extra'"
+        ).strip()
+        == "1"
     )
 
 
