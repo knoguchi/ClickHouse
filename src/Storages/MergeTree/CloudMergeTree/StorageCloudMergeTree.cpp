@@ -60,6 +60,7 @@ namespace ActionLocks
 namespace FailPoints
 {
     extern const char cloud_merge_tree_mutate_lease_acquired[];
+    extern const char cloud_merge_tree_schedule_pause[];
 }
 
 namespace ErrorCodes
@@ -1190,6 +1191,14 @@ bool StorageCloudMergeTree::scheduleDataProcessingJob(BackgroundJobsAssignee & a
 {
     if (shutdown_called)
         return false;
+
+    /// Test-only gate (see CODE_REVIEW.md finding #6's regression test): lets a test hold every
+    /// future scheduling attempt at the door -- including ones that would tag and start
+    /// processing a *different* part -- while letting an explicit OPTIMIZE TABLE (a separate code
+    /// path, not gated here) run concurrently. No-op unless a test explicitly enables it via
+    /// SYSTEM ENABLE FAILPOINT. Mirrors StorageMergeTree's own
+    /// mt_merge_selecting_task_pause_when_scheduled precedent.
+    FailPointInjection::pauseFailPoint(FailPoints::cloud_merge_tree_schedule_pause);
 
     auto table_lock_holder = lockForShare(RWLockImpl::NO_QUERY, (*getSettings())[MergeTreeSetting::lock_acquire_timeout_for_background_operations]);
     auto metadata_snapshot = getInMemoryMetadataPtr(getContext(), false);

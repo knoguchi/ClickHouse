@@ -262,6 +262,7 @@ static struct InitFiu
     PAUSEABLE(rmt_merge_selecting_task_pause_when_scheduled) \
     PAUSEABLE(mt_merge_selecting_task_pause_when_scheduled) \
     PAUSEABLE_ONCE(cloud_merge_tree_mutate_lease_acquired) \
+    PAUSEABLE(cloud_merge_tree_schedule_pause) \
     REGULAR(mt_select_parts_to_mutate_no_free_threads) \
     REGULAR(mt_select_parts_to_mutate_max_part_size) \
     ONCE(mt_alter_throw_in_start_mutation) \

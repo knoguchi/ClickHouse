@@ -1049,6 +1049,7 @@ def test_concurrent_mutation_and_optimize_no_corruption(cluster):
 def test_merge_rejects_combining_differently_mutated_parts(cluster):
     node1 = cluster.instances["node1"]
     table = "cloud_test_merge_mutation_version"
+    gate = "cloud_merge_tree_schedule_pause"
 
     node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
     node1.query(
@@ -1056,58 +1057,60 @@ def test_merge_rejects_combining_differently_mutated_parts(cluster):
         f"ORDER BY id SETTINGS storage_policy = 's3'"
     )
     try:
-        # SYSTEM STOP MERGES during setup only -- without it, background merging consolidates most
-        # of these rows' parts together *during* the insert loop itself (100 sequential INSERTs
-        # take long enough for that), so few enough parts are left by the time the mutation below
-        # is even submitted that it completes faster than any external polling could observe.
+        # SYSTEM STOP MERGES during setup only -- without it, background merging consolidates the
+        # two rows below together during the insert loop itself.
         node1.query(f"SYSTEM STOP MERGES {table}")
-
-        row_count = 100
-        for i in range(1, row_count + 1):
-            node1.query(f"INSERT INTO {table} VALUES ({i}, 'v{i}')")
-
+        node1.query(f"INSERT INTO {table} VALUES (1, 'v1')")
+        node1.query(f"INSERT INTO {table} VALUES (2, 'v2')")
         node1.query(f"ALTER TABLE {table} UPDATE data = 'mutated' WHERE 1")
 
-        # Merges and mutations both run via the same background scheduler and share one blocker
-        # (SYSTEM STOP MERGES blocks mutation selection too, matching upstream), so both start
-        # racing over these 100 fresh, still all-unmutated parts the moment this fires -- exactly
-        # the interleaving canMergeParts must stay safe under.
-        node1.query(f"SYSTEM START MERGES {table}")
+        # cloud_merge_tree_schedule_pause gates every future scheduleDataProcessingJob call at its
+        # very entry -- before it can even select, let alone tag, a part. Letting exactly one
+        # paused attempt through (one SYSTEM NOTIFY) lets the background scheduler select and start
+        # processing exactly one of the two parts above; leaving the gate closed afterwards (no
+        # further NOTIFY) prevents any subsequent scheduling attempt from ever selecting the other
+        # one, so it's guaranteed to remain un-mutated for as long as we hold the gate. Natural
+        # two-part timing was tried first (100 rows, polling for a partial-mutation state) and
+        # never reliably caught the window: the background pool processes parts faster than
+        # external SQL polling can observe an intermediate state.
+        node1.query(f"SYSTEM ENABLE FAILPOINT {gate}")
+        try:
+            node1.query(f"SYSTEM START MERGES {table}")
+            _wait_failpoint_paused(node1, gate)
+            node1.query(f"SYSTEM NOTIFY FAILPOINT {gate}")
 
-        # Catch the transient window where the background mutation scheduler has applied the
-        # mutation to some, but not all, of the several parts above -- canMergeParts must reject a
-        # merge combining an already-mutated part with a not-yet-mutated one: the merge result
-        # stamps mutation = max(sources), which would make partNeedsMutation() falsely report the
-        # merged part as already covering data that was never actually transformed.
-        deadline = time.time() + 30
-        mutated_rows = 0
-        while time.time() < deadline:
-            mutated_rows = int(
-                node1.query(f"SELECT count() FROM {table} WHERE data = 'mutated'").strip()
+            # The one part let through above must fully commit its mutation (the gate only blocks
+            # *future* scheduling attempts, not work already handed off) while the other, still
+            # ungated-out, part remains untouched.
+            assert_eq_with_retry(
+                node1, f"SELECT count() FROM {table} WHERE data = 'mutated'", "1", retry_count=60, sleep_time=1
             )
-            if 0 < mutated_rows < row_count:
-                break
-            time.sleep(0.05)
-        assert 0 < mutated_rows < row_count, (
-            "never observed a partially-mutated state to test the merge guard against "
-            f"(mutated_rows={mutated_rows})"
-        )
+            assert node1.query(f"SELECT count() FROM {table} WHERE data != 'mutated'").strip() == "1", (
+                "the second part must still be untouched while the schedule gate is held closed"
+            )
 
-        node1.query(f"OPTIMIZE TABLE {table}")
+            # canMergeParts must reject combining the just-mutated part (mutation=1) with the
+            # still-pending one (mutation=0): the merge result stamps mutation = max(sources),
+            # which would make partNeedsMutation() falsely report the merged part as already
+            # covering data that was never actually transformed. OPTIMIZE TABLE is a separate code
+            # path (optimizeUntilConverged), not gated by cloud_merge_tree_schedule_pause, so it can
+            # run right now while the background scheduler is held off.
+            node1.query(f"OPTIMIZE TABLE {table}")
+            assert node1.query(f"SELECT count() FROM system.parts WHERE table = '{table}' AND active").strip() == "2", (
+                "OPTIMIZE must not merge a mutated part with a not-yet-mutated one still pending the same mutation"
+            )
+        finally:
+            node1.query(f"SYSTEM DISABLE FAILPOINT {gate}")
 
-        # Whatever OPTIMIZE did (merged some parts or not), every row must eventually show the
-        # mutated value once the mutation itself finishes -- not silently skipped for some rows
-        # because a merge stamped a part as "mutation done" without ever actually running the
-        # mutation's commands on part of its data.
+        # Whatever OPTIMIZE did, every row must eventually show the mutated value once the
+        # mutation itself finishes -- not silently skipped for one row because a merge stamped a
+        # part as "mutation done" without ever actually running the mutation's commands on it.
         assert_eq_with_retry(
-            node1,
-            f"SELECT count() FROM {table} WHERE data = 'mutated'",
-            str(row_count),
-            retry_count=60,
-            sleep_time=1,
+            node1, f"SELECT count() FROM {table} WHERE data = 'mutated'", "2", retry_count=60, sleep_time=1
         )
-        assert node1.query(f"SELECT count() FROM {table}").strip() == str(row_count)
+        assert node1.query(f"SELECT count() FROM {table}").strip() == "2"
     finally:
+        node1.query(f"SYSTEM DISABLE FAILPOINT {gate}")
         node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
 
 
