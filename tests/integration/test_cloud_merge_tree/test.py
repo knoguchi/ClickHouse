@@ -1387,6 +1387,32 @@ def test_detach_and_attach_partition_roundtrip(cluster):
     assert node1.query(f"SELECT sum(id) FROM {TABLE_NAME}").strip() == "3"
 
 
+def test_mutation_applies_to_partition_reattached_after_submission(cluster):
+    node1 = cluster.instances["node1"]
+
+    node1.query(f"CREATE TABLE {TABLE_NAME} {TABLE_DDL}")
+    node1.query(f"INSERT INTO {TABLE_NAME} VALUES (1, 'a'), (2, 'b')")
+
+    # TABLE_DDL has no PARTITION BY, so DETACH PARTITION ID 'all' leaves the table's one and only
+    # partition with zero active parts on this replica.
+    node1.query(f"ALTER TABLE {TABLE_NAME} DETACH PARTITION ID 'all'")
+
+    # buildMutationEntry's table-wide affected-partition discovery must not silently exempt a
+    # partition just because it happens to have no active parts on this replica right now -- the
+    # mutation still needs to apply once the detached data comes back.
+    node1.query(f"ALTER TABLE {TABLE_NAME} DELETE WHERE id = 1")
+
+    node1.query(f"ALTER TABLE {TABLE_NAME} ATTACH PARTITION ID 'all'")
+
+    assert_eq_with_retry(node1, f"SELECT count() FROM {TABLE_NAME} WHERE id = 1", "0")
+    assert node1.query(f"SELECT count() FROM {TABLE_NAME}").strip() == "1"
+    assert_eq_with_retry(
+        node1,
+        f"SELECT count() FROM system.mutations WHERE table = '{TABLE_NAME}' AND is_done = 1",
+        "1",
+    )
+
+
 def test_detach_and_attach_part_by_name(cluster):
     node1 = cluster.instances["node1"]
 

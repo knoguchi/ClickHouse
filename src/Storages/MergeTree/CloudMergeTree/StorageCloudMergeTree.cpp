@@ -959,10 +959,18 @@ ReplicatedMergeTreeMutationEntry StorageCloudMergeTree::buildMutationEntry(
     std::set<String> affected_partition_ids = getPartitionIdsAffectedByCommands(commands, local_context);
     if (affected_partition_ids.empty())
     {
-        /// No command carried an explicit PARTITION clause: applies table-wide, to every partition
-        /// with currently-active parts.
-        for (const auto & part : getDataPartsVectorForInternalUsage({DataPartState::Active}, {DataPartKind::Regular}))
-            affected_partition_ids.insert(part->info.getPartitionId());
+        /// No command carried an explicit PARTITION clause: applies table-wide. Every partition
+        /// that has ever had a block number allocated (an INSERT, or an earlier mutation) has a
+        /// block_numbers/<partition_id> znode -- Keeper-authoritative, unlike this replica's own
+        /// local active-parts view, which can miss a partition entirely: DETACH doesn't touch
+        /// block_numbers/, so a partition detached down to zero active parts still shows up here
+        /// (its later re-ATTACHed parts correctly still need this mutation), and another replica's
+        /// commitInsertedPart() creates its partition's znode synchronously as part of the INSERT
+        /// itself, before this replica's watcher has necessarily adopted the resulting part. A
+        /// partition missing from block_numbers entirely here would permanently exempt every part
+        /// ever added to it afterwards from this mutation.
+        for (const auto & name : zk->getChildren(coordination.blockNumbersPath()))
+            affected_partition_ids.insert(name);
     }
 
     ReplicatedMergeTreeMutationEntry entry;
@@ -1625,9 +1633,21 @@ PartitionCommandsResultInfo StorageCloudMergeTree::attachPartition(
         DataPartsVector covered_parts;
         {
             auto lock = lockParts();
-            covered_parts = admitPartLocally(part, lock);
-            for (const auto & covered : covered_parts)
-                modifyPartState(covered, DataPartState::Deleting, lock);
+            /// The Keeper write above can trigger this replica's own watcher via self-notification
+            /// before this call gets here (the same class of race fixed for the metadata watch in
+            /// alter()/updatePartSetFromKeeper() -- see lockForAlter() there): the watcher's own
+            /// updatePartSetFromKeeper() cycle can adopt this exact part first, so by the time this
+            /// call runs, it's already Active locally under this exact name -- not "covered by
+            /// something newer" (addTempPart()'s own, different tolerance inside admitPartLocally()),
+            /// so admitPartLocally() would otherwise throw "Part ... already exists". Matches the
+            /// ZNODEEXISTS handling just above: someone else's concurrent adoption of the very same
+            /// part already won, which is success, not an error, for this call too.
+            if (!getPartIfExistsUnlocked(name, {DataPartState::Active}, lock))
+            {
+                covered_parts = admitPartLocally(part, lock);
+                for (const auto & covered : covered_parts)
+                    modifyPartState(covered, DataPartState::Deleting, lock);
+            }
         }
         /// See admitPartLocally()'s doc comment: erase any covered part's in-memory bookkeeping
         /// immediately (removePartsFinally() takes its own lockParts(), so must run after the block
