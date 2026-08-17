@@ -1575,15 +1575,30 @@ size_t StorageCloudMergeTree::removeActivePartsMatching(const std::function<bool
             throw zkutil::KeeperException(code, "Cannot remove parts from Keeper for table {}", getStorageID().getNameForLogs());
 
         std::unordered_set<std::string> matched_set(matched.begin(), matched.end());
-        auto lock = lockParts();
-        auto known = getDataPartsVectorForInternalUsage({DataPartState::Active}, {DataPartKind::Regular}, lock);
         DataPartsVector to_remove;
-        for (const auto & part : known)
-            if (matched_set.contains(part->name))
-                to_remove.push_back(part);
+        {
+            auto lock = lockParts();
+            auto known = getDataPartsVectorForInternalUsage({DataPartState::Active}, {DataPartKind::Regular}, lock);
+            for (const auto & part : known)
+                if (matched_set.contains(part->name))
+                    to_remove.push_back(part);
 
+            /// clear_without_timeout=true + the explicit removePartsFinally() below: CloudMergeTree
+            /// never runs the generic old-parts cleanup thread that would otherwise eventually erase
+            /// a plain (clear_without_timeout=false) Outdated entry, so leaving these pending that
+            /// timer would leak them in data_parts_indexes forever -- every other
+            /// removePartsFromWorkingSet() call site in this file already does this (see
+            /// detachActivePartsMatching()'s identical pattern just above). removePartsFinally() takes
+            /// its own lockParts() internally, so it must run after this block releases `lock`.
+            if (!to_remove.empty())
+            {
+                removePartsFromWorkingSet(/*txn=*/ nullptr, to_remove, /*clear_without_timeout=*/ true, lock);
+                for (const auto & part : to_remove)
+                    modifyPartState(part, DataPartState::Deleting, lock);
+            }
+        }
         if (!to_remove.empty())
-            removePartsFromWorkingSet(/*txn=*/ nullptr, to_remove, /*clear_without_timeout=*/ false, lock);
+            removePartsFinally(to_remove);
 
         return matched.size();
     }

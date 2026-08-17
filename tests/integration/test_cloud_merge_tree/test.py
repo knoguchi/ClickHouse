@@ -656,6 +656,29 @@ def test_truncate_empties_table_and_allows_further_inserts(cluster):
     assert node1.query(f"SELECT sum(id) FROM {TABLE_NAME}").strip() == "100"
 
 
+def test_truncate_does_not_leak_outdated_parts_in_memory(cluster):
+    node1 = cluster.instances["node1"]
+
+    node1.query(f"CREATE TABLE {TABLE_NAME} {TABLE_DDL}")
+    for i in range(1, 4):
+        node1.query(f"INSERT INTO {TABLE_NAME} VALUES ({i}, 'v{i}')")
+    assert node1.query(f"SELECT count() FROM {TABLE_NAME}").strip() == "3"
+
+    node1.query(f"TRUNCATE TABLE {TABLE_NAME}")
+
+    # removeActivePartsMatching() (TRUNCATE's and DROP PARTITION's shared path) must erase the
+    # removed parts from this replica's in-memory data_parts_indexes immediately, not leave them
+    # as Outdated pending a generic cleanup timer CloudMergeTree never runs (every other
+    # removePartsFromWorkingSet() call site in this file already does this -- see e.g.
+    # detachActivePartsMatching()'s identical pattern just above it). Checked via system.parts
+    # with no `active` filter, so it also counts Outdated/Deleting entries, not just the active
+    # set -- repeated TRUNCATE/DROP PARTITION cycles would otherwise grow this without bound.
+    assert (
+        node1.query(f"SELECT count() FROM system.parts WHERE table = '{TABLE_NAME}'").strip()
+        == "0"
+    )
+
+
 def test_truncate_then_reinsert_identical_content_is_not_deduplicated(cluster):
     node1 = cluster.instances["node1"]
 
