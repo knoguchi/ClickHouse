@@ -131,7 +131,8 @@ projections, FINAL), `MergeTreePartInfo`, checksums, `MergeTreeSettings`,
   into cold-storage tables sharing the same schema). Done: `REPLACE`/`ATTACH
   PARTITION ... FROM` and `MOVE PARTITION ... TO TABLE` are both implemented.
 
-Deferred (the SMT periphery, not correctness): per-AZ leader fan-out.
+Deferred list is empty as of the per-AZ leader fan-out landing (below) --
+every item ever listed here is now done.
 
 Sequential-consistency read fencing is done: `select_sequential_consistency`
 (the same global setting `StorageReplicatedMergeTree` uses) makes
@@ -141,6 +142,32 @@ current version first, instead of relying on the async background watcher
 alone.
 
 Snapshot cleaner tuning is done.
+
+Per-AZ merge-selection leader fan-out is done: when a replica's
+availability zone is known (`PlacementInfo::getAvailabilityZone()`), only
+the elected leader within that AZ attempts background merge/mutation
+selection, cutting the redundant Keeper traffic every other same-AZ
+replica used to spend racing (and losing) leases they were never going to
+win. A no-op wherever AZ info isn't configured. Deliberately per-AZ, not a
+single global leader -- see `zkutil::checkNoOldLeaders`
+(`Storages/MergeTree/LeaderElection.h`) on why upstream itself moved away
+from single-leader merge assignment.
+
+`DELETE FROM ... WHERE` (lightweight delete) works: it's implemented as a
+mutation under the hood (`lightweight_delete_mode` defaults to
+`ALTER_UPDATE`), the same Keeper-backed mutation path Phase 4 already
+covers -- no CloudMergeTree-specific code needed.
+
+`UPDATE ... SET` (lightweight update) is **not** supported: it writes a
+separate "patch part" instead of a mutation, and CloudMergeTree has no
+patch-part support in its Keeper part-set model (every part-set operation
+in this engine filters to `DataPartKind::Regular` only --
+see `CloudMergeTreePartsCollector`'s own doc comment). `IStorage`'s
+default `updateLightweight()` throws `NOT_IMPLEMENTED` before anything is
+written, so this fails closed rather than silently mishandling a patch
+part -- confirmed by a regression test. Teaching the Keeper part-set model
+about patch parts (commit, adopt, GC, backup/restore, all of it) would be
+a real, separate feature, not attempted here.
 
 `BACKUP`/`RESTORE` is done for part data: `backupData()` wraps each active
 part (optionally partition-filtered) via the inherited `backupParts()`;

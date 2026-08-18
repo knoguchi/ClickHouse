@@ -102,11 +102,19 @@ namespace Setting
     extern const SettingsUInt64 select_sequential_consistency;
 }
 
-/// Minimal mutations snapshot: CloudMergeTree has no mutations in Phase 0, so the snapshot is
-/// always empty. MutationsSnapshotBase already implements the patch/flags accessors.
+/// No on-the-fly mutation commands or patch parts to report -- CloudMergeTree has no patch-part
+/// support (see CloudMergeTreePartsCollector's own doc comment) and never batches unapplied
+/// mutation commands onto a part's read path (every applied mutation is already baked into the
+/// part it produced, via the same commitMergedPart() a merge uses). MutationsSnapshotBase already
+/// implements the patch/flags accessors from whatever Params/MutationCounters it's constructed
+/// with -- see getMutationsSnapshot() below for why those must NOT be defaulted.
 struct StorageCloudMergeTree::MutationsSnapshot final : public MergeTreeData::MutationsSnapshotBase
 {
     MutationsSnapshot() = default;
+    MutationsSnapshot(Params params_, MutationCounters counters_)
+        : MergeTreeData::MutationsSnapshotBase(std::move(params_), std::move(counters_), /*patches_=*/{})
+    {
+    }
 
     MutationCommands getOnFlyMutationCommandsForPart(const DataPartPtr & /*part*/) const override { return {}; }
     NameSet getAllUpdatedColumns() const override { return {}; }
@@ -809,9 +817,31 @@ void StorageCloudMergeTree::truncate(const ASTPtr &, const StorageMetadataPtr &,
     coordination.clearDeduplicationHashes(getZooKeeper());
 }
 
-StorageCloudMergeTree::MutationsSnapshotPtr StorageCloudMergeTree::getMutationsSnapshot(const IMutationsSnapshot::Params & /*params*/) const
+StorageCloudMergeTree::MutationsSnapshotPtr StorageCloudMergeTree::getMutationsSnapshot(const IMutationsSnapshot::Params & params) const
 {
-    return std::make_shared<MutationsSnapshot>();
+    /// params.has_lightweight_delete_parts is computed by the generic query-planning caller from
+    /// this table's own has_lightweight_delete_parts flag (MergeTreeData::addTempPart()/
+    /// preparePartForCommit() already set it correctly whenever a committed part carries the
+    /// _row_exists mask -- both are shared, unmodified functions commitInsertedPart()/
+    /// commitMergedPart() already route every commit through). The previous stub
+    /// (`return std::make_shared<MutationsSnapshot>();`, predating Phase 4's mutation support --
+    /// see this struct's own now-corrected doc comment) discarded `params` entirely, so
+    /// hasLightweightDeletedMask() always read a default-constructed false regardless of reality.
+    /// MergeTreeData::supportsTrivialCountOptimization() then never disabled the fast COUNT() path
+    /// for a table with an active lightweight-delete mask, so SELECT count() (and any other
+    /// trivial-count caller) silently overcounted by however many rows a completed
+    /// DELETE FROM/lightweight-delete mutation had already masked out -- reproduced end-to-end via
+    /// a plain ALTER TABLE ... UPDATE _row_exists = 0 mutation completing successfully
+    /// (is_done = 1) while SELECT count() kept returning the pre-delete row count indefinitely.
+    ///
+    /// Pending (not-yet-applied) mutation tracking (hasDataMutations()/hasAlterMutations(), which
+    /// would also gate trivial-count-optimization) is deliberately NOT populated here -- this
+    /// table's mutations live entirely in Keeper (see loadSortedMutations()), not a local
+    /// current_mutations_by_version map like StorageMergeTree's own getMutationsSnapshot() reads
+    /// from, and reading Keeper's pending mutation list into this snapshot for that purpose alone
+    /// is a real, separate, smaller follow-up -- not something this fix's reproduced bug
+    /// (an already-applied lightweight-delete mask being miscounted) requires.
+    return std::make_shared<MutationsSnapshot>(params, MutationCounters{});
 }
 
 CursorPromotersMap StorageCloudMergeTree::buildPromoters()

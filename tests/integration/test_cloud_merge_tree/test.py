@@ -3107,3 +3107,84 @@ def test_az_leader_multi_az_no_global_bottleneck(cluster):
     finally:
         node_a1.query(f"DROP TABLE IF EXISTS {TABLE_NAME} SYNC")
         node_b1.query(f"DROP TABLE IF EXISTS {TABLE_NAME} SYNC")
+
+
+def test_lightweight_delete_removes_matching_rows(cluster):
+    node1 = cluster.instances["node1"]
+    node2 = cluster.instances["node2"]
+    table = TABLE_NAME
+
+    node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
+    node1.query(
+        f"CREATE TABLE {table} (id UInt64, data String) ENGINE = CloudMergeTree "
+        f"ORDER BY id SETTINGS storage_policy = 's3'"
+    )
+    table_uuid = node1.query(f"SELECT uuid FROM system.tables WHERE table = '{table}'").strip()
+    node2.query(
+        f"ATTACH TABLE {table} UUID '{table_uuid}' (id UInt64, data String) "
+        f"ENGINE = CloudMergeTree ORDER BY id SETTINGS storage_policy = 's3'"
+    )
+    try:
+        for i in range(1, 6):
+            node1.query(f"INSERT INTO {table} VALUES ({i}, 'v{i}')")
+
+        # DELETE FROM ... WHERE (lightweight delete) is implemented as a mutation under the
+        # hood (lightweight_delete_mode defaults to ALTER_UPDATE) -- the same Keeper-backed
+        # mutation path already proven by Phase 4's own tests. The mutation itself always
+        # applied correctly; the bug this test guards against was in getMutationsSnapshot()
+        # (see its own doc comment) silently telling supportsTrivialCountOptimization() that no
+        # lightweight-delete mask existed, so SELECT count()'s fast path kept returning the
+        # pre-delete row count forever even though the mutation had genuinely completed.
+        node1.query(f"DELETE FROM {table} WHERE id IN (2, 4)")
+
+        assert_eq_with_retry(node1, f"SELECT count() FROM {table}", "3")
+        assert (
+            node1.query(f"SELECT arraySort(groupArray(id)) FROM {table}").strip()
+            == "[1,3,5]"
+        )
+
+        # The mutation commits through Keeper like any other -- the second replica's watcher
+        # picks it up without ever running the DELETE itself.
+        assert_eq_with_retry(node2, f"SELECT count() FROM {table}", "3")
+        assert (
+            node2.query(f"SELECT arraySort(groupArray(id)) FROM {table}").strip()
+            == "[1,3,5]"
+        )
+    finally:
+        node2.query(f"DROP TABLE IF EXISTS {table} SYNC")
+        node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
+
+
+def test_lightweight_update_throws_not_implemented(cluster):
+    node1 = cluster.instances["node1"]
+    table = TABLE_NAME
+
+    node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
+    node1.query(
+        f"CREATE TABLE {table} (id UInt64, c1 UInt64, c2 UInt64) ENGINE = CloudMergeTree "
+        f"ORDER BY id SETTINGS storage_policy = 's3', enable_block_number_column = 1, enable_block_offset_column = 1"
+    )
+    try:
+        node1.query(f"INSERT INTO {table} SELECT number, number, number FROM numbers(20)")
+
+        # UPDATE ... SET (lightweight update) writes a separate "patch part" instead of a
+        # mutation -- CloudMergeTreePartsCollector's own doc comment is explicit that
+        # CloudMergeTree has no patch-part support, and IStorage::updateLightweight()'s
+        # default (never overridden here) throws NOT_IMPLEMENTED before anything is written.
+        # This pins that fail-closed behavior: if patch-part support is ever added upstream to
+        # a shared base class CloudMergeTree inherits from without also teaching the Keeper
+        # part-set model about DataPartKind::Patch, this must keep failing loudly, not silently
+        # accept a write that the rest of this file's machinery (DataPartKind::Regular-only
+        # everywhere) would then mishandle.
+        with pytest.raises(QueryRuntimeException, match="NOT_IMPLEMENTED"):
+            node1.query(
+                f"UPDATE {table} SET c2 = c1 * c1 WHERE id % 2 = 0 "
+                f"SETTINGS enable_lightweight_update = 1, apply_patch_parts = 1"
+            )
+
+        # Confirms the rejection happened before writing anything -- c2 (pre-populated to
+        # 0..19 by the INSERT, sum 190) must be completely unchanged by the rejected UPDATE,
+        # not a partial/half-applied patch.
+        assert node1.query(f"SELECT sum(c2) FROM {table}").strip() == "190"
+    finally:
+        node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
