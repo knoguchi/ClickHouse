@@ -3188,3 +3188,87 @@ def test_lightweight_update_throws_not_implemented(cluster):
         assert node1.query(f"SELECT sum(c2) FROM {table}").strip() == "190"
     finally:
         node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
+
+
+TTL_TABLE_DDL_SETTINGS = "storage_policy = 's3', merge_with_ttl_timeout = 0"
+
+
+def test_ttl_delete_removes_expired_rows_and_visible_on_second_replica(cluster):
+    node1 = cluster.instances["node1"]
+    node2 = cluster.instances["node2"]
+    table = TABLE_NAME
+    ddl = (
+        f"(id UInt64, ts DateTime, data String) ENGINE = CloudMergeTree ORDER BY id "
+        f"TTL ts + INTERVAL 1 DAY SETTINGS {TTL_TABLE_DDL_SETTINGS}"
+    )
+
+    node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
+    node1.query(f"CREATE TABLE {table} {ddl}")
+    table_uuid = node1.query(f"SELECT uuid FROM system.tables WHERE table = '{table}'").strip()
+    node2.query(f"ATTACH TABLE {table} UUID '{table_uuid}' {ddl}")
+    try:
+        # Rows 1-3 already satisfy ts + INTERVAL 1 DAY <= now() at insert time (no need to
+        # actually wait out the interval). Rows 4-5 are inserted with ts = now() and must survive
+        # for the entire test -- a 1-day window (not 1 second) means normal scheduler/test
+        # latency (observed up to ~1.5s for a background merge to actually run) can never
+        # accidentally cross the threshold and expire them too, unlike a too-short TTL window.
+        node1.query(
+            f"INSERT INTO {table} VALUES "
+            f"(1, now() - INTERVAL 2 DAY, 'old1'), "
+            f"(2, now() - INTERVAL 2 DAY, 'old2'), "
+            f"(3, now() - INTERVAL 2 DAY, 'old3')"
+        )
+        node1.query(f"INSERT INTO {table} VALUES (4, now(), 'fresh4'), (5, now(), 'fresh5')")
+
+        # Before this fix, merge_with_ttl_allowed was hardcoded false, so no background merge
+        # ever considered TTL -- these rows would stay forever. Reproduce-first: this assertion
+        # fails against the pre-fix hardcode (count stays 5) and passes after (count becomes 2).
+        assert_eq_with_retry(node1, f"SELECT count() FROM {table}", "2")
+        assert (
+            node1.query(f"SELECT arraySort(groupArray(id)) FROM {table}").strip()
+            == "[4,5]"
+        )
+
+        # TTL-driven deletion commits through the same commitMergedPart() Keeper path as any
+        # other merge -- the second replica's watcher picks it up without running anything itself.
+        assert_eq_with_retry(node2, f"SELECT count() FROM {table}", "2")
+        assert (
+            node2.query(f"SELECT arraySort(groupArray(id)) FROM {table}").strip()
+            == "[4,5]"
+        )
+    finally:
+        node2.query(f"DROP TABLE IF EXISTS {table} SYNC")
+        node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
+
+
+def test_ttl_stop_start_merges_blocks_and_resumes_ttl_deletion(cluster):
+    node1 = cluster.instances["node1"]
+    table = TABLE_NAME
+    ddl = (
+        f"(id UInt64, ts DateTime, data String) ENGINE = CloudMergeTree ORDER BY id "
+        f"TTL ts + INTERVAL 1 DAY SETTINGS {TTL_TABLE_DDL_SETTINGS}"
+    )
+
+    node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
+    node1.query(f"CREATE TABLE {table} {ddl}")
+    try:
+        node1.query("SYSTEM STOP TTL MERGES " + table)
+        # 1-day window (not 1 second): the fresh row's ts = now() at insert time must not cross
+        # the TTL threshold no matter how long this test takes to run (including the STOP-then-
+        # sleep-then-START sequence below) -- same reasoning as the sibling delete test.
+        node1.query(
+            f"INSERT INTO {table} VALUES (1, now() - INTERVAL 2 DAY, 'old1'), (2, now(), 'fresh2')"
+        )
+
+        # Give the background scheduler several cycles' worth of time to (not) act -- the row
+        # must still be there, proving the independent PartsTTLMerge blocker actually blocks TTL
+        # selection specifically (SYSTEM STOP MERGES's own separate PartsMerge blocker is
+        # untouched here, so this also confirms the two blockers don't accidentally alias).
+        time.sleep(3)
+        assert node1.query(f"SELECT count() FROM {table}").strip() == "2"
+
+        node1.query("SYSTEM START TTL MERGES " + table)
+        assert_eq_with_retry(node1, f"SELECT count() FROM {table}", "1")
+        assert node1.query(f"SELECT id FROM {table}").strip() == "2"
+    finally:
+        node1.query(f"DROP TABLE IF EXISTS {table} SYNC")

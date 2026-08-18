@@ -59,6 +59,7 @@ namespace DB
 namespace ActionLocks
 {
     extern const StorageActionBlockType PartsMerge;
+    extern const StorageActionBlockType PartsTTLMerge;
 }
 
 namespace FailPoints
@@ -921,12 +922,24 @@ std::expected<CloudMergeMutateSelectedEntryPtr, SelectMergeFailure> StorageCloud
                 .explanation = PreformattedMessage::create("Current value of max_source_parts_bytes is zero"),
             });
 
+        /// merge_with_ttl_allowed=true enables delete/recompress TTL-driven merge selection
+        /// (TTLRowDeleteMergeSelector/TTLRecompressMergeSelector, both already generic
+        /// IMergeSelector implementations chooseMergesFrom() drives internally) -- see
+        /// getActionLock()'s PartsTTLMerge case for the independent SYSTEM STOP/START TTL MERGES
+        /// blocker this enables; merger_mutator.selectPartsToMerge() (shared, unmodified) already
+        /// reads merger_mutator.ttl_merges_blocker itself to compute can_use_ttl_merges before
+        /// this flag is even consulted. Move TTL (`TO DISK/VOLUME`) is a structurally separate
+        /// mechanism (MergeTreeData::selectPartsForMove(), driven by
+        /// startBackgroundMovesIfNeeded(), which CloudMergeTree deliberately leaves a no-op below
+        /// since its storage policy is constructor-enforced to exactly one disk -- see the
+        /// constructor's own isRemote() check) -- this flag only enables delete/recompress TTL
+        /// merge selection, which is unaffected by that gap.
         select_result = merger_mutator.selectPartsToMerge(
             parts_collector,
             merge_predicate,
             MergeSelectorApplier(
                 /*merge_constraints=*/{{max_source_parts_bytes_for_merge, max_result_part_rows}},
-                /*merge_with_ttl_allowed=*/false, /// CloudMergeTree has no TTL-driven merges yet
+                /*merge_with_ttl_allowed=*/true,
                 aggressive,
                 /*range_filter_=*/nullptr,
                 /*storage_id_=*/getStorageID()),
@@ -1357,12 +1370,19 @@ ActionLock StorageCloudMergeTree::getActionLock(StorageActionBlockType action_ty
 {
     if (action_type == ActionLocks::PartsMerge)
         return merger_mutator.merges_blocker.cancel();
+    /// merger_mutator.ttl_merges_blocker is the same sibling member StorageMergeTree/
+    /// StorageReplicatedMergeTree already wire up here -- selectPartsToMerge()'s
+    /// can_use_ttl_merges = !ttl_merges_blocker.isCancelled() (MergeTreeDataMergerMutator.cpp,
+    /// shared/unmodified) already reads it; this just gives SYSTEM STOP/START TTL MERGES a way
+    /// to actually flip it, independently of SYSTEM STOP/START MERGES's own PartsMerge blocker.
+    if (action_type == ActionLocks::PartsTTLMerge)
+        return merger_mutator.ttl_merges_blocker.cancel();
     return {};
 }
 
 void StorageCloudMergeTree::onActionLockRemove(StorageActionBlockType action_type)
 {
-    if (action_type == ActionLocks::PartsMerge)
+    if (action_type == ActionLocks::PartsMerge || action_type == ActionLocks::PartsTTLMerge)
         background_operations_assignee.trigger();
 }
 
@@ -2399,6 +2419,16 @@ try
 
     std::unordered_set<std::string> active_set(active_names.begin(), active_names.end());
 
+    /// Bound pending_adoption_first_seen_ms: a name whose settling window never completes
+    /// because it dropped out of Keeper's active set first (superseded by a merge/mutation
+    /// before this replica got around to it, or a genuine DROP/TRUNCATE) would otherwise sit
+    /// there forever -- it can never be seen again, so its entry is dead the moment it's no
+    /// longer in active_set.
+    {
+        std::lock_guard settle_lock(pending_adoption_mutex);
+        std::erase_if(pending_adoption_first_seen_ms, [&](const auto & entry) { return !active_set.contains(entry.first); });
+    }
+
     /// Parts no longer active in Keeper are only removed from the local working set after the
     /// adoption loop below has confirmed every currently-active part is present locally (see
     /// all_adopted) -- not upfront. A part superseded by a merge is atomically replaced by its
@@ -2420,11 +2450,37 @@ try
     /// Another replica registered this part in Keeper and wrote it to the shared disk;
     /// buildPartFromDisk() builds the part object from the on-disk directory (already named
     /// exactly `name`, no rename needed) and admitPartLocally() adds it to the active set.
+    ///
+    /// A part passing buildPartFromDisk()'s own checks is not proof it will still be readable a
+    /// moment later: plain_rewritable's in-memory tree is refreshed via a full listing-based
+    /// clobber-and-rebuild (see disk->refresh() below), and that listing pass can itself
+    /// momentarily miss an object the underlying S3-compatible backend (any of them -- this
+    /// can't be assumed away as an AWS-S3-specific quirk) hasn't fully propagated yet. Reproduced
+    /// end-to-end: a part that passed every adoption check here, and stayed queryable for a
+    /// while, later threw a raw FILE_DOESNT_EXIST on a real SELECT from a second replica --
+    /// proof the regression can happen well after a clean adoption, not just during it, so no
+    /// amount of checking harder *at this one moment* closes it. Requiring the SAME part to
+    /// independently pass this same check again on a LATER cycle, spaced past disk->refresh()'s
+    /// own 1000ms throttle, gives a transient listing gap time to resolve before this replica
+    /// ever exposes the part to a real query -- see pending_adoption_first_seen_ms's own doc
+    /// comment in the header.
+    static constexpr UInt64 settling_window_ms = 1100; // just over disk->refresh()'s own 1000ms throttle window
     auto try_adopt_part = [&](const String & name) -> bool
     {
         auto part = buildPartFromDisk(name);
         if (!part)
             return false;
+
+        const UInt64 now_ms = static_cast<UInt64>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+        {
+            std::lock_guard settle_lock(pending_adoption_mutex);
+            auto [it, first_observation] = pending_adoption_first_seen_ms.try_emplace(name, now_ms);
+            if (first_observation || now_ms - it->second < settling_window_ms)
+                return false;
+            pending_adoption_first_seen_ms.erase(it);
+        }
+
         /// See admitPartLocally()'s doc comment: any part this adoption covers/supersedes goes
         /// into the same to_remove collected below for the explicit-removal case -- both are
         /// erased together, once, after this function's lock is released.
