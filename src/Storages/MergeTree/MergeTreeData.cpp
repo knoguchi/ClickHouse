@@ -12773,7 +12773,7 @@ std::pair<MergeTreeData::MutableDataPartPtr, scope_guard> MergeTreeData::createE
 
     /// A leftover is possible here: the covering operation (DROP/DETACH/MOVE/REPLACE PARTITION) that
     /// creates this empty part can be interrupted after the directory but before the rename.
-    String tmp_part_dir_name = EMPTY_PART_TMP_PREFIX + new_part_name;
+    String tmp_part_dir_name = EMPTY_PART_TMP_PREFIX + getTempPartDirectoryInfix() + new_part_name;
     auto tmp_dir_holder = claimTemporaryPartDirectory(data_part_volume->getDisk(), tmp_part_dir_name);
 
     auto new_data_part = getDataPartBuilder(new_part_name, data_part_volume, tmp_part_dir_name, getReadSettings(), PartDirIntent::CreateFresh)

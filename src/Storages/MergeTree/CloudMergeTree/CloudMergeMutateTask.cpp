@@ -181,6 +181,14 @@ void CloudMergeMutateTask::finish()
 
     new_part = mutate_task->getFuture().get();
 
+    /// See CloudMergeTreeSink::consume()'s identical call for why: the produced part's own
+    /// storage transaction is left open by the shared mutate machinery, so its directory and
+    /// files are not yet resolvable via getRemotePaths() -- required by commitMergedPart()
+    /// below to build the part's Keeper location payload (CloudPartLocation::capture()) --
+    /// until this commits.
+    if (new_part->getDataPartStorage().hasActiveTransaction())
+        new_part->getDataPartStorage().commitTransaction();
+
     bool committed = storage.commitMergedPart(
         new_part, future_part->parts, mutate_entry->lease_path, current_lease_version, task_context);
 

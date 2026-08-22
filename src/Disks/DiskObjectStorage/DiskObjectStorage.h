@@ -159,6 +159,16 @@ public:
         metadata_storage->refresh(not_sooner_than_milliseconds);
     }
 
+    void setAuthoritativeDirectory(const String & path, const String & remote_token, const std::unordered_map<String, uint64_t> & files_with_sizes) override
+    {
+        metadata_storage->setAuthoritativeDirectory(path, remote_token, files_with_sizes);
+    }
+
+    void removeAuthoritativeDirectory(const String & path) override
+    {
+        metadata_storage->removeAuthoritativeDirectory(path);
+    }
+
     ReservationPtr reserve(UInt64 bytes) override;
 
     ReservationPtr reserve(UInt64 bytes, const ReservationConstraints & constraints) override;

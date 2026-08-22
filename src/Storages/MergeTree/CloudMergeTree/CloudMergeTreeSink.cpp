@@ -47,6 +47,19 @@ void CloudMergeTreeSink::consume(Chunk & chunk)
         /// advertise the part in Keeper.
         temp_part->finalize();
 
+        /// Commit the part's own storage transaction now (mirrors MergeTreeSink's identical
+        /// call): finalize() only flushes writer buffers, it does not publish the accumulated
+        /// createDirectory/writeFile operations to the shared disk's in-memory tree or the
+        /// object storage itself -- those stay queued in an uncommitted DiskObjectStorage
+        /// transaction (see IDataPartStorage::beginTransaction/commitTransaction) until
+        /// something calls commitTransaction(). commitInsertedPart() below needs the part's
+        /// directory and files to genuinely resolve (CloudPartLocation::capture() reads them
+        /// via getRemotePaths()) before it builds the Keeper payload -- committing here, before
+        /// that capture, is what makes them resolvable. Safe on a dedup/race loss: the part
+        /// stays under its temp name either way, and removeIfNeeded() removes it whether or not
+        /// its transaction was committed.
+        temp_part->part->getDataPartStorage().commitTransaction();
+
         /// Token-aware dedup hash for just this part's share of the chunk: honors
         /// insert_deduplication_token when the caller set one (via DeduplicationInfo::setUserToken
         /// upstream), falls back to a whole-content hash of this part's own rows otherwise -- see

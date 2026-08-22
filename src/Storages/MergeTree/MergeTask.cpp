@@ -548,7 +548,7 @@ bool MergeTask::ExecuteAndFinalizeHorizontalPart::prepare() const
 
     // projection parts have different prefix and suffix compared to normal parts.
     // E.g. `proj_a.proj` for a normal projection merge and `proj_a.tmp_proj` for a projection materialization merge.
-    String local_tmp_prefix = global_ctx->parent_part ? "" : TEMP_DIRECTORY_PREFIX;
+    String local_tmp_prefix = global_ctx->parent_part ? "" : TEMP_DIRECTORY_PREFIX + global_ctx->data->getTempPartDirectoryInfix();
 
     const String local_tmp_suffix = global_ctx->parent_part ? global_ctx->suffix : "";
 
@@ -582,7 +582,8 @@ bool MergeTask::ExecuteAndFinalizeHorizontalPart::prepare() const
     /// dedicated arena (same as `MergeTreeData::loadDataPart` / `DataPartsExchange`). The rest of
     /// `prepare` (storage snapshot, column extraction, pipeline/transform setup) is merge-lifetime
     /// scratch and is deliberately left in the default per-CPU arenas.
-    /// The name is deterministic (`tmp_merge_<part>`), so claim it and reclaim a leftover of an
+    /// The name is deterministic (`tmp_merge_<infix><part>`, the infix empty for every engine
+    /// except those overriding getTempPartDirectoryInfix), so claim it and reclaim a leftover of an
     /// interrupted merge. Projection merges write nested inside the parent's directory, which has no claim.
     if (!global_ctx->parent_part)
         global_ctx->temporary_directory_lock = global_ctx->data->claimTemporaryPartDirectory(global_ctx->disk, local_tmp_part_basename);

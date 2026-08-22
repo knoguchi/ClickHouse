@@ -273,6 +273,31 @@ public:
         /// The default no-op implementation when the state in memory cannot be out of sync of the actual state.
     }
 
+    /// Declare authoritative, out-of-band knowledge (e.g. from a coordination service, where
+    /// it was committed atomically with the data it describes) of which remote directory backs
+    /// the given logical path and which files it contains. For implementations whose in-memory
+    /// state is rebuilt from eventually-consistent storage listings, this both takes effect
+    /// immediately and survives any refresh whose listing transiently omits or contradicts the
+    /// directory: existence and the remote token are taken from the authority; file sets are
+    /// unioned when the listing agrees on the token (a directory can legitimately gain files
+    /// after the authority's snapshot; files themselves are immutable). No-op by default.
+    ///
+    /// Deletions performed by other actors directly on the shared storage reach this in-memory
+    /// state only through listings -- exactly the channel this call overrides -- so the caller
+    /// MUST withdraw the authority with removeAuthoritativeDirectory() as soon as its
+    /// out-of-band knowledge goes away, or a remotely-deleted directory stays alive in memory
+    /// forever.
+    virtual void setAuthoritativeDirectory(
+        const std::string & /* path */,
+        const std::string & /* remote_token */,
+        const std::unordered_map<std::string, uint64_t> & /* files_with_sizes */)
+    {
+    }
+
+    virtual void removeAuthoritativeDirectory(const std::string & /* path */)
+    {
+    }
+
     virtual ~IMetadataStorage() = default;
 
     /// ==== More specific methods. Previous were almost general purpose. ====

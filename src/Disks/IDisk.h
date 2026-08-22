@@ -15,6 +15,7 @@
 #include <Disks/DirectoryIterator.h>
 
 #include <memory>
+#include <unordered_map>
 #include <boost/noncopyable.hpp>
 #include <Poco/Timestamp.h>
 #include <filesystem>
@@ -495,6 +496,17 @@ public:
     virtual void refresh(UInt64 /* not_sooner_than_milliseconds */)
     {
         /// The default no-op implementation when the state in memory cannot be out of sync of the actual state.
+    }
+
+    /// See IMetadataStorage::setAuthoritativeDirectory / removeAuthoritativeDirectory. No-ops
+    /// for disks whose in-memory state cannot go out of sync with the actual storage.
+    virtual void setAuthoritativeDirectory(
+        const String & /* path */, const String & /* remote_token */, const std::unordered_map<String, uint64_t> & /* files_with_sizes */)
+    {
+    }
+
+    virtual void removeAuthoritativeDirectory(const String & /* path */)
+    {
     }
 
     /// Return some uniq string for file, overrode for IDiskRemote

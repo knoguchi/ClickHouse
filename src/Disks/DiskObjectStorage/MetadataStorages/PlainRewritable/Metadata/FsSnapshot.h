@@ -46,6 +46,10 @@ public:
     /// Directory Write Methods
 
     void recordDirectoryPath(const std::string & path, DirectoryRemoteInfo info);
+    /// Upsert variant of recordDirectoryPath for authoritative out-of-band knowledge
+    /// (see IMetadataStorage::setAuthoritativeDirectory) -- replaces an existing entry
+    /// instead of throwing DIRECTORY_ALREADY_EXISTS.
+    void overrideDirectory(const std::string & path, DirectoryRemoteInfo info);
     void moveDirectory(const std::string & from, const std::string & to);
     void removeDirectory(const std::string & path);
 

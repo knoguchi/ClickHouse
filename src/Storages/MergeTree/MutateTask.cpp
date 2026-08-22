@@ -3999,9 +3999,11 @@ bool MutateTask::prepare()
     }
     ctx->disk = single_disk_volume->getDisk();
 
-    String tmp_part_dir_name = TEMP_DIRECTORY_PREFIX + ctx->future_part->name;
+    String tmp_part_dir_name = TEMP_DIRECTORY_PREFIX + ctx->data->getTempPartDirectoryInfix() + ctx->future_part->name;
 
-    /// The name is deterministic, so claim it and reclaim a leftover of an interrupted mutation.
+    /// The name is deterministic (up to getTempPartDirectoryInfix, empty for every engine that
+    /// does not share its disk namespace between replicas), so claim it and reclaim a leftover of
+    /// an interrupted mutation.
     ctx->temporary_directory_lock = ctx->data->claimTemporaryPartDirectory(ctx->disk, tmp_part_dir_name);
 
     auto builder = ctx->data->getDataPartBuilder(ctx->future_part->name, single_disk_volume, tmp_part_dir_name, getReadSettings(), PartDirIntent::CreateFresh);

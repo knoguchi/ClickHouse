@@ -47,9 +47,14 @@ things relative to it:
   metadata                      table schema (reuse ReplicatedMergeTreeTableMetadata)
   columns
   parts/                        THE CANONICAL ACTIVE PART SET
-    <part_name>                 value = part header (columns + checksums), like
-                                Replicated minimalistic header. cversion of this
-                                node is the part-set version for cheap change checks.
+    <part_name>                 value = part header (columns + checksums, like
+                                Replicated minimalistic header) followed by a
+                                CloudPartLocation trailer: the part's plain_rewritable
+                                remote directory token(s) (root + any projections) and
+                                complete file list with sizes, so a replica resolves
+                                the part's bytes from this committed payload instead
+                                of an object storage listing. cversion of this node's
+                                parent is the part-set version for cheap change checks.
   block_numbers/<partition>/    block-number allocation (ephemeral-sequential lock)
   mutations/<id>                mutation commands + target version
   leases/                       merge/mutation assignment leases (ephemeral)
@@ -175,3 +180,93 @@ part (optionally partition-filtered) via the inherited `backupParts()`;
 `commitInsertedPart()` Keeper-commit hook `INSERT` uses, giving each a
 fresh identity in the destination table. Pending (not-yet-applied)
 mutations are not backed up -- a smaller, separate follow-up.
+
+TTL (row delete) is done: `selectPartsToMerge()` now passes
+`merge_with_ttl_allowed=true` to `MergeSelectorApplier`, and
+`getActionLock()`/`onActionLockRemove()` wire up `ActionLocks::PartsTTLMerge`
+the same way `PartsMerge` already was. The TTL-aware merge selector and its
+own bookkeeping are already generic, shared `MergeTreeDataMergerMutator`
+state -- this was a two-hunk flip, not a new subsystem. Move TTL (`TO DISK/
+VOLUME`) stays unenforced, correctly: `startBackgroundMovesIfNeeded()` is a
+deliberate no-op since the storage policy is constructor-enforced to
+exactly one disk, so there is nowhere for a part to move *to*.
+
+**Cross-replica part-visibility race (found 2026-08-18, structurally closed
+2026-08-19/20).** A part discovered via a second replica's watcher could
+pass every adoption check, get marked active, and later throw a raw
+`FILE_DOESNT_EXIST` (or silently return wrong data) on a real `SELECT` --
+reproduced at a 33-67% rate. Root cause: `plain_rewritable`'s in-memory
+directory tree is refreshed via a full listing-based clobber-and-rebuild,
+and that listing pass can itself momentarily miss an object the underlying
+S3-compatible backend (any of them -- not an AWS-S3-specific quirk) hasn't
+fully propagated yet. Existing single-writer uses of this disk type never
+stress this, because a process's own writes update its own in-memory tree
+synchronously, never by discovering them via a remote listing round-trip --
+CloudMergeTree's "no peer fetch, read shared storage directly" architecture
+is the first thing asking a replica to discover a *different process's*
+writes purely through this listing-based refresh, pushing the metadata
+layer outside the consistency envelope it was built for.
+
+A first fix (2026-08-18) required a cross-replica-discovered part to
+independently pass adoption checks on two separate observations, spaced
+past `disk->refresh()`'s own throttle window, before being admitted -- a
+heuristic timeout that traded latency (multiple seconds per cross-replica
+commit) for safety, and, when tightened, reintroduced a related class: a
+directory pinning mechanism meant to close the residual listing-gap window
+had to be withdrawn precisely when a part left the working set, and an
+early version of that withdrawal missed a case, letting a lease-losing
+replica's cleanup delete a lease-winning replica's live objects under
+concurrent mutation contention.
+
+The structural fix (2026-08-19/20) removes the listing dependency from the
+read path entirely, rather than racing it: every part znode payload now
+carries, alongside the header, the part's `plain_rewritable` remote
+directory token(s) and complete file list (see `CloudPartLocation`),
+captured at commit time and travelling through the same atomic `multi()`
+as the part's registration. Adoption, startup, ATTACH-from-detached, and
+GC all resolve a part's bytes by reading this Keeper-committed location
+and registering it as an authoritative override on the shared disk's
+in-memory tree (`IMetadataStorage::setAuthoritativeDirectory`) --
+overriding, not merely surviving, whatever the object storage listing
+does or doesn't show -- then verify what was actually read back against
+the header's checksums end to end. `plain_rewritable`'s listing keeps
+working exactly as before for every other user of that disk type; only
+CloudMergeTree's own directories carry an authoritative pointer.
+Tombstones (`dropped_parts/`) and detach markers (`detached_parts/`) carry
+the same location, copied from the part's znode at removal time, so GC
+deletes by token instead of re-resolving a name through a possibly-stale
+tree, and a replica attaching a part detached by a *different* replica
+never depends on its own listing having ever observed that directory.
+Cross-replica visibility drops from several seconds (the prior scheme's
+settling window plus refresh-cycle quantization) to roughly one watch
+fire plus a handful of strongly-consistent `GET`s.
+
+This is not a workaround grafted onto the architecture -- it is the
+architecture's own original design (see the top of this document:
+Keeper as the sole authority, object storage addressed by exact committed
+keys, mutability only in metadata) finally applied to part *location*
+resolution, not just part *membership*. The prior schemes treated names as
+Keeper-authoritative but locations as something to be rediscovered from an
+eventually-consistent listing on every replica, on every cycle -- the gap
+this fix closes.
+
+A commit that crashes between its Keeper `multi()` and the local
+rename-into-place is handled explicitly at startup: the part is already
+readable at its final path via the authoritative override, so the
+constructor resolves any of this replica's own leftover temp directories
+by token before the ordinary startup temp-cleanup runs, completing the
+rename rather than letting that cleanup delete the part's only physical
+copy.
+
+Known limits, accepted rather than engineered around: the location trailer
+adds roughly 0.5-2 KB to each part znode and to each removal's tombstone
+payload, so a `REPLACE PARTITION` spanning hundreds of parts approaches
+Keeper's `multi()` payload ceiling well before it approaches the part-count
+limits `ReplicatedMergeTree` already lives with -- if this bites in
+practice, the escape hatch is an Iceberg-style layout (part locations in a
+manifest file on object storage, Keeper holding only a pointer to the
+current manifest) rather than shrinking the payload. Disaster recovery
+still works without Keeper: `plain_rewritable` keeps writing its own
+`prefix.path` markers on every commit regardless of the authoritative
+override, so listing-based recovery tooling that never consults Keeper
+remains possible; only the hot read/adoption/GC paths are Keeper-only.

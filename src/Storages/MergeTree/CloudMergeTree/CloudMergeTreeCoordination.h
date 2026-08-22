@@ -229,11 +229,15 @@ public:
     /// this table, the table root directory itself is safe to remove."
     Coordination::Error markTableDropped(const zkutil::ZooKeeperPtr & zk) const;
 
-    /// A tombstoned part awaiting GC: its name and when it left parts/ (ms since epoch).
+    /// A tombstoned part awaiting GC: its name, when it left parts/ (ms since epoch), and its
+    /// location trailer (see CloudPartLocation) copied from its part znode at removal time --
+    /// empty for a tombstone written before locations existed (not expected in a clean-slate
+    /// deployment; see the class doc comment on dropped_parts/).
     struct Tombstone
     {
         String part_name;
         Int64 dropped_at_ms;
+        String location_text;
     };
 
     /// List all tombstones currently recorded under dropped_parts/, with their drop timestamps.

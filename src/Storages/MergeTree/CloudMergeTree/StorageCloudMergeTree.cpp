@@ -29,6 +29,8 @@
 #include <Common/logger_useful.h>
 #include <Common/MemoryTracker.h>
 #include <Common/formatReadable.h>
+#include <Common/escapeForFileName.h>
+#include <base/getFQDNOrHostName.h>
 #include <Interpreters/MergeTreeTransaction/VersionMetadata.h>
 #include <Storages/MergeTree/EphemeralLockInZooKeeper.h>
 #include <Common/ZooKeeper/ZooKeeperWithFaultInjection.h>
@@ -44,6 +46,7 @@
 #include <base/sleep.h>
 #include <Common/FailPoint.h>
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <filesystem>
 
@@ -252,15 +255,45 @@ StorageCloudMergeTree::StorageCloudMergeTree(
         Strings active_names = coordination.loadActivePartNames(zk, loaded_version);
         std::unordered_set<std::string> expected_parts(active_names.begin(), active_names.end());
 
-        /// This replica's own DiskObjectStorage in-memory listing cache can predate a part another
-        /// replica committed to Keeper moments ago (e.g. a RESTORE landing on one replica just
-        /// before this replica's own CREATE/ATTACH runs) -- the same plain_rewritable
-        /// eventual-consistency window updatePartSetFromKeeper()'s own disk->refresh(1000) call
-        /// handles reactively, after a miss, for its watcher path. This is a one-time startup
-        /// load, not a hot path, so refresh unconditionally up front instead: cheaper than loading
-        /// twice, and avoids throwing NO_SUCH_DATA_PART below for a part that is really there.
-        if (!expected_parts.empty())
-            getStoragePolicy()->getDisks().front()->refresh(1000);
+        /// Complete any commit that crashed on this replica between its Keeper multi() and the
+        /// local rename-into-place, before applying authoritative locations below: this
+        /// replica's own leftover temp directory (still real, still listed -- the disk's
+        /// in-memory tree is freshly built from an actual listing at this point in server
+        /// startup) is renamed to its final path first, so the authoritative mapping applied
+        /// next describes a directory that genuinely exists at that path rather than one whose
+        /// only physical copy still sits under a temp name the startup temp-cleanup below is
+        /// about to delete.
+        auto own_temp_dirs_by_token = findOwnTempDirectoriesByToken();
+
+        /// Apply every active part's Keeper-committed location as an authoritative mapping
+        /// before loadDataParts() runs, so it (and the NO_SUCH_DATA_PART check below) resolve
+        /// each expected part directly instead of depending on this replica's object storage
+        /// listing cache having caught up with what another replica committed moments ago
+        /// (e.g. a RESTORE landing on one replica just before this replica's own CREATE/ATTACH
+        /// runs). One-time startup cost, not a hot path.
+        for (const auto & name : active_names)
+        {
+            String payload;
+            if (!zk->tryGet(coordination.partPath(name), payload))
+                continue; /// dropped between loadActivePartNames() and here; not our problem to load
+            ReadBufferFromString payload_buf(payload);
+            ReplicatedMergeTreePartHeader header;
+            header.read(payload_buf);
+            const auto location = CloudPartLocation::read(payload_buf);
+
+            for (const auto & dir : location.directories)
+            {
+                if (auto it = own_temp_dirs_by_token.find(dir.remote_token); it != own_temp_dirs_by_token.end())
+                {
+                    auto final_path = std::filesystem::path(getRelativeDataPath()) / name;
+                    if (!dir.subpath.empty())
+                        final_path /= dir.subpath;
+                    if (!getStoragePolicy()->getDisks().front()->existsDirectory(final_path))
+                        getStoragePolicy()->getDisks().front()->moveDirectory(it->second, final_path);
+                }
+            }
+            applyPartLocationAuthority(name, location);
+        }
 
         loadDataParts(LoadingStrictnessLevel::FORCE_RESTORE <= mode, expected_parts);
 
@@ -331,7 +364,101 @@ zkutil::ZooKeeperPtr StorageCloudMergeTree::getZooKeeper() const
 
 String StorageCloudMergeTree::serializePartHeader(const DataPartPtr & part) const
 {
-    return ReplicatedMergeTreePartHeader::fromColumnsAndChecksums(part->getColumns(), part->checksums).toString();
+    /// Header (columns hash + checksums) followed by the part's physical location on the
+    /// shared disk (see CloudPartLocation): the location travels in the same znode -- and so
+    /// through the same atomic multi() -- as the part's registration, making Keeper the
+    /// authority for name -> bytes resolution on every replica.
+    WriteBufferFromOwnString out;
+    writeString(ReplicatedMergeTreePartHeader::fromColumnsAndChecksums(part->getColumns(), part->checksums).toString(), out);
+    CloudPartLocation::capture(*part).write(out);
+    return out.str();
+}
+
+void StorageCloudMergeTree::applyPartLocationAuthority(const String & part_name, const CloudPartLocation & location) const
+{
+    /// Registers the part's directories (root + projections) as authoritative mappings on the
+    /// shared disk -- see IMetadataStorage::setAuthoritativeDirectory. Takes effect
+    /// immediately and survives listing-based reloads; MUST be withdrawn via
+    /// removePartLocationAuthority once the part leaves this replica's working set.
+    auto disks = getStoragePolicy()->getDisks();
+    const auto & disk = disks.front();
+    for (const auto & dir : location.directories)
+    {
+        auto path = std::filesystem::path(getRelativeDataPath()) / part_name;
+        if (!dir.subpath.empty())
+            path /= dir.subpath;
+        std::unordered_map<String, uint64_t> files(dir.files_with_sizes.begin(), dir.files_with_sizes.end());
+        disk->setAuthoritativeDirectory(path, dir.remote_token, files);
+    }
+}
+
+void StorageCloudMergeTree::setPartDirectoryAuthority(const DataPartPtr & part) const
+{
+    /// Writer-side registration, recomputed from the live part (post-rename paths). The
+    /// writer's own in-memory tree entry is exactly as evictable by a listing-gap reload as
+    /// any adopter's, so every path that makes a part Active locally calls this.
+    applyPartLocationAuthority(part->name, CloudPartLocation::capture(*part));
+}
+
+void StorageCloudMergeTree::removePartLocationAuthority(const DataPartPtr & part) const
+{
+    auto disks = getStoragePolicy()->getDisks();
+    const auto & disk = disks.front();
+    const auto base = std::filesystem::path(getRelativeDataPath()) / part->name;
+    disk->removeAuthoritativeDirectory(base);
+    for (const auto & [projection_name, _] : part->getProjectionParts())
+        disk->removeAuthoritativeDirectory(base / (projection_name + ".proj"));
+}
+
+std::unordered_map<String, String> StorageCloudMergeTree::findOwnTempDirectoriesByToken() const
+{
+    std::unordered_map<String, String> result;
+    auto disks = getStoragePolicy()->getDisks();
+    const auto & disk = disks.front();
+    const auto data_path = getRelativeDataPath();
+    if (!disk->existsDirectory(data_path))
+        return result;
+
+    const std::string replica_infix = getTempPartDirectoryInfix();
+    const std::array<std::string, 4> prefixes{
+        "tmp_insert_" + replica_infix, "tmp_merge_" + replica_infix,
+        "tmp_mut_" + replica_infix, "tmp_empty_" + replica_infix};
+
+    for (auto it = disk->iterateDirectory(data_path); it->isValid(); it->next())
+    {
+        const auto & name = it->name();
+        if (std::none_of(prefixes.begin(), prefixes.end(), [&](const auto & prefix) { return name.starts_with(prefix); }))
+            continue;
+
+        const auto dir_path = std::filesystem::path(data_path) / name;
+        /// A temp directory not yet far enough along to have checksums.txt can't be the
+        /// leftover of a part this replica has already committed to Keeper (checksums.txt is
+        /// written before the commit that would register a token in a znode) -- irrelevant to
+        /// reconciliation either way.
+        auto objects = disk->getStorageObjectsIfExist(dir_path / "checksums.txt");
+        if (!objects || objects->empty())
+            continue;
+
+        auto token = std::filesystem::path(objects->front().remote_path).parent_path().filename().string();
+        if (!token.empty())
+            result.emplace(std::move(token), dir_path.string());
+    }
+    return result;
+}
+
+void StorageCloudMergeTree::removeLocationAuthorityByLocation(const String & part_name, const CloudPartLocation & location) const
+{
+    /// Counterpart of applyPartLocationAuthority for callers holding a parsed location but no
+    /// part object (failed adoption attempts, the tombstone GC).
+    auto disks = getStoragePolicy()->getDisks();
+    const auto & disk = disks.front();
+    for (const auto & dir : location.directories)
+    {
+        auto path = std::filesystem::path(getRelativeDataPath()) / part_name;
+        if (!dir.subpath.empty())
+            path /= dir.subpath;
+        disk->removeAuthoritativeDirectory(path);
+    }
 }
 
 StorageCloudMergeTree::MutableDataPartPtr StorageCloudMergeTree::buildPartFromDisk(const String & name)
@@ -388,6 +515,23 @@ StorageCloudMergeTree::MutableDataPartPtr StorageCloudMergeTree::buildPartFromDi
     return part;
 }
 
+void StorageCloudMergeTree::removePartsFinallyAndForget(const DataPartsVector & parts)
+{
+    /// Withdraw the location authority strictly before the physical forget: once a part
+    /// leaves this replica's working set, the knowledge that justified the authoritative
+    /// mapping -- the part's membership in the Keeper part set as seen by this replica -- is
+    /// gone, and the mapping must not keep the directory alive against a listing that reports
+    /// it deleted. Deletions performed by OTHER replicas (GC of tombstoned parts, DROP on
+    /// another node) reach this replica only through the listing -- exactly the channel the
+    /// authority overrides -- so an authority that outlives the part turns them into permanent
+    /// zombie tree entries (reproduced with the predecessor pin mechanism: NoSuchKey on parts
+    /// another replica had legitimately GC'd). Every removePartsFinally() in this engine must
+    /// go through here.
+    for (const auto & part : parts)
+        removePartLocationAuthority(part);
+    removePartsFinally(parts);
+}
+
 DataPartsVector StorageCloudMergeTree::admitPartLocally(MutableDataPartPtr part, DataPartsLock & lock)
 {
     Transaction transaction(*this, nullptr);
@@ -432,7 +576,25 @@ void StorageCloudMergeTree::startup()
         return;
 
     clearEmptyParts();
-    clearOldTemporaryDirectories(0, {"tmp_", "delete_tmp_", "tmp-fetch_"});
+
+    /// Only this replica's own temporary directories: the disk namespace is shared, and the
+    /// generic "tmp_" prefix would delete ANOTHER replica's in-flight insert/merge/mutation
+    /// temp directories whenever a replica (re)starts while its peers are writing. Every temp
+    /// name this engine creates embeds the replica's own marker (see getTempPartDirectoryInfix
+    /// and getPostfixForTempInsertName), so scoping the cleanup to it is exact. Orphans left by
+    /// a replica that never comes back are bounded garbage under names no live replica ever
+    /// reclaims -- acceptable until the GC learns to collect them.
+    const std::string replica_infix = getTempPartDirectoryInfix();
+    clearOldTemporaryDirectories(0, {
+        "tmp_insert_" + replica_infix,
+        "tmp_merge_" + replica_infix,
+        "tmp_mut_" + replica_infix,
+        "tmp_empty_" + replica_infix});
+
+    /// Re-assert every Active part's location authority from the live part objects (covers
+    /// ATTACH TABLE and restarts uniformly; idempotent with the constructor's overlay).
+    for (const auto & part : getDataPartsVectorForInternalUsage())
+        setPartDirectoryAuthority(part);
 
     part_set_updating_task->activateAndSchedule();
     parts_killer_task->activateAndSchedule();
@@ -475,6 +637,16 @@ void StorageCloudMergeTree::shutdown(bool)
             }
         }
     }
+
+    /// Withdraw this replica's location authority for every part it still knows about: the
+    /// authoritative mapping lives on the shared disk's metadata storage, which outlives this
+    /// table object (DETACH TABLE keeps the disk attached to the server) -- an authority left
+    /// behind for a part that another replica later GCs would resurface as the same zombie
+    /// tree entry the authority mechanism exists to prevent (see removePartsFinallyAndForget's
+    /// doc comment).
+    if (!isStaticStorage())
+        for (const auto & part : getDataPartsVectorForInternalUsage())
+            removePartLocationAuthority(part);
 
     background_operations_assignee.finish();
 
@@ -521,8 +693,12 @@ void StorageCloudMergeTree::ensureSequentialConsistency(const Settings & setting
     /// side effect, but is logically const from every caller's point of view -- "give me a
     /// consistent view" -- matching totalRows()/totalBytes()'s inherited const IStorage
     /// signatures, which can't be changed.
-    static constexpr size_t max_attempts = 3;
     static constexpr UInt64 retry_delay_ms = 1100; // just over disk->refresh()'s own 1000ms throttle window
+    /// Sized against updatePartSetFromKeeper()'s only remaining wait: the backend's listing
+    /// catching up (its old time-based settling window is gone -- adoption is gated on the exact
+    /// Keeper-header completeness check now, which passes the moment the listing shows the whole
+    /// part). Three refresh-spaced attempts bound that at ~3 listing round-trips.
+    static constexpr size_t max_attempts = 3;
     for (size_t attempt = 0; attempt < max_attempts && current_parts_version.load() < target_version; ++attempt)
     {
         if (attempt > 0)
@@ -550,8 +726,15 @@ void StorageCloudMergeTree::read(
 {
     ensureSequentialConsistency(local_context->getSettingsRef());
 
-    /// Phase 0: the local read path only. Sparse primary index, skip indexes, projections and
-    /// FINAL all come for free from the shared MergeTree read machinery.
+    /// Fan-out across the cluster (parallel_replicas) is decided and built by Planner/ClusterProxy
+    /// above this call under the analyzer (the default query pipeline), not by this function --
+    /// see PlannerJoinTree.cpp's parallelReplicasEnabledForStorage()/canUseParallelReplicasOnInitiator()
+    /// dispatch, which calls this read() first to build the local plan it then wraps/replaces. This
+    /// function's only responsibility toward that mechanism is the follower side: when a replica is
+    /// invoked to serve its assigned partition-range fragment as part of someone else's fan-out,
+    /// canUseParallelReplicasOnFollower() reports that, and MergeTreeDataSelectExecutor::read() needs
+    /// to know to only read its assigned range rather than the whole local part set. Mirrors
+    /// StorageReplicatedMergeTree::readLocalImpl()'s identical use of the same call.
     QueryPlanPtr plan = MergeTreeDataSelectExecutor(*this).read(
         column_names,
         storage_snapshot,
@@ -560,7 +743,7 @@ void StorageCloudMergeTree::read(
         max_block_size,
         num_streams,
         local_context->getPartitionIdToMaxBlock(getStorageID().uuid),
-        /*enable_parallel_reading=*/ false);
+        local_context->canUseParallelReplicasOnFollower());
 
     if (plan)
         query_plan = std::move(*plan);
@@ -660,6 +843,7 @@ bool StorageCloudMergeTree::commitInsertedPart(MutableDataPartPtr & part, const 
 
         /// Only now reflect it in this replica's in-memory cache.
         renameTempPartAndAdd(part, transaction, lock, /*rename_in_transaction=*/ false);
+        setPartDirectoryAuthority(part);
         covered_parts = transaction.commit(lock);
         for (const auto & covered : covered_parts)
             modifyPartState(covered, DataPartState::Deleting, lock);
@@ -671,7 +855,7 @@ bool StorageCloudMergeTree::commitInsertedPart(MutableDataPartPtr & part, const 
     /// (a fresh part covering something existing is an edge case, not the common path), but handled
     /// uniformly with commitMergedPart()/admitPartLocally()'s callers for the same reason.
     if (!covered_parts.empty())
-        removePartsFinally(covered_parts);
+        removePartsFinallyAndForget(covered_parts);
     return true;
 }
 
@@ -711,13 +895,55 @@ bool StorageCloudMergeTree::commitMergedPart(
 
     coordination.releaseLease(zk, lease_path, lease_version); /// best-effort; we won, safe to release now
 
-    /// No outer lockParts() here: renameTempPartAndReplace()/Transaction::commit() each acquire
-    /// their own lock internally, same as MergeTreeDataMergerMutator::renameMergedTemporaryPart()
-    /// does for the ordinary (non-Cloud) merge path. Wrapping them in an extra lockParts() would
-    /// self-deadlock, the same trap fixed in updatePartSetFromKeeper() earlier.
+    /// Self-notification: our own tryCommitMerge() write above can fire this replica's watcher
+    /// (updatePartSetFromKeeper()) before this thread gets here, and -- since adoption now
+    /// resolves directly from the Keeper-committed location instead of waiting out a listing
+    /// refresh -- the watcher can win and admit new_part->name under its own DataPartPtr well
+    /// before this thread's own renameTempPartAndReplace() below gets a turn at lockParts().
+    /// checkPartDuplicate() has no tolerance for that: it throws DUPLICATE_DATA_PART, uncaught,
+    /// killing this background task (reproduced: MergeTreeBackgroundExecutor logging exactly
+    /// that exception moments after the watcher's own "Removing N parts from memory" for these
+    /// same sources). Detected and treated as success here, the same way tryReattachPart()'s
+    /// caller already tolerates the identical race for ATTACH: the data is already correctly
+    /// admitted, under the very location this thread itself captured and committed to Keeper
+    /// (serializePartHeader() above ran before tryCommitMerge(), so the winner's token IS
+    /// new_part's own token) -- there is nothing left to rename or admit. new_part must NOT be
+    /// removeIfNeeded()'d in this case: its still-temp-named directory and the watcher's
+    /// now-Active part share that same token's real objects, and removeIfNeeded() would delete
+    /// them out from under the replica that just adopted them. It is simply abandoned in
+    /// memory; its now-orphaned temp-path directory metadata alias (the underlying objects stay
+    /// referenced, and thus alive, under the final name) is a small, bounded, one-time leak
+    /// specific to this race, not a matched cleanup this function is positioned to perform.
+    {
+        auto lock = lockParts();
+        if (getPartIfExistsUnlocked(new_part->name, {DataPartState::Active}, lock))
+        {
+            /// Matches what preparePartForCommit() (skipped below in this branch) would have
+            /// set: is_temp is the flag every later cleanup path (crucially MergeTask::cancel(),
+            /// called unconditionally during normal task teardown, expecting a no-op here) uses
+            /// to decide whether removeIfNeeded() is a safe no-op or a real delete. Leaving it
+            /// true is what actually caused the data loss on the first version of this fix --
+            /// reproduced end-to-end: cancel() -> removeIfNeeded() deleted new_part's
+            /// still-temp-named directory, which shares its token (and therefore its real
+            /// objects) with the watcher-adopted Active part now serving queries under the
+            /// final name.
+            new_part->is_temp = false;
+            LOG_DEBUG(getLogger("StorageCloudMergeTree"),
+                "Part {} was already admitted locally (self-notification raced ahead of this commit); nothing left to do", new_part->name);
+            return true;
+        }
+    }
+
+    /// No outer lockParts() here beyond the check above: renameTempPartAndReplace()/
+    /// Transaction::commit() each acquire their own lock internally, same as
+    /// MergeTreeDataMergerMutator::renameMergedTemporaryPart() does for the ordinary
+    /// (non-Cloud) merge path. Wrapping them in an extra held-open lockParts() would
+    /// self-deadlock, the same trap fixed in updatePartSetFromKeeper() earlier -- the race
+    /// above is inherent to that gap, not something closing it here would fix.
     Transaction transaction(*this, nullptr);
     renameTempPartAndReplace(new_part, transaction, /*rename_in_transaction=*/ true);
     transaction.renameParts();
+    setPartDirectoryAuthority(new_part);
     DataPartsVector covered_parts = transaction.commit();
 
     /// See admitPartLocally()'s doc comment: a source part covered by this merge/mutation result
@@ -732,14 +958,27 @@ bool StorageCloudMergeTree::commitMergedPart(
             for (const auto & covered : covered_parts)
                 modifyPartState(covered, DataPartState::Deleting, lock);
         }
-        removePartsFinally(covered_parts);
+        removePartsFinallyAndForget(covered_parts);
     }
     return true;
 }
 
+std::string StorageCloudMergeTree::getTempPartDirectoryInfix() const
+{
+    /// Replica-scoped temporary namespace on the shared disk -- see the base declaration's doc
+    /// comment. The hostname is stable across restarts (StatefulSet-style deployments give each
+    /// replica a stable name), so per-replica leftover reclaim by deterministic name keeps
+    /// working, while two replicas racing to build the same merge/mutation result can never
+    /// contend for one shared temporary directory.
+    return escapeForFileName(getFQDNOrHostName()) + "_";
+}
+
 std::string StorageCloudMergeTree::getPostfixForTempInsertName() const
 {
-    return toString(UUIDHelpers::generateV4());
+    /// Hostname first for the same replica-scoping reason as getTempPartDirectoryInfix (and so
+    /// startup()'s leftover cleanup can match this replica's own insert temp dirs by prefix);
+    /// the UUID part makes every attempt unique, as before.
+    return escapeForFileName(getFQDNOrHostName()) + "_" + toString(UUIDHelpers::generateV4());
 }
 
 std::optional<UInt64> StorageCloudMergeTree::totalRows(ContextPtr local_context) const
@@ -1777,7 +2016,7 @@ size_t StorageCloudMergeTree::removeActivePartsMatching(const std::function<bool
             }
         }
         if (!to_remove.empty())
-            removePartsFinally(to_remove);
+            removePartsFinallyAndForget(to_remove);
 
         return matched.size();
     }
@@ -1844,7 +2083,7 @@ size_t StorageCloudMergeTree::detachActivePartsMatching(const std::function<bool
             }
         }
         if (!to_remove.empty())
-            removePartsFinally(to_remove);
+            removePartsFinallyAndForget(to_remove);
 
         return matched.size();
     }
@@ -1928,6 +2167,19 @@ PartitionCommandsResultInfo StorageCloudMergeTree::attachPartition(
     PartitionCommandsResultInfo results;
     for (const auto & name : candidates)
     {
+        /// The detached marker's payload is "<ms>\n<location trailer>" (see
+        /// CloudMergeTreeCoordination::tryDetachParts / buildRemovalPayload): apply it as an
+        /// authoritative mapping before building the part, so this replica resolves the
+        /// detached directory (root + projections) from Keeper instead of depending on its own
+        /// object storage listing having ever observed it -- the part may have been detached by
+        /// a DIFFERENT replica, on a shared disk this replica has otherwise never looked at.
+        String detached_payload;
+        if (zk->tryGet(coordination.detachedPartPath(name), detached_payload) && !detached_payload.empty())
+        {
+            ReadBufferFromString location_buf(CloudPartLocation::extractTrailerText(detached_payload));
+            applyPartLocationAuthority(name, CloudPartLocation::read(location_buf));
+        }
+
         auto part = buildPartFromDisk(name);
         if (!part)
             throw Exception(ErrorCodes::NO_SUCH_DATA_PART,
@@ -1957,6 +2209,7 @@ PartitionCommandsResultInfo StorageCloudMergeTree::attachPartition(
             /// part already won, which is success, not an error, for this call too.
             if (!getPartIfExistsUnlocked(name, {DataPartState::Active}, lock))
             {
+                setPartDirectoryAuthority(part);
                 covered_parts = admitPartLocally(part, lock);
                 for (const auto & covered : covered_parts)
                     modifyPartState(covered, DataPartState::Deleting, lock);
@@ -1967,7 +2220,7 @@ PartitionCommandsResultInfo StorageCloudMergeTree::attachPartition(
         /// above releases this one) rather than leaving it as a timer-based Outdated entry nothing
         /// would ever clean up.
         if (!covered_parts.empty())
-            removePartsFinally(covered_parts);
+            removePartsFinallyAndForget(covered_parts);
 
         results.push_back(PartitionCommandResultInfo{
             .command_type = command.part ? "ATTACH PART" : "ATTACH PARTITION",
@@ -2094,15 +2347,30 @@ void StorageCloudMergeTree::replacePartitionFrom(const StoragePtr & source_table
         if (code != Coordination::Error::ZOK)
             throw zkutil::KeeperException(code, "Cannot commit REPLACE/ATTACH PARTITION in Keeper for table {}", getStorageID().getNameForLogs());
 
-        /// Keeper-first, then the local rename+admit -- other replicas' adoption watchers correctly
-        /// retry until the physical rename below becomes visible, same contract every other commit
-        /// in this engine already relies on (buildPartFromDisk()'s existsDirectory() pre-check).
+        /// Keeper-first, then the local rename+admit. Note this thread's OWN watcher can race in
+        /// here via self-notification and adopt one of new_parts_with_headers's names before
+        /// this loop's own renameTempPartAndAdd() gets a turn at the lock below (see
+        /// commitMergedPart()'s identical race, reproduced and fixed there first) -- tolerated
+        /// per-part the same way.
         Transaction transaction(*this, nullptr);
         DataPartsVector covered_parts;
         {
             auto lock = lockParts();
             for (auto & part : new_parts)
+            {
+                if (getPartIfExistsUnlocked(part->name, {DataPartState::Active}, lock))
+                {
+                    /// See commitMergedPart()'s identical branch for why is_temp must be
+                    /// cleared here too: it is the flag every later cleanup path relies on to
+                    /// treat removeIfNeeded() as a no-op once a part is genuinely admitted.
+                    part->is_temp = false;
+                    LOG_DEBUG(getLogger("StorageCloudMergeTree"),
+                        "Part {} was already admitted locally (self-notification raced ahead of this commit); skipping", part->name);
+                    continue;
+                }
                 renameTempPartAndAdd(part, transaction, lock, /*rename_in_transaction=*/ false);
+                setPartDirectoryAuthority(part);
+            }
             covered_parts = transaction.commit(lock);
             for (const auto & covered : covered_parts)
                 modifyPartState(covered, DataPartState::Deleting, lock);
@@ -2126,7 +2394,7 @@ void StorageCloudMergeTree::replacePartitionFrom(const StoragePtr & source_table
             }
         }
         if (!covered_parts.empty())
-            removePartsFinally(covered_parts);
+            removePartsFinallyAndForget(covered_parts);
 
         /// Only for REPLACE (which discards this partition's prior content), not plain ATTACH ...
         /// FROM (which only adds alongside it) -- same reasoning as dropPartition()'s identical
@@ -2261,10 +2529,18 @@ void StorageCloudMergeTree::movePartitionToTable(const StoragePtr & dest_table, 
 
         const String tombstone_ts = toString(static_cast<Int64>(std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count()));
-        for (const auto & name : old_part_names_to_remove)
+        /// Same "<ms>\n<location trailer>" tombstone shape every other removal path writes (see
+        /// buildRemovalPayload() in CloudMergeTreeCoordination.cpp) -- captured directly from the
+        /// in-hand src_parts rather than round-tripping through Keeper, since this function
+        /// already holds the exact DataPartPtr objects being moved.
+        for (const auto & src_part : src_parts)
         {
-            ops.emplace_back(zkutil::makeRemoveRequest(coordination.partPath(name), -1));
-            ops.emplace_back(zkutil::makeCreateRequest(coordination.droppedPartPath(name), tombstone_ts, zkutil::CreateMode::Persistent));
+            WriteBufferFromOwnString tombstone_payload;
+            writeString(tombstone_ts, tombstone_payload);
+            writeChar('\n', tombstone_payload);
+            CloudPartLocation::capture(*src_part).write(tombstone_payload);
+            ops.emplace_back(zkutil::makeRemoveRequest(coordination.partPath(src_part->name), -1));
+            ops.emplace_back(zkutil::makeCreateRequest(coordination.droppedPartPath(src_part->name), tombstone_payload.str(), zkutil::CreateMode::Persistent));
         }
 
         Coordination::Responses responses;
@@ -2275,19 +2551,34 @@ void StorageCloudMergeTree::movePartitionToTable(const StoragePtr & dest_table, 
             throw zkutil::KeeperException(code, "Cannot commit MOVE PARTITION in Keeper between table {} and {}",
                 getStorageID().getNameForLogs(), dest_storage->getStorageID().getNameForLogs());
 
-        /// Admit the new parts on the destination.
+        /// Admit the new parts on the destination. Same self-notification race as
+        /// commitMergedPart()/tryReplacePartition()'s admit loop -- the destination table's own
+        /// watcher can adopt one of these names before this loop gets a turn at dest_lock;
+        /// tolerated identically.
         Transaction dest_transaction(*dest_storage, nullptr);
         DataPartsVector dest_covered_parts;
         {
             auto dest_lock = dest_storage->lockParts();
             for (auto & part : new_parts)
+            {
+                if (dest_storage->getPartIfExistsUnlocked(part->name, {DataPartState::Active}, dest_lock))
+                {
+                    /// See commitMergedPart()'s identical branch for why is_temp must be
+                    /// cleared here too.
+                    part->is_temp = false;
+                    LOG_DEBUG(getLogger("StorageCloudMergeTree"),
+                        "Part {} was already admitted locally on the destination (self-notification raced ahead); skipping", part->name);
+                    continue;
+                }
                 dest_storage->renameTempPartAndAdd(part, dest_transaction, dest_lock, /*rename_in_transaction=*/ false);
+                dest_storage->setPartDirectoryAuthority(part);
+            }
             dest_covered_parts = dest_transaction.commit(dest_lock);
             for (const auto & covered : dest_covered_parts)
                 dest_storage->modifyPartState(covered, DataPartState::Deleting, dest_lock);
         }
         if (!dest_covered_parts.empty())
-            dest_storage->removePartsFinally(dest_covered_parts);
+            dest_storage->removePartsFinallyAndForget(dest_covered_parts);
 
         /// Evict the moved-away parts on the source (self).
         DataPartsVector src_to_remove;
@@ -2307,7 +2598,7 @@ void StorageCloudMergeTree::movePartitionToTable(const StoragePtr & dest_table, 
             }
         }
         if (!src_to_remove.empty())
-            removePartsFinally(src_to_remove);
+            removePartsFinallyAndForget(src_to_remove);
         return;
     }
 
@@ -2419,16 +2710,6 @@ try
 
     std::unordered_set<std::string> active_set(active_names.begin(), active_names.end());
 
-    /// Bound pending_adoption_first_seen_ms: a name whose settling window never completes
-    /// because it dropped out of Keeper's active set first (superseded by a merge/mutation
-    /// before this replica got around to it, or a genuine DROP/TRUNCATE) would otherwise sit
-    /// there forever -- it can never be seen again, so its entry is dead the moment it's no
-    /// longer in active_set.
-    {
-        std::lock_guard settle_lock(pending_adoption_mutex);
-        std::erase_if(pending_adoption_first_seen_ms, [&](const auto & entry) { return !active_set.contains(entry.first); });
-    }
-
     /// Parts no longer active in Keeper are only removed from the local working set after the
     /// adoption loop below has confirmed every currently-active part is present locally (see
     /// all_adopted) -- not upfront. A part superseded by a merge is atomically replaced by its
@@ -2441,44 +2722,66 @@ try
     for (const auto & part : known)
         known_names.insert(part->name);
 
-    auto disks = getStoragePolicy()->getDisks();
-    const auto & disk = disks.front();
-
-    /// Try to build and admit one adopted part. Returns false (instead of throwing) for the
-    /// "not visible on this disk's in-memory listing yet" case specifically, so the caller can
-    /// refresh and retry without losing track of every *other* name still pending in this batch.
-    /// Another replica registered this part in Keeper and wrote it to the shared disk;
-    /// buildPartFromDisk() builds the part object from the on-disk directory (already named
-    /// exactly `name`, no rename needed) and admitPartLocally() adds it to the active set.
-    ///
-    /// A part passing buildPartFromDisk()'s own checks is not proof it will still be readable a
-    /// moment later: plain_rewritable's in-memory tree is refreshed via a full listing-based
-    /// clobber-and-rebuild (see disk->refresh() below), and that listing pass can itself
-    /// momentarily miss an object the underlying S3-compatible backend (any of them -- this
-    /// can't be assumed away as an AWS-S3-specific quirk) hasn't fully propagated yet. Reproduced
-    /// end-to-end: a part that passed every adoption check here, and stayed queryable for a
-    /// while, later threw a raw FILE_DOESNT_EXIST on a real SELECT from a second replica --
-    /// proof the regression can happen well after a clean adoption, not just during it, so no
-    /// amount of checking harder *at this one moment* closes it. Requiring the SAME part to
-    /// independently pass this same check again on a LATER cycle, spaced past disk->refresh()'s
-    /// own 1000ms throttle, gives a transient listing gap time to resolve before this replica
-    /// ever exposes the part to a real query -- see pending_adoption_first_seen_ms's own doc
-    /// comment in the header.
-    static constexpr UInt64 settling_window_ms = 1100; // just over disk->refresh()'s own 1000ms throttle window
+    /// Adopt one part committed by another replica. Keeper is the authority for everything:
+    /// the znode payload -- written atomically with the part's registration -- carries the
+    /// header (columns hash + checksums) AND the part's physical location on the shared disk
+    /// (directory tokens + complete file lists; see CloudPartLocation). Adoption therefore
+    /// never waits on the object storage listing: the location is applied as an authoritative
+    /// mapping to the disk's in-memory tree, the part is built through it with
+    /// strongly-consistent GETs, verified against the header checksums end-to-end, and
+    /// admitted. Returns false (instead of throwing) for transient conditions -- znode gone
+    /// mid-cycle, objects not yet readable -- so the caller retries without losing track of
+    /// every other name in this batch.
     auto try_adopt_part = [&](const String & name) -> bool
     {
+        String payload;
+        if (!zk->tryGet(coordination.partPath(name), payload))
+        {
+            /// The part vanished from Keeper between loadActivePartNames() and here (merged
+            /// away or dropped by another replica mid-cycle) -- don't adopt a part that's no
+            /// longer canonical; the next cycle's active set simply won't include it.
+            LOG_DEBUG(getLogger("StorageCloudMergeTree"), "updatePartSetFromKeeper: part {} disappeared from Keeper mid-cycle", name);
+            return false;
+        }
+
+        ReadBufferFromString payload_buf(payload);
+        ReplicatedMergeTreePartHeader header;
+        header.read(payload_buf);
+        const auto location = CloudPartLocation::read(payload_buf);
+
+        /// Authoritative mapping first: after this, the directory resolves in the in-memory
+        /// tree regardless of what the backend's listing does or doesn't show, and can never
+        /// be evicted by a transiently-incomplete listing later (the failure mode that used to
+        /// surface as FILE_DOESNT_EXIST on a long-adopted part). Withdrawn by
+        /// removePartsFinallyAndForget when the part leaves the working set, or below on a
+        /// failed attempt.
+        applyPartLocationAuthority(name, location);
+
         auto part = buildPartFromDisk(name);
         if (!part)
-            return false;
-
-        const UInt64 now_ms = static_cast<UInt64>(std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count());
         {
-            std::lock_guard settle_lock(pending_adoption_mutex);
-            auto [it, first_observation] = pending_adoption_first_seen_ms.try_emplace(name, now_ms);
-            if (first_observation || now_ms - it->second < settling_window_ms)
-                return false;
-            pending_adoption_first_seen_ms.erase(it);
+            /// With the location applied this can only be a genuinely broken build (the
+            /// directory itself always resolves); withdraw the authority so a part that never
+            /// admits doesn't leave a mapping behind, and retry next cycle.
+            removeLocationAuthorityByLocation(name, location);
+            LOG_DEBUG(getLogger("StorageCloudMergeTree"), "updatePartSetFromKeeper: part {} could not be built from its Keeper location; will retry", name);
+            return false;
+        }
+
+        /// End-to-end verification: what was actually read back from object storage through
+        /// the authoritative mapping must match the checksums committed with the part.
+        try
+        {
+            header.getChecksums().checkEqual(
+                part->checksums, /*check_uncompressed_hash_in_compressed_files=*/ false, name);
+        }
+        catch (const Exception & e)
+        {
+            removeLocationAuthorityByLocation(name, location);
+            LOG_DEBUG(getLogger("StorageCloudMergeTree"),
+                "updatePartSetFromKeeper: part {} read back from its Keeper location does not match its header ({}); will retry",
+                name, e.message());
+            return false;
         }
 
         /// See admitPartLocally()'s doc comment: any part this adoption covers/supersedes goes
@@ -2496,36 +2799,24 @@ try
     /// whole in-memory directory tree on every watch trigger, only refresh reactively, once, right
     /// when a specific part turns out to be missing -- a resync a moment later is harmless, a
     /// proactive refresh on every trigger is wasted work most of the time.
-    ///
-    /// This used to be able to race destructively against this same process's own concurrent
-    /// INSERT/merge temp-directory writes: disk->refresh() is a full clobber-and-rebuild from one
-    /// remote-listing snapshot, and a temp directory created after that snapshot's listing started
-    /// (but before it finished) wasn't in it yet, so refresh() would evict it from the cache as if
-    /// it had been deleted, corrupting that unrelated write's later rename-to-final-name step
-    /// ("Directory ... does not exist"). Reproduced independently on plain MergeTree via SYSTEM
-    /// RESTART DISK racing a concurrent INSERT -- a core plain_rewritable bug, not
-    /// CloudMergeTree-specific. Confirmed fixed upstream as of the 2026-08 rebase onto
-    /// upstream/master: MetadataStorageFromPlainRewritableObjectStorageTransaction::commit() and
-    /// refresh()/load() now share metadata_mutex for the whole operation, fully serializing refresh
-    /// against every commit, so this call is safe as-is.
+    /// No listing-based retry: try_adopt_part() resolves each part directly from its
+    /// Keeper-committed location (strongly-consistent GETs), so a false negative here means
+    /// either a genuinely torn write (objects not readable yet -- rare, resolves itself) or a
+    /// real problem with the part, not an eventually-consistent listing catching up.
     bool all_adopted = true;
     for (const auto & name : active_names)
     {
         if (known_names.contains(name))
             continue;
 
-        if (try_adopt_part(name))
-            continue;
-
-        disk->refresh(1000);
         if (!try_adopt_part(name))
         {
-            /// Still not visible (or genuinely broken) -- leave it out of known_names/this
-            /// replica's working set for now and retry on the next cycle rather than crash the
-            /// whole reconciliation over one part; the others in this batch already succeeded.
+            /// Leave it out of known_names/this replica's working set for now and retry on the
+            /// next cycle rather than crash the whole reconciliation over one part; the others
+            /// in this batch already succeeded.
             all_adopted = false;
             LOG_DEBUG(getLogger("StorageCloudMergeTree"),
-                "Part {} is active in Keeper but not yet adoptable from the shared disk; will retry", name);
+                "Part {} is active in Keeper but could not be adopted; will retry", name);
         }
     }
 
@@ -2566,10 +2857,16 @@ try
         current_parts_version.store(new_version);
     }
     else
+    {
+        /// A part is active in Keeper but couldn't be adopted -- its objects are not readable
+        /// yet (a torn write on the backend, resolving itself shortly) or genuinely broken.
+        /// No sharper deadline is knowable from here; retry at the same cadence as every other
+        /// polling interval in this function.
         part_set_updating_task->scheduleAfter(1000);
     }
+    }
     if (!to_remove.empty())
-        removePartsFinally(to_remove);
+        removePartsFinallyAndForget(to_remove);
 }
 catch (const Coordination::Exception & e)
 {
@@ -2607,14 +2904,35 @@ try
         if (zk->exists(coordination.leasePath(tombstone.part_name)))
             continue;
 
+        if (tombstone.location_text.empty())
+        {
+            /// A tombstone written before Keeper-authoritative locations existed -- not expected
+            /// in a clean-slate deployment (such a table must be recreated). Never delete
+            /// through an unresolvable name: skip and let an operator notice the log line
+            /// rather than silently leaking the object or, worse, guessing wrong.
+            LOG_ERROR(getLogger("StorageCloudMergeTree"),
+                "Tombstone for part {} has no location trailer; skipping physical deletion. "
+                "This table must be recreated to use Keeper-authoritative part locations.", tombstone.part_name);
+            continue;
+        }
+
         if (!coordination.tryClaimTombstoneForDeletion(zk, tombstone.part_name))
             continue; /// another replica's GC cycle claimed it first this round
 
         try
         {
+            ReadBufferFromString location_buf(tombstone.location_text);
+            const auto location = CloudPartLocation::read(location_buf);
+
+            /// Authoritative mapping first: physical deletion below must resolve every
+            /// directory (root + projections) by the token recorded at removal time, never by
+            /// re-listing the shared disk -- the exact class of misresolution the predecessor
+            /// listing-based GC could hit under a stale tree.
+            applyPartLocationAuthority(tombstone.part_name, location);
             auto part_path = std::filesystem::path(getRelativeDataPath()) / tombstone.part_name;
             if (disk->existsDirectory(part_path))
                 disk->removeRecursive(part_path);
+            removeLocationAuthorityByLocation(tombstone.part_name, location);
             coordination.releaseTombstone(zk, tombstone.part_name);
         }
         catch (...)

@@ -5,11 +5,14 @@
 #include <Storages/MergeTree/MergeTreeDataMergerMutator.h>
 #include <Storages/MergeTree/Compaction/PartProperties.h>
 #include <Storages/MergeTree/CloudMergeTree/CloudMergeTreeCoordination.h>
+#include <Storages/MergeTree/CloudMergeTree/CloudPartLocation.h>
 #include <Interpreters/InsertDeduplication.h>
 #include <Common/ZooKeeper/ZooKeeper.h>
 #include <Core/BackgroundSchedulePool.h>
 #include <expected>
 #include <functional>
+#include <mutex>
+#include <unordered_map>
 
 namespace DB
 {
@@ -103,6 +106,7 @@ public:
     /// makes every temp directory name globally unique regardless of what any replica's local
     /// counter says.
     std::string getPostfixForTempInsertName() const override;
+    std::string getTempPartDirectoryInfix() const override;
 
     /// The part-set coordinator and a freshly-resolved Keeper session. Used by the sink.
     const CloudMergeTreeCoordination & getCoordination() const { return coordination; }
@@ -254,6 +258,28 @@ private:
     /// this piggybacks on the existing task rather than adding a second one.
     BackgroundSchedulePoolTaskHolder part_set_updating_task;
     void updatePartSetFromKeeper();
+
+    /// Keeper-authoritative part locations (see CloudPartLocation): every path that makes a
+    /// part Active registers the part's directories (root + projections) as authoritative
+    /// mappings on the shared disk, so the in-memory tree resolves name -> bytes from
+    /// Keeper-committed knowledge instead of eventually-consistent listings.
+    void applyPartLocationAuthority(const String & part_name, const CloudPartLocation & location) const;
+    void setPartDirectoryAuthority(const DataPartPtr & part) const;
+    void removePartLocationAuthority(const DataPartPtr & part) const;
+    void removeLocationAuthorityByLocation(const String & part_name, const CloudPartLocation & location) const;
+
+    /// This replica's own in-flight temp directories (matching getTempPartDirectoryInfix's
+    /// marker), keyed by remote token -- see the constructor's call site: completing a commit
+    /// that crashed between the Keeper multi() and the local rename-into-place needs to find a
+    /// leftover temp directory by the token its Keeper-committed location names, not by a name
+    /// it can't reconstruct (insert temp names embed a random per-attempt uuid).
+    std::unordered_map<String, String> findOwnTempDirectoriesByToken() const;
+
+    /// The only allowed way to call removePartsFinally in this engine: withdraws each part's
+    /// location authority first, so it never outlives the part's membership in this replica's
+    /// working set (a surviving authority would turn another replica's legitimate deletion
+    /// into a permanent zombie directory entry -- see removePartsFinallyAndForget's body).
+    void removePartsFinallyAndForget(const DataPartsVector & parts);
 
     /// select_sequential_consistency support: if set in `settings`, synchronously catches this
     /// replica's local part-set cache up to Keeper's current version before read()/totalRows()/

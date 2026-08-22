@@ -1422,6 +1422,18 @@ public:
     /// FIXME: Currently unused.
     virtual std::string getPostfixForTempInsertName() const { return ""; }
 
+    /// Extra infix for merge/mutation/empty-part temporary directory names, inserted right
+    /// after the "tmp_merge_"/"tmp_mut_"/"tmp_empty_" prefix. Empty by default: on a disk
+    /// private to this server, the fully deterministic name is a feature -- an interrupted
+    /// operation's leftover directory is reclaimed by name (see claimTemporaryPartDirectory),
+    /// and TemporaryParts fails closed on a same-process duplicate. Engines whose replicas
+    /// share one disk namespace (CloudMergeTree on plain_rewritable object storage) return a
+    /// per-replica marker instead: two replicas racing to build the same result part must
+    /// never contend for one shared temporary directory (the loser's cleanup could otherwise
+    /// destroy the winner's files), while each replica still reclaims its own leftovers,
+    /// because its marker is stable across restarts.
+    virtual std::string getTempPartDirectoryInfix() const { return ""; }
+
     /// For generating names of temporary parts during insertion.
     SimpleIncrement insert_increment;
 

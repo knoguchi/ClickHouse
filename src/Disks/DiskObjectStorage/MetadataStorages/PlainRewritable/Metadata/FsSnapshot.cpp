@@ -191,6 +191,29 @@ void FsSnapshot::recordDirectoryPath(const std::string & path, DirectoryRemoteIn
     remote_layout_files_delta += info.files.size();
 }
 
+void FsSnapshot::overrideDirectory(const std::string & path, DirectoryRemoteInfo info)
+{
+    UniqueLock lock(mutex);
+    const auto normalized_path = normalizePath(path);
+
+    /// Upsert counterpart of recordDirectoryPath, for callers holding out-of-band authority
+    /// over a directory's remote info (see IMetadataStorage::setAuthoritativeDirectory): an
+    /// existing entry is replaced instead of throwing DIRECTORY_ALREADY_EXISTS.
+    if (hasFileOnPath(root, normalized_path))
+        throw Exception(ErrorCodes::CANNOT_CREATE_DIRECTORY, "There is a file on the path '{}', can't create a directory", normalized_path.string());
+
+    if (const auto node = walk(root, normalized_path); node && !isVirtual(node))
+    {
+        remote_layout_files_delta -= node->info->files.size();
+        remote_layout_directories_delta -= 1;
+    }
+
+    const size_t new_files_count = info.files.size();
+    root = updateInfo(root, normalized_path, info);
+    remote_layout_directories_delta += 1;
+    remote_layout_files_delta += new_files_count;
+}
+
 void FsSnapshot::moveDirectory(const std::string & from, const std::string & to)
 {
     UniqueLock lock(mutex);

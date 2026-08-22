@@ -50,6 +50,7 @@ namespace ErrorCodes
 namespace FailPoints
 {
     extern const char plain_rewritable_object_storage_azure_not_found_on_init[];
+    extern const char plain_rewritable_listing_returns_empty[];
 }
 
 namespace
@@ -247,9 +248,77 @@ void MetadataStorageFromPlainRewritableObjectStorage::load(bool is_initial_load,
 
     runner.waitForAllToFinishAndRethrowFirstError();
 
-    LOG_DEBUG(log, "Loaded metadata for {} directories", remote_layout.size());
-    fs.applyLayout(std::move(remote_layout));
+    /// Simulates the backend's transient list-after-write gap in its most extreme form (the
+    /// whole listing comes back empty) -- lets tests prove deterministically that pinned
+    /// directories survive it while everything else would be evicted.
+    fiu_do_on(FailPoints::plain_rewritable_listing_returns_empty, {
+        LOG_TEST(log, "Fault injection: dropping all {} listed directories", remote_layout.size() - 1);
+        std::erase_if(remote_layout, [](const auto & entry) { return !entry.first.empty(); });
+    });
+
+    /// Apply authoritative directory mappings (see IMetadataStorage::setAuthoritativeDirectory)
+    /// on top of whatever this listing pass produced -- union semantics live in applyLayout(),
+    /// decided via the tree's own canonical path walk, never raw path-string comparison. The
+    /// authoritative lock is held through applyLayout() -- see its declaration.
+    std::unique_lock authoritative_lock(authoritative_mutex);
+    std::vector<std::pair<std::string, DirectoryRemoteInfo>> authoritative_overrides(
+        authoritative_directories.begin(), authoritative_directories.end());
+
+    LOG_DEBUG(log, "Loaded metadata for {} directories ({} authoritative overrides)", remote_layout.size(), authoritative_overrides.size());
+    fs.applyLayout(std::move(remote_layout), authoritative_overrides);
     previous_refresh.restart();
+}
+
+void MetadataStorageFromPlainRewritableObjectStorage::setAuthoritativeDirectory(
+    const std::string & path,
+    const std::string & remote_token,
+    const std::unordered_map<std::string, uint64_t> & files_with_sizes)
+{
+    DirectoryRemoteInfo info;
+    info.remote_path = remote_token;
+    /// Empty etag can never equal a real listing etag: whenever this directory later appears
+    /// in a listing, refresh reloads its real file set instead of trusting this entry as
+    /// "unchanged".
+    info.etag = "";
+    info.last_modified = Poco::Timestamp().epochTime();
+    for (const auto & [file_name, file_size] : files_with_sizes)
+        info.files.emplace(file_name, FileRemoteInfo{.bytes_size = file_size, .last_modified = info.last_modified});
+
+    /// Immediate apply, so reads work without waiting for the next reload. Same locking
+    /// discipline as a transaction commit (metadata_mutex -> mutate a read-write snapshot ->
+    /// publish), with the authority map updated under its own mutex, ordered after
+    /// metadata_mutex -- matching load(), whose caller holds metadata_mutex before the
+    /// override pass takes authoritative_mutex.
+    std::lock_guard metadata_lock(metadata_mutex);
+    std::lock_guard authoritative_lock(authoritative_mutex);
+    authoritative_directories[path] = info;
+
+    auto snapshot = fs.takeReadWriteSnapshot();
+    if (const auto existing = snapshot->getDirectoryRemoteInfo(path); existing && existing->remote_path == info.remote_path)
+    {
+        /// Same union semantics as applyLayout(): the live tree may know files written after
+        /// this authority's snapshot was taken; keep them, add authority-only ones.
+        DirectoryRemoteInfo merged = *existing;
+        bool changed = false;
+        for (const auto & [file_name, file_info] : info.files)
+            changed = merged.files.emplace(file_name, file_info).second || changed;
+        if (!changed)
+            return;
+        snapshot->overrideDirectory(path, std::move(merged));
+    }
+    else
+    {
+        snapshot->overrideDirectory(path, std::move(info));
+    }
+    fs.applySnapshot(std::move(snapshot));
+}
+
+void MetadataStorageFromPlainRewritableObjectStorage::removeAuthoritativeDirectory(const std::string & path)
+{
+    /// Only withdraws the authority; the tree entry itself is removed by whoever physically
+    /// removes the directory (removeRecursive) or by the next listing-based reload.
+    std::lock_guard authoritative_lock(authoritative_mutex);
+    authoritative_directories.erase(path);
 }
 
 MetadataStorageFromPlainRewritableObjectStorage::MetadataStorageFromPlainRewritableObjectStorage(ObjectStoragePtr object_storage_, String storage_path_prefix_)

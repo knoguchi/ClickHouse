@@ -10,6 +10,8 @@
 #include <Disks/DiskObjectStorage/ObjectStorages/StoredObject.h>
 
 #include <memory>
+#include <mutex>
+#include <unordered_set>
 
 namespace DB
 {
@@ -60,6 +62,11 @@ public:
     /// Will reload in-memory structure from scratch.
     void dropCache() override;
     void refresh(UInt64 not_sooner_than_milliseconds) override;
+    void setAuthoritativeDirectory(
+        const std::string & path,
+        const std::string & remote_token,
+        const std::unordered_map<std::string, uint64_t> & files_with_sizes) override;
+    void removeAuthoritativeDirectory(const std::string & path) override;
 
     bool existsFile(const std::string & path) const override;
     bool existsDirectory(const std::string & path) const override;
@@ -89,6 +96,15 @@ private:
 
     std::mutex load_mutex;
     AtomicStopwatch previous_refresh;
+
+    /// Authoritative directory mappings (see IMetadataStorage::setAuthoritativeDirectory).
+    /// Guarded by authoritative_mutex, which load() holds from the override pass through
+    /// applyLayout(), so an authority registered concurrently with a reload either takes
+    /// effect in that reload or strictly after its snapshot is published (never
+    /// half-applied). Where both are taken, authoritative_mutex is acquired after
+    /// metadata_mutex.
+    std::mutex authoritative_mutex;
+    std::unordered_map<std::string, DirectoryRemoteInfo> authoritative_directories;
 };
 
 class MetadataStorageFromPlainRewritableObjectStorageTransaction : public IMetadataTransaction

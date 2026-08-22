@@ -1,5 +1,6 @@
 #include <Storages/MergeTree/CloudMergeTree/CloudMergeTreeCoordination.h>
 
+#include <Storages/MergeTree/CloudMergeTree/CloudPartLocation.h>
 #include <Common/ZooKeeper/KeeperException.h>
 #include <Storages/MergeTree/EphemeralLockInZooKeeper.h>
 #include <Common/ZooKeeper/ZooKeeperWithFaultInjection.h>
@@ -7,6 +8,7 @@
 #include <IO/WriteHelpers.h>
 #include <base/sort.h>
 #include <chrono>
+#include <optional>
 
 namespace DB
 {
@@ -24,6 +26,20 @@ namespace
     {
         return std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
+    }
+
+    /// A removal/detach znode's payload is "<ms-since-epoch>\n<location trailer>": the location
+    /// is copied verbatim from the part's own znode payload before it's removed, so GC (or a
+    /// later ATTACH) can resolve the part's directories from Keeper without ever having to
+    /// re-derive them by re-listing the shared disk. Returns nullopt if the part's znode is
+    /// already gone -- the caller must treat that exactly like a ZNONODE from the remove
+    /// op it was about to issue (a concurrent racer got there first; fail closed and retry).
+    std::optional<String> buildRemovalPayload(const zkutil::ZooKeeperPtr & zk, const String & part_znode_path, Int64 timestamp_ms)
+    {
+        String part_payload;
+        if (!zk->tryGet(part_znode_path, part_payload))
+            return std::nullopt;
+        return toString(timestamp_ms) + "\n" + CloudPartLocation::extractTrailerText(part_payload);
     }
 }
 
@@ -85,12 +101,17 @@ Coordination::Error CloudMergeTreeCoordination::tryCommitMerge(
 
     /// Deactivate the sources and tombstone them in the same atomic step, so the parts-killer
     /// GC task's grace-period clock starts exactly when the source genuinely left parts/, never
-    /// derived after the fact (Keeper doesn't retain deleted-znode history).
-    const String tombstone_ts = toString(nowMilliseconds());
+    /// derived after the fact (Keeper doesn't retain deleted-znode history). Each tombstone
+    /// payload carries the source's own location, read from its still-active znode just before
+    /// this multi() -- see buildRemovalPayload().
+    const Int64 tombstone_ts = nowMilliseconds();
     for (const auto & source : source_part_names)
     {
+        auto payload = buildRemovalPayload(zk, partPath(source), tombstone_ts);
+        if (!payload)
+            return Coordination::Error::ZNONODE;
         ops.emplace_back(zkutil::makeRemoveRequest(partPath(source), -1));
-        ops.emplace_back(zkutil::makeCreateRequest(droppedPartPath(source), tombstone_ts, zkutil::CreateMode::Persistent));
+        ops.emplace_back(zkutil::makeCreateRequest(droppedPartPath(source), *payload, zkutil::CreateMode::Persistent));
     }
 
     Coordination::Responses responses;
@@ -107,11 +128,14 @@ Coordination::Error CloudMergeTreeCoordination::tryReplacePartition(
     for (const auto & [name, header] : new_parts_with_headers)
         ops.emplace_back(zkutil::makeCreateRequest(partPath(name), header, zkutil::CreateMode::Persistent));
 
-    const String tombstone_ts = toString(nowMilliseconds());
+    const Int64 tombstone_ts = nowMilliseconds();
     for (const auto & name : old_part_names_to_remove)
     {
+        auto payload = buildRemovalPayload(zk, partPath(name), tombstone_ts);
+        if (!payload)
+            return Coordination::Error::ZNONODE;
         ops.emplace_back(zkutil::makeRemoveRequest(partPath(name), -1));
-        ops.emplace_back(zkutil::makeCreateRequest(droppedPartPath(name), tombstone_ts, zkutil::CreateMode::Persistent));
+        ops.emplace_back(zkutil::makeCreateRequest(droppedPartPath(name), *payload, zkutil::CreateMode::Persistent));
     }
 
     Coordination::Responses responses;
@@ -205,11 +229,14 @@ Coordination::Error CloudMergeTreeCoordination::tryRemoveParts(
     const zkutil::ZooKeeperPtr & zk, const Strings & part_names) const
 {
     Coordination::Requests ops;
-    const String tombstone_ts = toString(nowMilliseconds());
+    const Int64 tombstone_ts = nowMilliseconds();
     for (const auto & part_name : part_names)
     {
+        auto payload = buildRemovalPayload(zk, partPath(part_name), tombstone_ts);
+        if (!payload)
+            return Coordination::Error::ZNONODE;
         ops.emplace_back(zkutil::makeRemoveRequest(partPath(part_name), -1));
-        ops.emplace_back(zkutil::makeCreateRequest(droppedPartPath(part_name), tombstone_ts, zkutil::CreateMode::Persistent));
+        ops.emplace_back(zkutil::makeCreateRequest(droppedPartPath(part_name), *payload, zkutil::CreateMode::Persistent));
     }
 
     Coordination::Responses responses;
@@ -241,11 +268,17 @@ Coordination::Error CloudMergeTreeCoordination::tryDetachParts(
     const zkutil::ZooKeeperPtr & zk, const Strings & part_names) const
 {
     Coordination::Requests ops;
-    const String detached_ts = toString(nowMilliseconds());
+    const Int64 detached_ts = nowMilliseconds();
     for (const auto & part_name : part_names)
     {
+        /// Same "<ms>\n<location trailer>" shape as a tombstone -- see buildRemovalPayload() --
+        /// so a later ATTACH can resolve the detached part's directories from Keeper instead of
+        /// depending on the attaching replica's own object storage listing having caught up.
+        auto payload = buildRemovalPayload(zk, partPath(part_name), detached_ts);
+        if (!payload)
+            return Coordination::Error::ZNONODE;
         ops.emplace_back(zkutil::makeRemoveRequest(partPath(part_name), -1));
-        ops.emplace_back(zkutil::makeCreateRequest(detachedPartPath(part_name), detached_ts, zkutil::CreateMode::Persistent));
+        ops.emplace_back(zkutil::makeCreateRequest(detachedPartPath(part_name), *payload, zkutil::CreateMode::Persistent));
     }
 
     Coordination::Responses responses;
@@ -282,8 +315,18 @@ std::vector<CloudMergeTreeCoordination::Tombstone> CloudMergeTreeCoordination::l
     for (const auto & name : names)
     {
         String value;
-        if (zk->tryGet(droppedPartPath(name), value) && !value.empty())
-            result.push_back(Tombstone{name, parse<Int64>(value)});
+        if (!zk->tryGet(droppedPartPath(name), value) || value.empty())
+            continue;
+
+        /// Payload is "<ms>\n<location trailer>" (see buildRemovalPayload()) -- parse only the
+        /// timestamp line; the trailer is opaque here and handed to the caller verbatim.
+        const auto newline = value.find('\n');
+        Tombstone tombstone;
+        tombstone.part_name = name;
+        tombstone.dropped_at_ms = parse<Int64>(value.substr(0, newline));
+        if (newline != String::npos)
+            tombstone.location_text = value.substr(newline + 1);
+        result.push_back(std::move(tombstone));
     }
     return result;
 }
