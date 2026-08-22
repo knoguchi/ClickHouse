@@ -61,7 +61,7 @@ using CloudMergeMutateSelectedEntryPtr = std::shared_ptr<CloudMergeMutateSelecte
   * verbatim for the actual I/O (NEED_EXECUTE); the one substantive difference is finish(), which
   * replaces the local-only renameMergedTemporaryPart()+Transaction::commit() with a Keeper-fenced
   * commit via StorageCloudMergeTree::commitMergedPart() -- discarding the part on a lost lease
-  * race instead of crashing or silently keeping it. See DESIGN.md invariant 3.
+  * race instead of crashing or silently keeping it. See README.md invariant 3.
   *
   * Also heartbeats the lease during NEED_EXECUTE so a merge that's still genuinely in progress
   * doesn't get its lease stolen out from under it by another replica's staleness check.

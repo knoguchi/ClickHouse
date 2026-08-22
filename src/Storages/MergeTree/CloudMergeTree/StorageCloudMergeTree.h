@@ -38,7 +38,7 @@ struct ReplicatedMergeTreeMutationEntry;
   * Unlike StorageReplicatedMergeTree there is no replication log, no per-replica
   * part ownership, and no peer-to-peer part fetch: every replica reads the same
   * global part set from Keeper (CloudMergeTreeCoordination) and the same objects
-  * from shared storage. See DESIGN.md.
+  * from shared storage. See README.md.
   *
   * Phase 1 scope: multi-replica CREATE / INSERT / SELECT / DROP on a single, shared
   * (remote) disk. A replica bootstraps its working set from Keeper's active part
@@ -129,7 +129,7 @@ public:
     /// this is a verbatim copy of -- the logic isn't specific to how parts get into the set).
     UInt32 getMaxLevelInBetween(const PartProperties & left, const PartProperties & right) const;
 
-    /// Keeper-fenced merge commit (DESIGN.md invariant 3, exactly-once materialization): a single
+    /// Keeper-fenced merge commit (README.md invariant 3, exactly-once materialization): a single
     /// multi() that creates the merged part, removes the sources, and checks the lease is still
     /// held at lease_version. Returns false (without throwing, without touching local state) if
     /// the lease was lost to another replica -- the caller must discard new_part in that case.
@@ -157,7 +157,7 @@ public:
     /// needs the mutation; a later INSERT's part does not -- see CloudMergeTreeCoordination's
     /// class doc comment) and persists a Keeper-allocated mutations/<id> entry. Returns once
     /// durably recorded; does not wait for completion (mutations_sync is not implemented -- see
-    /// DESIGN.md/the Phase 4 Step C plan for why this is a deliberate, documented scope cut, not
+    /// README.md/the Phase 4 Step C plan for why this is a deliberate, documented scope cut, not
     /// an oversight).
     void mutate(const MutationCommands & commands, ContextPtr context) override;
 
@@ -220,7 +220,7 @@ public:
     /// attempt against that attempt's own Keeper read) additionally submits a mutations/<id> entry,
     /// committed atomically together with the metadata change via
     /// coordination.trySetMetadataAndCreateMutation() -- mirrors
-    /// StorageReplicatedMergeTree::alter()'s own atomic-together shape (DESIGN.md invariant 3).
+    /// StorageReplicatedMergeTree::alter()'s own atomic-together shape (README.md invariant 3).
     void alter(const AlterCommands & params, ContextPtr context, AlterLockHolder & alter_lock_holder) override;
 
     /// KILL MUTATION: removes the mutations/<mutation_id> znode outright (CloudMergeTree has no
@@ -317,13 +317,13 @@ private:
     /// Phase 3 "parts killer": periodically scans dropped_parts/ (tombstones written atomically
     /// whenever a part leaves the active Keeper set -- merge sources, or a dropped table's parts)
     /// and physically deletes a tombstoned part's shared-storage objects once
-    /// cloud_merge_tree_gc_grace_period_seconds has elapsed, per DESIGN.md invariant 2. Simple
+    /// cloud_merge_tree_gc_grace_period_seconds has elapsed, per README.md invariant 2. Simple
     /// polling on cloud_merge_tree_gc_interval_ms, not watch-driven -- GC latency is bounded by
     /// the grace period regardless, unlike part_set_updating_task's correctness-critical immediacy.
     BackgroundSchedulePoolTaskHolder parts_killer_task;
     void runPartsKillerCycle();
 
-    /// Per-AZ merge-selection leader election (DESIGN.md's "per-AZ leader fan-out"): every
+    /// Per-AZ merge-selection leader election (README.md's "per-AZ leader fan-out"): every
     /// replica racing selectPartsToMerge()/acquireOrStealLease() independently every scheduling
     /// cycle is redundant Keeper traffic, since only one replica can ever win a given lease. When
     /// this replica's availability zone is known (PlacementInfo::getAvailabilityZone() is

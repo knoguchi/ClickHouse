@@ -209,7 +209,7 @@ StorageCloudMergeTree::StorageCloudMergeTree(
 {
     /// Phase 1: every disk in the storage policy must be a single, shared (remote) disk. This
     /// keeps "which disk is a Keeper-known part on" unambiguous for the watcher below, and is
-    /// the structural precondition for "no local copy" in DESIGN.md's Phase 1 description.
+    /// the structural precondition for "no local copy" in README.md's Phase 1 description.
     if (!isStaticStorage())
     {
         auto storage_policy = getStoragePolicy();
@@ -225,7 +225,7 @@ StorageCloudMergeTree::StorageCloudMergeTree(
     {
         auto component_guard = Coordination::setCurrentComponent("StorageCloudMergeTree::StorageCloudMergeTree");
 
-        /// Keeper is authoritative for which parts are active (invariant 1 in DESIGN.md): load
+        /// Keeper is authoritative for which parts are active (invariant 1 in README.md): load
         /// only the parts Keeper knows about, not whatever a local directory listing turns up.
         auto zk = getZooKeeper();
         coordination.createRootNodes(zk);
@@ -343,7 +343,7 @@ StorageCloudMergeTree::StorageCloudMergeTree(
         /// comment): only register and start rechecking when this replica's AZ is actually known.
         /// Left entirely unset (az_election_node_path empty, az_leadership_recheck_task null,
         /// is_az_leader stays at its default true) otherwise, so every replica keeps racing
-        /// exactly as before this feature existed -- see DESIGN.md's own reasoning for why
+        /// exactly as before this feature existed -- see README.md's own reasoning for why
         /// collapsing every AZ-less replica into one implicit bucket would be wrong.
         const String az = PlacementInfo::PlacementInfo::instance().getAvailabilityZone();
         if (!az.empty())
@@ -1039,7 +1039,7 @@ void StorageCloudMergeTree::drop()
     /// Remove the canonical part set from Keeper synchronously -- every replica gets its own
     /// independent DROP TABLE query, and this is cheap/fast regardless of how many replicas run
     /// it concurrently (each part's remove-and-tombstone multi() is independent). Physical
-    /// shared-storage deletion is NOT done here: S3 deletion is slow, and per DESIGN.md invariant
+    /// shared-storage deletion is NOT done here: S3 deletion is slow, and per README.md invariant
     /// 2 it must go through the same grace-period-gated parts-killer GC task as merge-source
     /// cleanup (see tryRemoveParts, which now tombstones every part it deactivates). The GC task
     /// also removes the table's own root directory once every part -- active or tombstoned -- has
@@ -1294,7 +1294,7 @@ std::expected<CloudMergeMutateSelectedEntryPtr, SelectMergeFailure> StorageCloud
 
     /// Lease acquisition is part of selection, not execution: don't reserve space or tag parts
     /// (CloudCurrentlyMergingPartsTagger below) for a range whose lease already belongs to another
-    /// replica. A lost race here is NOTHING_TO_MERGE, not an error -- see DESIGN.md invariant 3 and
+    /// replica. A lost race here is NOTHING_TO_MERGE, not an error -- see README.md invariant 3 and
     /// the decentralized-selection design note at the top of this file's plan.
     const String lease_path = coordination.leasePath(future_part->name);
     const String holder_data = toString(ServerUUID::get());
@@ -1700,7 +1700,7 @@ void StorageCloudMergeTree::alter(const AlterCommands & params, ContextPtr local
             /// A command requiring an actual data rewrite (e.g. a genuine type conversion): commit
             /// the metadata change and the mutation that migrates existing parts to it atomically
             /// together, in one multi() -- mirrors StorageReplicatedMergeTree::alter()'s own
-            /// atomic-together shape (DESIGN.md invariant 3's "exactly-once materialization"). A
+            /// atomic-together shape (README.md invariant 3's "exactly-once materialization"). A
             /// crash between two *separate* writes would otherwise leave either a live schema
             /// change with no mutation to ever rewrite old-typed data, or an orphaned mutation
             /// naming a metadata state that was never actually published.
@@ -3185,7 +3185,7 @@ try
     /// replica running this independently would be correct, just wasteful. Deliberately reads
     /// Keeper fresh (loadActivePartNames() below, never this replica's own data_parts_indexes
     /// cache) for both sides of the comparison -- the exact substitution that closes the
-    /// cross-replica visibility race DESIGN.md documents for regular parts, applied here to avoid
+    /// cross-replica visibility race README.md documents for regular parts, applied here to avoid
     /// the same shape of bug: a patch that's still needed must never look safe to drop just
     /// because this replica's local cache happens to be lagging on the regular part that still
     /// needs it.

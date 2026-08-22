@@ -208,7 +208,7 @@ def test_second_replica_sees_inserts_without_peer_fetch(cluster):
     node1 = cluster.instances["node1"]
     node2 = cluster.instances["node2"]
 
-    # CloudMergeTree derives its Keeper root from the table UUID (see DESIGN.md), not from an
+    # CloudMergeTree derives its Keeper root from the table UUID (see README.md), not from an
     # engine argument like ReplicatedMergeTree's zookeeper_path. So the only way to point two
     # replicas at the same table is to create it on one and ATTACH it by the same UUID on the
     # other -- there is no ON CLUSTER support to do this implicitly yet.
@@ -383,7 +383,7 @@ def test_optimize_merges_all_parts_and_propagates_to_second_replica(cluster):
     assert node1.query(f"SELECT sum(id) FROM {TABLE_NAME}").strip() == expected_sum
 
     # The merge's source parts are removed from Keeper's canonical set atomically with the merged
-    # part's creation (DESIGN.md invariant 3); on node1 they should be locally Outdated, never
+    # part's creation (README.md invariant 3); on node1 they should be locally Outdated, never
     # gone-but-still-active.
     active_names = node1.query(
         f"SELECT name FROM system.parts WHERE table = '{TABLE_NAME}' AND active"
@@ -438,7 +438,7 @@ def test_concurrent_optimize_race_exactly_one_winner(cluster):
 
     expected_sum = str(row_count * (row_count + 1) // 2)
 
-    # Both replicas race to merge the same range: exactly-once materialization (DESIGN.md
+    # Both replicas race to merge the same range: exactly-once materialization (README.md
     # invariant 3) means the Keeper-fenced multi() in commitMergedPart lets only one of them win,
     # regardless of which selects first -- the loser must discard its output without a trace in
     # the canonical part set.
@@ -513,7 +513,7 @@ def test_merge_source_objects_survive_grace_period_then_get_collected(cluster):
         )
 
         # The merge's sources are Keeper-deactivated and tombstoned atomically with the merge
-        # commit (DESIGN.md invariant 3 is unaffected -- this just rides more ops in the same
+        # commit (README.md invariant 3 is unaffected -- this just rides more ops in the same
         # multi()).
         assert (
             int(
@@ -595,7 +595,7 @@ def test_drop_table_objects_survive_grace_period_then_get_collected(cluster):
         # Drop only on node1 -- node2 keeps its own StorageCloudMergeTree object (and
         # parts-killer task) alive to actually perform the physical cleanup. If every replica
         # dropped the table, no live GC task would remain to drain these tombstones; that
-        # liveness gap is a known, documented limitation of this phase (see DESIGN.md
+        # liveness gap is a known, documented limitation of this phase (see README.md
         # discussion), not something this test exercises.
         node1.query(f"DROP TABLE {table} SYNC")
 
