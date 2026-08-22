@@ -1308,10 +1308,10 @@ std::expected<CloudMergeMutateSelectedEntryPtr, SelectMergeFailure> StorageCloud
                 "Lease for {} is already held by another replica: {}", future_part->name, lease.error()),
         });
 
-    /// Test-only pause point (see CODE_REVIEW.md finding #7's regression test): lets a test
-    /// deterministically hold this merge's lease across a real gap, instead of relying on two
-    /// replicas' independent OPTIMIZE calls racing to overlap by chance. No-op unless the test
-    /// explicitly enables it via SYSTEM ENABLE FAILPOINT.
+    /// Test-only pause point: lets a test deterministically hold this merge's lease across a
+    /// real gap, instead of relying on two replicas' independent OPTIMIZE calls racing to
+    /// overlap by chance. No-op unless the test explicitly enables it via SYSTEM ENABLE
+    /// FAILPOINT.
     FailPointInjection::pauseFailPoint(FailPoints::cloud_merge_tree_merge_lease_acquired);
 
     try
@@ -1433,11 +1433,11 @@ std::expected<CloudMutateSelectedEntryPtr, SelectMergeFailure> StorageCloudMerge
             if (!lease)
                 break;
 
-            /// Test-only pause point (see CODE_REVIEW.md finding #8's regression test): lets a
-            /// test deterministically hold this mutation's lease across a real gap, instead of
-            /// relying on two replicas' independent background schedulers racing to overlap by
-            /// chance within a couple hundred milliseconds -- which they reliably don't. No-op
-            /// unless the test explicitly enables it via SYSTEM ENABLE FAILPOINT.
+            /// Test-only pause point: lets a test deterministically hold this mutation's lease
+            /// across a real gap, instead of relying on two replicas' independent background
+            /// schedulers racing to overlap by chance within a couple hundred milliseconds --
+            /// which they reliably don't. No-op unless the test explicitly enables it via
+            /// SYSTEM ENABLE FAILPOINT.
             FailPointInjection::pauseFailPoint(FailPoints::cloud_merge_tree_mutate_lease_acquired);
 
             try
@@ -1796,11 +1796,10 @@ bool StorageCloudMergeTree::scheduleDataProcessingJob(BackgroundJobsAssignee & a
     if (shutdown_called)
         return false;
 
-    /// Test-only gate (see CODE_REVIEW.md finding #6's regression test): lets a test hold every
-    /// future scheduling attempt at the door -- including ones that would tag and start
-    /// processing a *different* part -- while letting an explicit OPTIMIZE TABLE (a separate code
-    /// path, not gated here) run concurrently. No-op unless a test explicitly enables it via
-    /// SYSTEM ENABLE FAILPOINT. Mirrors StorageMergeTree's own
+    /// Test-only gate: lets a test hold every future scheduling attempt at the door -- including
+    /// ones that would tag and start processing a *different* part -- while letting an explicit
+    /// OPTIMIZE TABLE (a separate code path, not gated here) run concurrently. No-op unless a
+    /// test explicitly enables it via SYSTEM ENABLE FAILPOINT. Mirrors StorageMergeTree's own
     /// mt_merge_selecting_task_pause_when_scheduled precedent.
     FailPointInjection::pauseFailPoint(FailPoints::cloud_merge_tree_schedule_pause);
 
@@ -3180,8 +3179,9 @@ try
     auto disks = getStoragePolicy()->getDisks();
     const auto & disk = disks.front();
 
-    /// Phase F: patch-absorption GC. Gated on is_az_leader for the same redundant-Keeper-traffic
-    /// reasoning already applied to merge selection (see is_az_leader's own doc comment) -- every
+    /// Patch-absorption GC: drop a patch part once every active regular part in its partition
+    /// has absorbed it. Gated on is_az_leader for the same redundant-Keeper-traffic reasoning
+    /// already applied to merge selection (see is_az_leader's own doc comment) -- every
     /// replica running this independently would be correct, just wasteful. Deliberately reads
     /// Keeper fresh (loadActivePartNames() below, never this replica's own data_parts_indexes
     /// cache) for both sides of the comparison -- the exact substitution that closes the
@@ -3228,11 +3228,11 @@ try
                 ReadBufferFromString trailer_buf(CloudPartLocation::extractTrailerText(header));
                 auto location = CloudPartLocation::read(trailer_buf);
 
-                /// Test-only pause point (fault-injection test 1, see the plan's Testing section):
-                /// lets a test deterministically commit a new, lower-data-version regular part into
-                /// this same partition right after the read above but before the tombstone below,
-                /// and assert this cycle's already-fenced decision stays correct regardless (a part
-                /// committed after the read simply wasn't part of this GC decision -- correctly).
+                /// Test-only pause point: lets a test deterministically commit a new,
+                /// lower-data-version regular part into this same partition right after the read
+                /// above but before the tombstone below, and assert this cycle's already-fenced
+                /// decision stays correct regardless (a part committed after the read simply
+                /// wasn't part of this GC decision -- correctly).
                 FailPointInjection::pauseFailPoint(FailPoints::cloud_merge_tree_patch_gc_absorption_check_pause);
 
                 if (location.patch_max_data_version > it->second)
@@ -3240,7 +3240,8 @@ try
             }
             /// Else: zero active regular parts remain in this patch's original partition at all --
             /// vacuously safe to drop (also a backstop for DROP PARTITION without a full cascade,
-            /// though Phase A/G's synchronous cascade-drop should make this branch rare in practice).
+            /// though dropPartition()'s own synchronous cascade-drop of matching patches should
+            /// make this branch rare in practice).
 
             /// Fail-closed/idempotent under races: a second replica's concurrent GC cycle reaching
             /// the same conclusion just gets ZNONODE here, harmless -- same tolerance

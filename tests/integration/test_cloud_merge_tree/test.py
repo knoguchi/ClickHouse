@@ -2412,10 +2412,10 @@ def test_concurrent_insert_during_move_partition_is_not_lost(cluster):
                 node1.query, f"ALTER TABLE {src_table} MOVE PARTITION 0 TO TABLE {dst_table}"
             )
             # node2, not node1: a genuinely different replica's INSERT, adopted through node1's
-            # own watcher -- exactly CODE_REVIEW.md finding #4's failure scenario
-            # (movePartitionToTable rebuilt its removal list from a fresh partition-wide scan on
-            # every attempt, so a part that showed up in the meantime got tombstoned on the source
-            # without ever having been cloned to the destination -- lost from both tables).
+            # own watcher. Reproduces a real bug found during development: movePartitionToTable
+            # rebuilt its removal list from a fresh partition-wide scan on every attempt, so a
+            # part that showed up in the meantime got tombstoned on the source without ever
+            # having been cloned to the destination -- lost from both tables.
             insert_future = executor.submit(
                 node2.query, f"INSERT INTO {src_table} VALUES (100, 'racing')"
             )
@@ -2875,9 +2875,9 @@ def test_lease_loss_during_optimize_does_not_hang(cluster):
         # Neither replica's *background scheduler* must be the one to reach the merge-lease
         # failpoint below -- only the explicit OPTIMIZE call this test issues on node1 must be,
         # since that's the one whose client-side result() call actually observes a hang.
-        # cloud_merge_tree_schedule_pause (added for finding #6) gates every
-        # scheduleDataProcessingJob call at its very entry, unconditionally, independent of SYSTEM
-        # STOP/START MERGES -- so enabling it up front on *both* nodes (and never resuming it until
+        # cloud_merge_tree_schedule_pause gates every scheduleDataProcessingJob call at its
+        # very entry, unconditionally, independent of SYSTEM STOP/START MERGES -- so enabling it
+        # up front on *both* nodes (and never resuming it until
         # the very end) fully removes both background schedulers as candidates; explicit OPTIMIZE
         # goes through a completely separate call path (optimizeUntilConverged), unaffected on
         # either node. Gating node1 alone isn't enough: node2 independently sees all 5 rows via
@@ -2969,8 +2969,8 @@ def test_select_sequential_consistency_sees_fresh_insert_despite_stalled_watcher
         # node1's INSERT asynchronously -- gating it (before it can ever call
         # updatePartSetFromKeeper()) proves read()'s own synchronous catch-up path under
         # select_sequential_consistency works independently of it, not just "usually fast enough"
-        # under natural timing (which this session's earlier findings showed is not reliable
-        # proof on its own).
+        # under natural timing, which is not reliable proof on its own (background adoption
+        # can race ahead of a slow assertion and mask a missing synchronous path).
         node2.query(f"SYSTEM ENABLE FAILPOINT {gate}")
         try:
             node1.query(f"INSERT INTO {table} VALUES (1, 'a')")
@@ -3248,8 +3248,7 @@ def test_lightweight_update_concurrent_from_both_replicas_both_apply(cluster):
         # At least one patch part exists (proves both commits genuinely landed and neither
         # silently collided on Keeper block-number allocation or the DETACH-guard/absorption-GC
         # machinery -- if either commit had been lost, sum(c2) above would already have caught it,
-        # this is a second, more direct signal). Not asserting an exact count: Phase E's own
-        # automatic patch-to-patch compaction (see test_lightweight_update_many_small_updates_
+        # this is a second, more direct signal). Not asserting an exact count: automatic patch-to-patch compaction (see test_lightweight_update_many_small_updates_
         # merge_into_one_patch) can legitimately have already merged the two small patches this
         # test produces into one by the time this check runs -- that's the feature working
         # correctly, not a race to guard against here.
@@ -3352,8 +3351,8 @@ def test_lightweight_update_absorption_gc_removes_patch_after_merge(cluster):
         )
 
         # OPTIMIZE TABLE FINAL merges every regular part into one whose data_version is >= the
-        # patch's own max_data_version -- runPartsKillerCycle()'s absorption-GC pass (Phase F)
-        # should then find every active regular part in the partition already past the patch's
+        # patch's own max_data_version -- runPartsKillerCycle()'s absorption-GC pass should then
+        # find every active regular part in the partition already past the patch's
         # max_data_version and tombstone it. No explicit trigger needed: the low
         # cloud_merge_tree_gc_interval_ms above means the next background cycle picks it up on
         # its own, same as any other GC-driven removal in this suite.
