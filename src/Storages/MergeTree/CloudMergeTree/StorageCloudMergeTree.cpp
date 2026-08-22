@@ -57,6 +57,7 @@ namespace ErrorCodes
     extern const int SUPPORT_IS_DISABLED;
     extern const int INCOMPATIBLE_COLUMNS;
     extern const int CANNOT_ASSIGN_OPTIMIZE;
+    extern const int UNKNOWN_POLICY;
 }
 
 namespace MergeTreeSetting
@@ -1468,9 +1469,157 @@ PartitionCommandsResultInfo StorageCloudMergeTree::attachPartition(
     return results;
 }
 
-void StorageCloudMergeTree::replacePartitionFrom(const StoragePtr &, const ASTPtr &, bool, ContextPtr)
+void StorageCloudMergeTree::replacePartitionFrom(const StoragePtr & source_table, const ASTPtr & partition, bool replace, ContextPtr local_context)
 {
-    throw Exception(ErrorCodes::NOT_IMPLEMENTED, "REPLACE PARTITION is not implemented for CloudMergeTree yet");
+    auto component_guard = Coordination::setCurrentComponent("StorageCloudMergeTree::replacePartitionFrom");
+
+    /// Phase 5 Step A: only between two CloudMergeTree tables -- matches both upstream engines'
+    /// own dynamic-cast-fail behavior for cross-engine REPLACE/ATTACH PARTITION ... FROM.
+    auto * source_storage = dynamic_cast<StorageCloudMergeTree *>(source_table.get());
+    if (!source_storage)
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+            "REPLACE/ATTACH PARTITION ... FROM is only implemented between two CloudMergeTree tables");
+
+    auto my_metadata_snapshot = getInMemoryMetadataPtr(local_context, false);
+    auto src_metadata_snapshot = source_storage->getInMemoryMetadataPtr(local_context, false);
+
+    /// Generic, engine-agnostic structural check (column list, sorting/partition/primary key,
+    /// format_version) -- same helper both StorageMergeTree and StorageReplicatedMergeTree already
+    /// call unchanged.
+    checkStructureAndGetMergeTreeData(*source_storage, src_metadata_snapshot, my_metadata_snapshot);
+
+    /// Stricter than StorageMergeTree's isCompatibleForPartitionOps() allowance -- matches
+    /// StorageReplicatedMergeTree's own exact-equality requirement instead. CloudMergeTree's
+    /// constructor already enforces "exactly one remote disk policy" per table, so this reduces to
+    /// "same bucket/disk," not a deep multi-disk compatibility question. Simplest, safest first
+    /// cut; easy to relax later.
+    if (getStoragePolicy()->getName() != source_storage->getStoragePolicy()->getName())
+        throw Exception(ErrorCodes::UNKNOWN_POLICY,
+            "Destination and source table have different storage policies, cannot REPLACE/ATTACH PARTITION between table {} and {}",
+            getStorageID().getNameForLogs(), source_storage->getStorageID().getNameForLogs());
+
+    String partition_id = getPartitionIDFromQuery(partition, local_context);
+
+    /// Read-lock the source for the duration of the clone below -- it is only ever read from
+    /// (its active parts queried, its part data cloned), never mutated by this operation.
+    auto source_table_lock = source_storage->lockForShare(
+        RWLockImpl::NO_QUERY, (*getSettings())[MergeTreeSetting::lock_acquire_timeout_for_background_operations]);
+
+    DataPartsVector src_parts;
+    for (const auto & part : source_storage->getDataPartsVectorForInternalUsage({DataPartState::Active}, {DataPartKind::Regular}))
+        if (part->info.getPartitionId() == partition_id)
+            src_parts.push_back(part);
+
+    for (const auto & src_part : src_parts)
+        if (!canReplacePartition(src_part))
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                "Cannot replace partition '{}': part '{}' has incompatible granularity for table {}",
+                partition_id, src_part->name, getStorageID().getNameForLogs());
+
+    auto zk = getZooKeeper();
+    auto zk_fault = std::make_shared<ZooKeeperWithFaultInjection>(zk);
+    coordination.ensureBlockNumbersPartition(zk, partition_id);
+
+    /// Clone once -- source data doesn't need re-cloning if the commit below loses a race and
+    /// retries; only the destination-side "which of my own parts am I replacing" set can go stale.
+    /// Fresh block numbers on self (never the source's -- an unrelated table's counter sequence),
+    /// same choice both upstream engines make: getLevelForAdoptedPart() resets the merge level to
+    /// 0 unless both tables' merging_params have identical merge semantics, so a later
+    /// FINAL/OPTIMIZE doesn't wrongly trust an adopted part as already fully merged (issue #106798).
+    MutableDataPartsVector new_parts;
+    std::vector<std::pair<String, String>> new_parts_with_headers;
+    std::vector<scope_guard> temp_dir_guards;
+    for (const auto & src_part : src_parts)
+    {
+        auto block_lock = createEphemeralLockInZooKeeper(
+            coordination.blockNumbersPartitionPath(partition_id) + "/block-",
+            coordination.tempPath(), zk_fault, /*deduplication_paths=*/ {}, /*znode_data=*/ std::nullopt);
+        Int64 block_number = block_lock.getNumber();
+        block_lock.unlock();
+
+        auto dst_part_info = src_part->info;
+        dst_part_info.min_block = dst_part_info.max_block = block_number;
+        dst_part_info.level = getLevelForAdoptedPart(*source_storage, src_part->info.level);
+        dst_part_info.mutation = 0;
+
+        IDataPartStorage::ClonePartParams clone_params;
+        /// CloudMergeTree's plain_rewritable disk already has supportsHardLinks() == false -- the
+        /// same reason checkMutationIsPossible()/always_use_copy_instead_of_hardlinks already force
+        /// copy-mode elsewhere in this engine.
+        clone_params.copy_instead_of_hardlink = true;
+        clone_params.metadata_version_to_write = my_metadata_snapshot->getMetadataVersion();
+
+        auto [dst_part, temp_dir_guard] = cloneAndLoadDataPart(
+            src_part, "tmp_replace_from_", dst_part_info, my_metadata_snapshot, clone_params,
+            local_context->getReadSettings(), local_context->getWriteSettings(), /*must_on_same_disk=*/ true);
+
+        new_parts.push_back(dst_part);
+        new_parts_with_headers.emplace_back(dst_part->name, serializePartHeader(dst_part));
+        temp_dir_guards.push_back(std::move(temp_dir_guard));
+    }
+
+    if (new_parts_with_headers.empty() && !replace)
+        return; /// Nothing to attach: empty source partition.
+
+    /// Bounded retry against a concurrent DROP/merge/REPLACE racing on our own old parts in this
+    /// partition: tryReplacePartition()'s multi() fails closed (ZNONODE) if any old part we're
+    /// replacing was already deactivated elsewhere between our read and our commit -- same
+    /// fail-closed/retry shape removeActivePartsMatching()/commitMergedPart() already rely on. A
+    /// failed multi() is all-or-nothing, so new_parts_with_headers is safe to reuse unchanged on
+    /// retry (none of them were actually created in Keeper on a failed attempt).
+    for (int attempt = 0; attempt < 20; ++attempt)
+    {
+        Strings old_part_names_to_remove;
+        if (replace)
+            for (const auto & part : getDataPartsVectorForInternalUsage({DataPartState::Active}, {DataPartKind::Regular}))
+                if (part->info.getPartitionId() == partition_id)
+                    old_part_names_to_remove.push_back(part->name);
+
+        auto code = coordination.tryReplacePartition(zk, new_parts_with_headers, old_part_names_to_remove);
+        if (code == Coordination::Error::ZNONODE)
+            continue;
+        if (code != Coordination::Error::ZOK)
+            throw zkutil::KeeperException(code, "Cannot commit REPLACE/ATTACH PARTITION in Keeper for table {}", getStorageID().getNameForLogs());
+
+        /// Keeper-first, then the local rename+admit -- other replicas' adoption watchers correctly
+        /// retry until the physical rename below becomes visible, same contract every other commit
+        /// in this engine already relies on (buildPartFromDisk()'s existsDirectory() pre-check).
+        Transaction transaction(*this, nullptr);
+        DataPartsVector covered_parts;
+        {
+            auto lock = lockParts();
+            for (auto & part : new_parts)
+                renameTempPartAndAdd(part, transaction, lock, /*rename_in_transaction=*/ false);
+            covered_parts = transaction.commit(lock);
+            for (const auto & covered : covered_parts)
+                modifyPartState(covered, DataPartState::Deleting, lock);
+
+            if (!old_part_names_to_remove.empty())
+            {
+                std::unordered_set<std::string> old_names_set(old_part_names_to_remove.begin(), old_part_names_to_remove.end());
+                auto known = getDataPartsVectorForInternalUsage({DataPartState::Active}, {DataPartKind::Regular}, lock);
+                DataPartsVector to_remove;
+                for (const auto & part : known)
+                    if (old_names_set.contains(part->name))
+                        to_remove.push_back(part);
+
+                if (!to_remove.empty())
+                {
+                    removePartsFromWorkingSet(/*txn=*/ nullptr, to_remove, /*clear_without_timeout=*/ true, lock);
+                    for (const auto & part : to_remove)
+                        modifyPartState(part, DataPartState::Deleting, lock);
+                    covered_parts.insert(covered_parts.end(), to_remove.begin(), to_remove.end());
+                }
+            }
+        }
+        if (!covered_parts.empty())
+            removePartsFinally(covered_parts);
+        return;
+    }
+
+    throw Exception(ErrorCodes::LOGICAL_ERROR,
+        "Failed to commit REPLACE/ATTACH PARTITION in Keeper for table {} after repeated concurrent-modification retries",
+        getStorageID().getNameForLogs());
 }
 
 void StorageCloudMergeTree::movePartitionToTable(const StoragePtr &, const ASTPtr &, ContextPtr)

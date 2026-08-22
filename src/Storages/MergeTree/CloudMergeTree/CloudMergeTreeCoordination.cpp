@@ -98,6 +98,27 @@ Coordination::Error CloudMergeTreeCoordination::tryCommitMerge(
     return zk->tryMultiNoThrow(ops, responses);
 }
 
+Coordination::Error CloudMergeTreeCoordination::tryReplacePartition(
+    const zkutil::ZooKeeperPtr & zk,
+    const std::vector<std::pair<String, String>> & new_parts_with_headers,
+    const Strings & old_part_names_to_remove) const
+{
+    Coordination::Requests ops;
+
+    for (const auto & [name, header] : new_parts_with_headers)
+        ops.emplace_back(zkutil::makeCreateRequest(partPath(name), header, zkutil::CreateMode::Persistent));
+
+    const String tombstone_ts = toString(nowMilliseconds());
+    for (const auto & name : old_part_names_to_remove)
+    {
+        ops.emplace_back(zkutil::makeRemoveRequest(partPath(name), -1));
+        ops.emplace_back(zkutil::makeCreateRequest(droppedPartPath(name), tombstone_ts, zkutil::CreateMode::Persistent));
+    }
+
+    Coordination::Responses responses;
+    return zk->tryMultiNoThrow(ops, responses);
+}
+
 std::expected<CloudMergeTreeCoordination::LeaseHandle, Coordination::Error> CloudMergeTreeCoordination::acquireOrStealLease(
     const zkutil::ZooKeeperPtr & zk, const String & lease_path, const String & holder_data, Int64 staleness_threshold_ms) const
 {

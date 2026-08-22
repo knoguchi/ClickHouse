@@ -128,6 +128,18 @@ public:
         const String & lease_path,
         int32_t lease_version) const;
 
+    /// REPLACE/ATTACH PARTITION ... FROM commit: atomically register the newly-cloned parts and,
+    /// when replacing (not attaching), deactivate+tombstone whatever they replace -- same shape as
+    /// tryCommitMerge's "N creates + M removes-and-tombstones", but no lease check (this executes
+    /// synchronously against the resolved part set, like optimize()'s own synchronous loop; a
+    /// concurrent race on the same names fails closed via ZNONODE on the remove ops, same
+    /// fail-closed/retry contract every other commit in this file already relies on).
+    /// old_part_names_to_remove is empty for ATTACH PARTITION ... FROM (replace=false).
+    Coordination::Error tryReplacePartition(
+        const zkutil::ZooKeeperPtr & zk,
+        const std::vector<std::pair<String, String>> & new_parts_with_headers,
+        const Strings & old_part_names_to_remove) const;
+
     struct LeaseHandle
     {
         String path;

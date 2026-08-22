@@ -121,7 +121,13 @@ projections, FINAL), `MergeTreePartInfo`, checksums, `MergeTreeSettings`,
   Invariant 3.
 - **Phase 3 — Keeper-owned GC (parts killer).** Invariant 2.
 - **Phase 4 — mutations, DROP PARTITION, ALTER, dedup.** Feature completeness.
+- **Phase 5 — cross-table MOVE/REPLACE PARTITION.** Transfer Keeper ownership
+  of a partition's parts from one table's `<root>` to another's (register
+  under the destination, deregister from the source), for the standard
+  ClickHouse bulk-swap/archival use cases (`REPLACE PARTITION ... FROM` for
+  atomic staging-table reloads; `MOVE PARTITION ... TO TABLE` for archiving
+  into cold-storage tables sharing the same schema). Not yet started.
 
 Deferred (the SMT periphery, not correctness): sequential-consistency read
 fencing, per-AZ leader fan-out, snapshot cleaner tuning, backup/restore
-conversion, MOVE/REPLACE PARTITION across tables.
+conversion.

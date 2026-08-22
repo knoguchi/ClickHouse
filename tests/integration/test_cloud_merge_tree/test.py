@@ -1573,3 +1573,176 @@ def test_optimize_plain_still_works_unchanged(cluster):
         f"SELECT count() FROM system.parts WHERE table = '{TABLE_NAME}' AND active",
         "1",
     )
+
+
+def test_replace_partition_from_replaces_destination_partition(cluster):
+    node1 = cluster.instances["node1"]
+    src_table = "cloud_test_replace_src"
+    dst_table = "cloud_test_replace_dst"
+    ddl = "(id UInt64, data String) ENGINE = CloudMergeTree ORDER BY id PARTITION BY id % 2 SETTINGS storage_policy = 's3'"
+
+    node1.query(f"DROP TABLE IF EXISTS {src_table} SYNC")
+    node1.query(f"DROP TABLE IF EXISTS {dst_table} SYNC")
+    node1.query(f"CREATE TABLE {src_table} {ddl}")
+    node1.query(f"CREATE TABLE {dst_table} {ddl}")
+    try:
+        # dst has old data in both partitions.
+        node1.query(f"INSERT INTO {dst_table} VALUES (2, 'old0')")
+        node1.query(f"INSERT INTO {dst_table} VALUES (3, 'old1')")
+
+        # src has new data only for partition 0.
+        node1.query(f"INSERT INTO {src_table} VALUES (10, 'new0a')")
+        node1.query(f"INSERT INTO {src_table} VALUES (12, 'new0b')")
+
+        node1.query(f"ALTER TABLE {dst_table} REPLACE PARTITION 0 FROM {src_table}")
+
+        # Partition 0 in dst now holds exactly src's data, not the old row.
+        result = sorted(
+            node1.query(f"SELECT data FROM {dst_table} WHERE id % 2 = 0 ORDER BY id")
+            .strip()
+            .splitlines()
+        )
+        assert result == sorted(["new0a", "new0b"])
+
+        # Partition 1 (untouched) still has its original data.
+        assert node1.query(f"SELECT data FROM {dst_table} WHERE id = 3").strip() == "old1"
+
+        # This is a copy, not a move -- source is untouched.
+        assert node1.query(f"SELECT count() FROM {src_table}").strip() == "2"
+    finally:
+        node1.query(f"DROP TABLE IF EXISTS {src_table} SYNC")
+        node1.query(f"DROP TABLE IF EXISTS {dst_table} SYNC")
+
+
+def test_attach_partition_from_adds_alongside_existing_data(cluster):
+    node1 = cluster.instances["node1"]
+    src_table = "cloud_test_attach_from_src"
+    dst_table = "cloud_test_attach_from_dst"
+    ddl = "(id UInt64, data String) ENGINE = CloudMergeTree ORDER BY id PARTITION BY id % 2 SETTINGS storage_policy = 's3'"
+
+    node1.query(f"DROP TABLE IF EXISTS {src_table} SYNC")
+    node1.query(f"DROP TABLE IF EXISTS {dst_table} SYNC")
+    node1.query(f"CREATE TABLE {src_table} {ddl}")
+    node1.query(f"CREATE TABLE {dst_table} {ddl}")
+    try:
+        node1.query(f"INSERT INTO {dst_table} VALUES (2, 'existing0')")
+        node1.query(f"INSERT INTO {src_table} VALUES (10, 'new0')")
+
+        # replace=false: src's partition-0 data joins dst's existing partition-0 data, nothing removed.
+        node1.query(f"ALTER TABLE {dst_table} ATTACH PARTITION 0 FROM {src_table}")
+
+        result = sorted(
+            node1.query(f"SELECT data FROM {dst_table} WHERE id % 2 = 0 ORDER BY id")
+            .strip()
+            .splitlines()
+        )
+        assert result == sorted(["existing0", "new0"])
+        assert node1.query(f"SELECT count() FROM {src_table}").strip() == "1"
+    finally:
+        node1.query(f"DROP TABLE IF EXISTS {src_table} SYNC")
+        node1.query(f"DROP TABLE IF EXISTS {dst_table} SYNC")
+
+
+def test_replace_partition_from_mismatched_schema_throws(cluster):
+    node1 = cluster.instances["node1"]
+    src_table = "cloud_test_replace_schema_src"
+    dst_table = "cloud_test_replace_schema_dst"
+
+    node1.query(f"DROP TABLE IF EXISTS {src_table} SYNC")
+    node1.query(f"DROP TABLE IF EXISTS {dst_table} SYNC")
+    node1.query(
+        f"CREATE TABLE {src_table} (id UInt64, extra UInt64) ENGINE = CloudMergeTree "
+        f"ORDER BY id SETTINGS storage_policy = 's3'"
+    )
+    node1.query(f"CREATE TABLE {dst_table} {TABLE_DDL}")
+    try:
+        # checkStructureAndGetMergeTreeData() (generic, engine-agnostic) rejects a column-list
+        # mismatch before any cloning is attempted.
+        with pytest.raises(QueryRuntimeException) as exc:
+            node1.query(f"ALTER TABLE {dst_table} REPLACE PARTITION ID 'all' FROM {src_table}")
+        assert "INCOMPATIBLE_COLUMNS" in str(exc.value)
+    finally:
+        node1.query(f"DROP TABLE IF EXISTS {src_table} SYNC")
+        node1.query(f"DROP TABLE IF EXISTS {dst_table} SYNC")
+
+
+def test_replace_partition_visible_on_destination_other_replica(cluster):
+    node1 = cluster.instances["node1"]
+    node2 = cluster.instances["node2"]
+    src_table = "cloud_test_replace_xreplica_src"
+    dst_table = "cloud_test_replace_xreplica_dst"
+
+    node1.query(f"DROP TABLE IF EXISTS {src_table} SYNC")
+    node1.query(f"DROP TABLE IF EXISTS {dst_table} SYNC")
+    node1.query(f"CREATE TABLE {src_table} {TABLE_DDL}")
+    node1.query(f"CREATE TABLE {dst_table} {TABLE_DDL}")
+    dst_uuid = node1.query(
+        f"SELECT uuid FROM system.tables WHERE table = '{dst_table}'"
+    ).strip()
+    node2.query(f"ATTACH TABLE {dst_table} UUID '{dst_uuid}' {TABLE_DDL}")
+    try:
+        node1.query(f"INSERT INTO {dst_table} VALUES (1, 'old')")
+        assert_eq_with_retry(node2, f"SELECT count() FROM {dst_table}", "1")
+
+        node1.query(f"INSERT INTO {src_table} VALUES (2, 'new')")
+        node1.query(f"ALTER TABLE {dst_table} REPLACE PARTITION ID 'all' FROM {src_table}")
+
+        # node2 never ran the REPLACE PARTITION itself -- purely Keeper-watcher-driven, same
+        # mechanism as any other cross-replica part-set change.
+        assert_eq_with_retry(node2, f"SELECT count() FROM {dst_table}", "1")
+        assert_eq_with_retry(node2, f"SELECT data FROM {dst_table} WHERE id = 2", "new")
+    finally:
+        node2.query(f"DROP TABLE IF EXISTS {dst_table} SYNC")
+        node1.query(f"DROP TABLE IF EXISTS {src_table} SYNC")
+
+
+def test_replace_partition_old_parts_survive_grace_period_then_reclaimed(cluster):
+    node1 = cluster.instances["node1"]
+    src_table = "cloud_test_replace_gc_src"
+    dst_table = "cloud_test_replace_gc_dst"
+
+    node1.query(f"DROP TABLE IF EXISTS {src_table} SYNC")
+    node1.query(f"DROP TABLE IF EXISTS {dst_table} SYNC")
+    node1.query(
+        f"CREATE TABLE {src_table} (id UInt64, data String) ENGINE = CloudMergeTree "
+        f"ORDER BY id SETTINGS storage_policy = 's3'"
+    )
+    node1.query(
+        f"CREATE TABLE {dst_table} (id UInt64, data String) ENGINE = CloudMergeTree "
+        f"ORDER BY id SETTINGS {GC_TABLE_DDL_SETTINGS}"
+    )
+    try:
+        dst_uuid = node1.query(
+            f"SELECT uuid FROM system.tables WHERE table = '{dst_table}'"
+        ).strip()
+        node1.query(f"INSERT INTO {dst_table} VALUES (1, 'old')")
+        node1.query(f"INSERT INTO {src_table} VALUES (2, 'new')")
+
+        node1.query(f"ALTER TABLE {dst_table} REPLACE PARTITION ID 'all' FROM {src_table}")
+        assert node1.query(f"SELECT data FROM {dst_table} WHERE id = 2").strip() == "new"
+
+        # The replaced-away old part is tombstoned (not deleted inline) -- same lazy-GC path as
+        # DROP PARTITION and merge sources.
+        assert (
+            int(
+                node1.query(
+                    f"SELECT count() FROM system.zookeeper WHERE path = "
+                    f"'/clickhouse/cloud_tables/{dst_uuid}/dropped_parts'"
+                ).strip()
+            )
+            > 0
+        )
+        assert_eq_with_retry(
+            node1,
+            f"SELECT count() FROM system.zookeeper WHERE path = "
+            f"'/clickhouse/cloud_tables/{dst_uuid}/dropped_parts'",
+            "0",
+            retry_count=30,
+            sleep_time=1,
+        )
+
+        assert node1.query(f"SELECT count() FROM {dst_table}").strip() == "1"
+        assert node1.query(f"SELECT data FROM {dst_table} WHERE id = 2").strip() == "new"
+    finally:
+        node1.query(f"DROP TABLE IF EXISTS {src_table} SYNC")
+        node1.query(f"DROP TABLE IF EXISTS {dst_table} SYNC")
