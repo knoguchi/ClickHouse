@@ -3155,38 +3155,409 @@ def test_lightweight_delete_removes_matching_rows(cluster):
         node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
 
 
-def test_lightweight_update_throws_not_implemented(cluster):
+LWU_TABLE_DDL_SETTINGS = (
+    "storage_policy = 's3', enable_block_number_column = 1, enable_block_offset_column = 1"
+)
+
+
+def test_lightweight_update_applies_and_visible_cross_replica(cluster):
     node1 = cluster.instances["node1"]
+    node2 = cluster.instances["node2"]
     table = TABLE_NAME
+    ddl = f"(id UInt64, c1 UInt64, c2 UInt64) ENGINE = CloudMergeTree ORDER BY id SETTINGS {LWU_TABLE_DDL_SETTINGS}"
 
     node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
-    node1.query(
-        f"CREATE TABLE {table} (id UInt64, c1 UInt64, c2 UInt64) ENGINE = CloudMergeTree "
-        f"ORDER BY id SETTINGS storage_policy = 's3', enable_block_number_column = 1, enable_block_offset_column = 1"
-    )
+    node1.query(f"CREATE TABLE {table} {ddl}")
+    table_uuid = node1.query(f"SELECT uuid FROM system.tables WHERE table = '{table}'").strip()
+    node2.query(f"ATTACH TABLE {table} UUID '{table_uuid}' {ddl}")
     try:
         node1.query(f"INSERT INTO {table} SELECT number, number, number FROM numbers(20)")
 
-        # UPDATE ... SET (lightweight update) writes a separate "patch part" instead of a
-        # mutation -- CloudMergeTreePartsCollector's own doc comment is explicit that
-        # CloudMergeTree has no patch-part support, and IStorage::updateLightweight()'s
-        # default (never overridden here) throws NOT_IMPLEMENTED before anything is written.
-        # This pins that fail-closed behavior: if patch-part support is ever added upstream to
-        # a shared base class CloudMergeTree inherits from without also teaching the Keeper
-        # part-set model about DataPartKind::Patch, this must keep failing loudly, not silently
-        # accept a write that the rest of this file's machinery (DataPartKind::Regular-only
-        # everywhere) would then mishandle.
-        with pytest.raises(QueryRuntimeException, match="NOT_IMPLEMENTED"):
+        # UPDATE ... SET (lightweight update) writes a "patch part" -- a normal
+        # DataPartKind::Patch part carrying only the updated column(s), committed through the
+        # exact same commitInsertedPart() Keeper-commit hook INSERT already uses (see
+        # CloudMergeTreeSinkPatch) -- rather than rewriting the base part like a heavy mutation.
+        node1.query(
+            f"UPDATE {table} SET c2 = c1 * c1 WHERE id % 2 = 0 "
+            f"SETTINGS enable_lightweight_update = 1, apply_patch_parts = 1"
+        )
+
+        # sum(0..19) = 190; even ids get replaced by their square, odd ids keep c1 unchanged
+        # (c2 stays equal to id for odd ids). sum(i*i for even i in 0..18) + sum(odd i in 1..19).
+        expected = sum(i * i for i in range(0, 20, 2)) + sum(i for i in range(1, 20, 2))
+        assert node1.query(f"SELECT sum(c2) FROM {table}").strip() == str(expected)
+
+        # A patch part exists and is registered in Keeper under its own synthetic
+        # 'patch-<hash>-<partition_id>' partition (see PatchPartInfo.h's doc comment).
+        assert (
+            int(node1.query(f"SELECT count() FROM system.parts WHERE table = '{table}' AND active AND partition_id LIKE 'patch-%'").strip())
+            > 0
+        )
+
+        # The patch part commits through Keeper like any other -- the second replica's watcher
+        # picks it up and applies it on read without ever running the UPDATE itself.
+        assert_eq_with_retry(node2, f"SELECT sum(c2) FROM {table}", str(expected))
+    finally:
+        node2.query(f"DROP TABLE IF EXISTS {table} SYNC")
+        node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
+
+
+def test_lightweight_update_concurrent_from_both_replicas_both_apply(cluster):
+    node1 = cluster.instances["node1"]
+    node2 = cluster.instances["node2"]
+    table = TABLE_NAME
+    ddl = f"(id UInt64, c1 UInt64, c2 UInt64) ENGINE = CloudMergeTree ORDER BY id SETTINGS {LWU_TABLE_DDL_SETTINGS}"
+
+    node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
+    node1.query(f"CREATE TABLE {table} {ddl}")
+    table_uuid = node1.query(f"SELECT uuid FROM system.tables WHERE table = '{table}'").strip()
+    node2.query(f"ATTACH TABLE {table} UUID '{table_uuid}' {ddl}")
+    try:
+        node1.query(f"INSERT INTO {table} SELECT number, number, number FROM numbers(20)")
+        assert_eq_with_retry(node2, f"SELECT count() FROM {table}", "20")
+
+        # Two DIFFERENT replicas issue UPDATEs on disjoint row subsets of the SAME partition at
+        # the same wall-clock time -- two genuinely concurrent CloudMergeTreeSinkPatch commits,
+        # each independently allocating its own Keeper block number (data version) for the same
+        # partition's block_numbers/ sequence, each going through getLockForLightweightUpdateInKeeper
+        # (default update_parallel_mode=AUTO: since both target column c2, the affected-columns
+        # conflict check serializes them at the Keeper lock rather than truly overlapping -- this
+        # is the correct, expected AUTO-mode behavior, not a test artifact) and each independently
+        # committing its own patch part via commitInsertedPart(), the same Keeper-first commit path
+        # every other part kind in this engine already uses.
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [
+                executor.submit(
+                    node1.query,
+                    f"UPDATE {table} SET c2 = c1 * c1 WHERE id % 2 = 0 "
+                    f"SETTINGS enable_lightweight_update = 1, apply_patch_parts = 1",
+                ),
+                executor.submit(
+                    node2.query,
+                    f"UPDATE {table} SET c2 = c1 * 1000 WHERE id % 2 = 1 "
+                    f"SETTINGS enable_lightweight_update = 1, apply_patch_parts = 1",
+                ),
+            ]
+            for future in futures:
+                future.result()
+
+        expected = sum(i * i for i in range(0, 20, 2)) + sum(i * 1000 for i in range(1, 20, 2))
+        assert_eq_with_retry(node1, f"SELECT sum(c2) FROM {table}", str(expected))
+        assert_eq_with_retry(node2, f"SELECT sum(c2) FROM {table}", str(expected))
+
+        # At least one patch part exists (proves both commits genuinely landed and neither
+        # silently collided on Keeper block-number allocation or the DETACH-guard/absorption-GC
+        # machinery -- if either commit had been lost, sum(c2) above would already have caught it,
+        # this is a second, more direct signal). Not asserting an exact count: Phase E's own
+        # automatic patch-to-patch compaction (see test_lightweight_update_many_small_updates_
+        # merge_into_one_patch) can legitimately have already merged the two small patches this
+        # test produces into one by the time this check runs -- that's the feature working
+        # correctly, not a race to guard against here.
+        assert (
+            int(node1.query(f"SELECT count() FROM system.parts WHERE table = '{table}' AND active AND partition_id LIKE 'patch-%'").strip())
+            >= 1
+        )
+    finally:
+        node2.query(f"DROP TABLE IF EXISTS {table} SYNC")
+        node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
+
+
+def test_lightweight_update_dedup_disabled_identical_updates_both_apply(cluster):
+    node1 = cluster.instances["node1"]
+    table = TABLE_NAME
+    ddl = f"(id UInt64, c1 UInt64, c2 UInt64) ENGINE = CloudMergeTree ORDER BY id SETTINGS {LWU_TABLE_DDL_SETTINGS}"
+
+    node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
+    node1.query(f"CREATE TABLE {table} {ddl}")
+    try:
+        node1.query(f"INSERT INTO {table} SELECT number, number, number FROM numbers(10)")
+
+        # Two UPDATE statements producing byte-identical patch content (same predicate, same
+        # SET, no data changed in between) must both commit as separate patch parts, not
+        # dedup-collide on the second one -- see CloudMergeTreeSinkPatch's own doc comment on
+        # why deduplication_hashes is always empty for patch parts.
+        for _ in range(2):
             node1.query(
                 f"UPDATE {table} SET c2 = c1 * c1 WHERE id % 2 = 0 "
                 f"SETTINGS enable_lightweight_update = 1, apply_patch_parts = 1"
             )
 
-        # Confirms the rejection happened before writing anything -- c2 (pre-populated to
-        # 0..19 by the INSERT, sum 190) must be completely unchanged by the rejected UPDATE,
-        # not a partial/half-applied patch.
-        assert node1.query(f"SELECT sum(c2) FROM {table}").strip() == "190"
+        patch_part_count = int(
+            node1.query(
+                f"SELECT count() FROM system.parts WHERE table = '{table}' AND active AND partition_id LIKE 'patch-%'"
+            ).strip()
+        )
+        assert patch_part_count == 2, (
+            f"expected both identical UPDATEs to commit as separate patch parts, got {patch_part_count}"
+        )
     finally:
+        node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
+
+
+def test_lightweight_update_many_small_updates_merge_into_one_patch(cluster):
+    node1 = cluster.instances["node1"]
+    table = TABLE_NAME
+    ddl = f"(id UInt64, c1 UInt64, c2 UInt64) ENGINE = CloudMergeTree ORDER BY id SETTINGS {LWU_TABLE_DDL_SETTINGS}"
+
+    node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
+    node1.query(f"CREATE TABLE {table} {ddl}")
+    try:
+        node1.query(f"INSERT INTO {table} SELECT number, number, number FROM numbers(30)")
+
+        # Each UPDATE targets a disjoint slice of rows, so every one of them produces its own
+        # patch part in the same synthetic patch partition -- CloudMergeTreePartsCollector's
+        # patch-scoped selection path (StorageCloudMergeTree::selectPartsToMerge()'s second
+        # attempt) should compact them into one via ordinary background merge selection, the
+        # same way it compacts regular parts, without any explicit OPTIMIZE.
+        for i in range(6):
+            node1.query(
+                f"UPDATE {table} SET c2 = c1 * c1 WHERE id % 6 = {i} "
+                f"SETTINGS enable_lightweight_update = 1, apply_patch_parts = 1"
+            )
+
+        assert_eq_with_retry(
+            node1,
+            f"SELECT count() FROM system.parts WHERE table = '{table}' AND active AND partition_id LIKE 'patch-%'",
+            "1",
+            retry_count=60,
+            sleep_time=1,
+        )
+
+        expected = sum(i * i for i in range(30))
+        assert node1.query(f"SELECT sum(c2) FROM {table}").strip() == str(expected)
+    finally:
+        node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
+
+
+def test_lightweight_update_absorption_gc_removes_patch_after_merge(cluster):
+    node1 = cluster.instances["node1"]
+    table = TABLE_NAME
+    ddl = (
+        f"(id UInt64, c1 UInt64, c2 UInt64) ENGINE = CloudMergeTree ORDER BY id "
+        f"SETTINGS {LWU_TABLE_DDL_SETTINGS}, cloud_merge_tree_gc_grace_period_seconds = 5, "
+        f"cloud_merge_tree_gc_interval_ms = 1000"
+    )
+
+    node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
+    node1.query(f"CREATE TABLE {table} {ddl}")
+    try:
+        node1.query(f"INSERT INTO {table} SELECT number, number, number FROM numbers(10)")
+        node1.query(
+            f"UPDATE {table} SET c2 = c1 * c1 WHERE id % 2 = 0 "
+            f"SETTINGS enable_lightweight_update = 1, apply_patch_parts = 1"
+        )
+        assert (
+            int(node1.query(f"SELECT count() FROM system.parts WHERE table = '{table}' AND active AND partition_id LIKE 'patch-%'").strip())
+            == 1
+        )
+
+        # OPTIMIZE TABLE FINAL merges every regular part into one whose data_version is >= the
+        # patch's own max_data_version -- runPartsKillerCycle()'s absorption-GC pass (Phase F)
+        # should then find every active regular part in the partition already past the patch's
+        # max_data_version and tombstone it. No explicit trigger needed: the low
+        # cloud_merge_tree_gc_interval_ms above means the next background cycle picks it up on
+        # its own, same as any other GC-driven removal in this suite.
+        node1.query(f"OPTIMIZE TABLE {table} FINAL")
+
+        assert_eq_with_retry(
+            node1,
+            f"SELECT count() FROM system.parts WHERE table = '{table}' AND active AND partition_id LIKE 'patch-%'",
+            "0",
+            retry_count=60,
+            sleep_time=1,
+        )
+
+        expected = sum(i * i for i in range(0, 10, 2)) + sum(i for i in range(1, 10, 2))
+        assert node1.query(f"SELECT sum(c2) FROM {table}").strip() == str(expected)
+    finally:
+        node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
+
+
+def test_lightweight_update_drop_partition_removes_patch_cascade(cluster):
+    node1 = cluster.instances["node1"]
+    node2 = cluster.instances["node2"]
+    table = TABLE_NAME
+    ddl = (
+        f"(id UInt64, c1 UInt64, c2 UInt64) ENGINE = CloudMergeTree ORDER BY id "
+        f"PARTITION BY id % 2 SETTINGS {LWU_TABLE_DDL_SETTINGS}"
+    )
+
+    node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
+    node1.query(f"CREATE TABLE {table} {ddl}")
+    table_uuid = node1.query(f"SELECT uuid FROM system.tables WHERE table = '{table}'").strip()
+    node2.query(f"ATTACH TABLE {table} UUID '{table_uuid}' {ddl}")
+    try:
+        node1.query(f"INSERT INTO {table} SELECT number, number, number FROM numbers(20)")
+        node1.query(
+            f"UPDATE {table} SET c2 = c1 * c1 WHERE id % 2 = 0 "
+            f"SETTINGS enable_lightweight_update = 1, apply_patch_parts = 1"
+        )
+        assert (
+            int(node1.query(f"SELECT count() FROM system.parts WHERE table = '{table}' AND active AND partition_id LIKE 'patch-%'").strip())
+            > 0
+        )
+
+        # DROP PARTITION 0 must synchronously tombstone both the regular parts of partition 0
+        # AND the patch part covering it -- see dropPartition()'s partitionIdMatchesOrIsPatchOf
+        # predicate -- so no orphaned patch znode is left behind with no surviving regular part
+        # in its original partition to ever absorb it.
+        node1.query(f"ALTER TABLE {table} DROP PARTITION 0")
+
+        assert node1.query(f"SELECT count() FROM system.parts WHERE table = '{table}' AND active AND partition_id LIKE 'patch-%'").strip() == "0"
+        assert node1.query(f"SELECT count() FROM {table} WHERE id % 2 = 0").strip() == "0"
+        # Partition 1 (odd ids), never targeted by the UPDATE or the DROP, is untouched.
+        assert node1.query(f"SELECT count() FROM {table} WHERE id % 2 = 1").strip() == "10"
+
+        # The cascade-drop is a normal Keeper removal -- the second replica's watcher picks it
+        # up without running anything itself.
+        assert_eq_with_retry(node2, f"SELECT count() FROM {table} WHERE id % 2 = 0", "0")
+        assert_eq_with_retry(node2, f"SELECT count() FROM {table} WHERE id % 2 = 1", "10")
+    finally:
+        node2.query(f"DROP TABLE IF EXISTS {table} SYNC")
+        node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
+
+
+def test_lightweight_update_detach_partition_rejects_with_unabsorbed_patch(cluster):
+    node1 = cluster.instances["node1"]
+    table = TABLE_NAME
+    ddl = f"(id UInt64, c1 UInt64, c2 UInt64) ENGINE = CloudMergeTree ORDER BY id SETTINGS {LWU_TABLE_DDL_SETTINGS}"
+
+    node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
+    node1.query(f"CREATE TABLE {table} {ddl}")
+    try:
+        node1.query(f"INSERT INTO {table} SELECT number, number, number FROM numbers(10)")
+        node1.query(
+            f"UPDATE {table} SET c2 = c1 * c1 WHERE id % 2 = 0 "
+            f"SETTINGS enable_lightweight_update = 1, apply_patch_parts = 1"
+        )
+        expected = sum(i * i for i in range(0, 10, 2)) + sum(i for i in range(1, 10, 2))
+        assert node1.query(f"SELECT sum(c2) FROM {table}").strip() == str(expected)
+
+        # Only the base part would be detached; the pending patch would be left behind, so a
+        # later re-ATTACH would silently revert the update for its rows -- matches vanilla's own
+        # StorageMergeTree/StorageReplicatedMergeTree rejection (assertNoPatchesForParts) for the
+        # identical scenario, reused unchanged here.
+        with pytest.raises(QueryRuntimeException, match="SUPPORT_IS_DISABLED"):
+            node1.query(f"ALTER TABLE {table} DETACH PARTITION ID 'all'")
+        assert node1.query(f"SELECT sum(c2) FROM {table}").strip() == str(expected)
+
+        # Once the patch is fully absorbed (OPTIMIZE TABLE FINAL merges every regular part past
+        # its max_data_version -- same mechanism test_lightweight_update_absorption_gc_removes_
+        # patch_after_merge exercises), DETACH/ATTACH is a completely ordinary roundtrip again.
+        node1.query(f"OPTIMIZE TABLE {table} FINAL")
+        assert_eq_with_retry(
+            node1,
+            f"SELECT count() FROM system.parts WHERE table = '{table}' AND active AND partition_id LIKE 'patch-%'",
+            "0",
+            retry_count=60,
+            sleep_time=1,
+        )
+
+        node1.query(f"ALTER TABLE {table} DETACH PARTITION ID 'all'")
+        assert node1.query(f"SELECT count() FROM {table}").strip() == "0"
+
+        node1.query(f"ALTER TABLE {table} ATTACH PARTITION ID 'all'")
+        assert node1.query(f"SELECT sum(c2) FROM {table}").strip() == str(expected)
+    finally:
+        node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
+
+
+def test_lightweight_update_replace_partition_rejects_when_unabsorbed_patch(cluster):
+    node1 = cluster.instances["node1"]
+    src_table = "cloud_test_lwu_replace_src"
+    dst_table = "cloud_test_lwu_replace_dst"
+    ddl = (
+        f"(id UInt64, c1 UInt64, c2 UInt64) ENGINE = CloudMergeTree ORDER BY id "
+        f"PARTITION BY id % 2 SETTINGS {LWU_TABLE_DDL_SETTINGS}"
+    )
+
+    node1.query(f"DROP TABLE IF EXISTS {src_table} SYNC")
+    node1.query(f"DROP TABLE IF EXISTS {dst_table} SYNC")
+    node1.query(f"CREATE TABLE {src_table} {ddl}")
+    node1.query(f"CREATE TABLE {dst_table} {ddl}")
+    try:
+        node1.query(f"INSERT INTO {src_table} SELECT number, number, number FROM numbers(10)")
+        node1.query(
+            f"UPDATE {src_table} SET c2 = c1 * c1 WHERE id % 2 = 0 "
+            f"SETTINGS enable_lightweight_update = 1, apply_patch_parts = 1"
+        )
+        assert (
+            int(node1.query(f"SELECT count() FROM system.parts WHERE table = '{src_table}' AND active AND partition_id LIKE 'patch-%'").strip())
+            > 0
+        )
+
+        # v1 scope cut (see replacePartitionFrom()'s own doc comment): cross-table partition
+        # transfer with an unabsorbed patch pending in the source partition is rejected
+        # outright rather than silently orphaning it.
+        with pytest.raises(QueryRuntimeException, match="NOT_IMPLEMENTED"):
+            node1.query(f"ALTER TABLE {dst_table} REPLACE PARTITION 0 FROM {src_table}")
+    finally:
+        node1.query(f"DROP TABLE IF EXISTS {src_table} SYNC")
+        node1.query(f"DROP TABLE IF EXISTS {dst_table} SYNC")
+
+
+def test_patch_gc_absorption_check_pause_does_not_corrupt_concurrent_gc(cluster):
+    node1 = cluster.instances["node1"]
+    node2 = cluster.instances["node2"]
+    table = TABLE_NAME
+    failpoint = "cloud_merge_tree_patch_gc_absorption_check_pause"
+    ddl = (
+        f"(id UInt64, c1 UInt64, c2 UInt64) ENGINE = CloudMergeTree ORDER BY id "
+        f"SETTINGS {LWU_TABLE_DDL_SETTINGS}, cloud_merge_tree_gc_grace_period_seconds = 5, "
+        f"cloud_merge_tree_gc_interval_ms = 1000"
+    )
+
+    node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
+    node1.query(f"CREATE TABLE {table} {ddl}")
+    table_uuid = node1.query(f"SELECT uuid FROM system.tables WHERE table = '{table}'").strip()
+    node2.query(f"ATTACH TABLE {table} UUID '{table_uuid}' {ddl}")
+    try:
+        node1.query(f"INSERT INTO {table} SELECT number, number, number FROM numbers(10)")
+        node1.query(
+            f"UPDATE {table} SET c2 = c1 * c1 WHERE id % 2 = 0 "
+            f"SETTINGS enable_lightweight_update = 1, apply_patch_parts = 1"
+        )
+        node1.query(f"OPTIMIZE TABLE {table} FINAL")
+
+        # Park node1's absorption-GC cycle right after it has read the patch's trailer (its
+        # committed max_data_version) but before the tombstone decision -- proves the decision
+        # made from that single Keeper-fresh read stays self-consistent even while further,
+        # unrelated Keeper activity (node2 runs its own concurrent GC cycle too -- is_az_leader
+        # defaults to true for both nodes here, neither has AZ placement configured -- plus an
+        # ordinary concurrent INSERT below) continues in parallel.
+        node1.query(f"SYSTEM ENABLE FAILPOINT {failpoint}")
+        try:
+            # Longer than this suite's other failpoint waits: under full-suite parallel load
+            # (89+ tables' cumulative background-schedule-pool tasks from earlier tests in this
+            # same file, sharing one BackgroundSchedulePool with this table), a 1s GC interval can
+            # occasionally take several minutes of wall-clock time to actually get a worker
+            # thread, even though the mechanism itself is correct (proven by this same test
+            # passing reliably in isolation and in a small batch -- see this test's own history).
+            _wait_failpoint_paused(node1, failpoint, timeout=300)
+
+            # Ordinary, unrelated write activity while node1's GC decision is parked -- must not
+            # be disturbed by, or disturb, the paused GC cycle.
+            node2.query(f"INSERT INTO {table} VALUES (100, 1, 1)")
+            assert_eq_with_retry(node1, f"SELECT count() FROM {table}", "11")
+
+            node1.query(f"SYSTEM NOTIFY FAILPOINT {failpoint}")
+        finally:
+            node1.query(f"SYSTEM DISABLE FAILPOINT {failpoint}")
+
+        assert_eq_with_retry(
+            node1,
+            f"SELECT count() FROM system.parts WHERE table = '{table}' AND active AND partition_id LIKE 'patch-%'",
+            "0",
+            retry_count=60,
+            sleep_time=1,
+        )
+
+        expected = sum(i * i for i in range(0, 10, 2)) + sum(i for i in range(1, 10, 2)) + 1
+        assert_eq_with_retry(node1, f"SELECT sum(c2) FROM {table}", str(expected))
+        assert_eq_with_retry(node2, f"SELECT sum(c2) FROM {table}", str(expected))
+    finally:
+        node1.query(f"SYSTEM DISABLE FAILPOINT {failpoint}")
+        node2.query(f"DROP TABLE IF EXISTS {table} SYNC")
         node1.query(f"DROP TABLE IF EXISTS {table} SYNC")
 
 

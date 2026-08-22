@@ -1,5 +1,6 @@
 #include <Storages/MergeTree/CloudMergeTree/StorageCloudMergeTree.h>
 #include <Storages/MergeTree/CloudMergeTree/CloudMergeTreeSink.h>
+#include <Storages/MergeTree/CloudMergeTree/CloudMergeTreeSinkPatch.h>
 #include <Storages/MergeTree/CloudMergeTree/CloudMergeTreeMergePredicate.h>
 #include <Storages/MergeTree/CloudMergeTree/CloudMergeTreePartsCollector.h>
 #include <Storages/MergeTree/CloudMergeTree/CloudMergePlainMergeTreeTask.h>
@@ -14,6 +15,8 @@
 #include <Server/CloudPlacementInfo.h>
 
 #include <Storages/MergeTree/MergeTreeDataSelectExecutor.h>
+#include <Storages/MergeTree/PatchParts/PatchPartsUtils.h>
+#include <Storages/MergeTree/PatchParts/PatchPartsLock.h>
 #include <Storages/MergeTree/ReplicatedMergeTreePartHeader.h>
 #include <Storages/MergeTree/MergeTreeSettings.h>
 #include <Core/Settings.h>
@@ -71,6 +74,7 @@ namespace FailPoints
     extern const char cloud_merge_tree_merge_lease_acquired[];
     extern const char cloud_merge_tree_schedule_pause[];
     extern const char cloud_merge_tree_part_set_watcher_pause[];
+    extern const char cloud_merge_tree_patch_gc_absorption_check_pause[];
 }
 
 namespace ErrorCodes
@@ -98,25 +102,29 @@ namespace MergeTreeSetting
     extern const MergeTreeSettingsUInt64 cloud_merge_tree_az_leader_recheck_ms;
     extern const MergeTreeSettingsSeconds lock_acquire_timeout_for_background_operations;
     extern const MergeTreeSettingsBool allow_experimental_replacing_merge_with_cleanup;
+    extern const MergeTreeSettingsMergeTreePatchPartsVersion patch_parts_version;
 }
 
 namespace Setting
 {
     extern const SettingsBool optimize_skip_merged_partitions;
     extern const SettingsUInt64 select_sequential_consistency;
+    extern const SettingsUpdateParallelMode update_parallel_mode;
 }
 
-/// No on-the-fly mutation commands or patch parts to report -- CloudMergeTree has no patch-part
-/// support (see CloudMergeTreePartsCollector's own doc comment) and never batches unapplied
+/// No on-the-fly mutation commands to report here -- CloudMergeTree never batches unapplied
 /// mutation commands onto a part's read path (every applied mutation is already baked into the
-/// part it produced, via the same commitMergedPart() a merge uses). MutationsSnapshotBase already
-/// implements the patch/flags accessors from whatever Params/MutationCounters it's constructed
-/// with -- see getMutationsSnapshot() below for why those must NOT be defaulted.
+/// part it produced, via the same commitMergedPart() a merge uses). Patch parts (lightweight
+/// UPDATE, see updateLightweight()/CloudMergeTreeSinkPatch below) ARE reported here, via
+/// getMutationsSnapshot()'s own patch_parts population -- MutationsSnapshotBase already
+/// implements the patch/flags accessors from whatever Params/MutationCounters/patches it's
+/// constructed with -- see getMutationsSnapshot() below for why the first two must NOT be
+/// defaulted.
 struct StorageCloudMergeTree::MutationsSnapshot final : public MergeTreeData::MutationsSnapshotBase
 {
     MutationsSnapshot() = default;
-    MutationsSnapshot(Params params_, MutationCounters counters_)
-        : MergeTreeData::MutationsSnapshotBase(std::move(params_), std::move(counters_), /*patches_=*/{})
+    MutationsSnapshot(Params params_, MutationCounters counters_, DataPartsVector patches_ = {})
+        : MergeTreeData::MutationsSnapshotBase(std::move(params_), std::move(counters_), std::move(patches_))
     {
     }
 
@@ -461,7 +469,7 @@ void StorageCloudMergeTree::removeLocationAuthorityByLocation(const String & par
     }
 }
 
-StorageCloudMergeTree::MutableDataPartPtr StorageCloudMergeTree::buildPartFromDisk(const String & name)
+StorageCloudMergeTree::MutableDataPartPtr StorageCloudMergeTree::buildPartFromDisk(const String & name, bool is_attach)
 {
     auto disks = getStoragePolicy()->getDisks();
     const auto & disk = disks.front();
@@ -495,7 +503,28 @@ StorageCloudMergeTree::MutableDataPartPtr StorageCloudMergeTree::buildPartFromDi
 
     try
     {
-        loadPartAndFixMetadataImpl(part, getContext());
+        if (is_attach)
+        {
+            /// Genuine ATTACH: this part's provenance relative to the CURRENT schema is unknown
+            /// (matches vanilla's own ATTACH-from-detached scenarios that also call this) -- see
+            /// buildPartFromDisk()'s own doc comment in the header for why this must NOT run for
+            /// routine cross-replica adoption below.
+            loadPartAndFixMetadataImpl(part, getContext());
+        }
+        else
+        {
+            /// Routine adoption of an already-active, freshly-committed-elsewhere part --
+            /// structurally equivalent to StorageReplicatedMergeTree::fetchPart(), which does no
+            /// system-column invalidation. Same sequence as loadPartAndFixMetadataImpl() minus its
+            /// writeInvalidatedSystemColumnsFile() call for _block_number/_block_offset: those
+            /// columns' per-row values are valid here (this part was written moments ago under
+            /// the current schema) and reads that depend on them -- including a lightweight-UPDATE
+            /// patch applying against this part -- must see them as such, not as invalidated.
+            part->loadColumnsChecksumsIndexes(false, true);
+            part->modification_time = part->getDataPartStorage().getLastModified().epochTime();
+            part->removeDeleteOnDestroyMarker();
+            part->removeVersionMetadata();
+        }
     }
     catch (const Exception &)
     {
@@ -1081,7 +1110,18 @@ StorageCloudMergeTree::MutationsSnapshotPtr StorageCloudMergeTree::getMutationsS
     /// from, and reading Keeper's pending mutation list into this snapshot for that purpose alone
     /// is a real, separate, smaller follow-up -- not something this fix's reproduced bug
     /// (an already-applied lightweight-delete mask being miscounted) requires.
-    return std::make_shared<MutationsSnapshot>(params, MutationCounters{});
+    ///
+    /// need_patch_parts: same one-line pattern StorageMergeTree::getMutationsSnapshot() uses.
+    /// getPatchPartsVectorForInternalUsage() (base MergeTreeData method, unmodified) reads
+    /// whatever this replica currently has loaded as DataPartKind::Patch in data_parts_indexes --
+    /// this is the entire read-path change lightweight UPDATE needs here: everything downstream
+    /// (MutationsSnapshotBase::getPatchesForPart(), getAlterConversionsForPart(), and every
+    /// SELECT/projection/skip-index path built on top of them) is MergeTreeData-generic and
+    /// already unaffected by anything CloudMergeTree-specific.
+    DataPartsVector patch_parts;
+    if (params.need_patch_parts)
+        patch_parts = getPatchPartsVectorForInternalUsage();
+    return std::make_shared<MutationsSnapshot>(params, MutationCounters{}, std::move(patch_parts));
 }
 
 CursorPromotersMap StorageCloudMergeTree::buildPromoters()
@@ -1104,6 +1144,14 @@ std::unique_ptr<MergeTreeSettings> StorageCloudMergeTree::getDefaultSettings() c
     /// unconditionally on any disk. See checkMutationIsPossible() below, which skips the disk
     /// hard-link check this same setting exists to make unnecessary.
     settings->set("always_use_copy_instead_of_hardlinks", true);
+
+    /// Force-enabled, not just left at its already-v2 upstream default: supportsLightweightUpdate()
+    /// below rejects v1 explicitly, but a table created before that check existed (or with an
+    /// explicit MergeTree setting override) could otherwise end up with v1 patches whose Join-mode
+    /// covering-part-name lookup nothing in this engine implements -- forcing it here closes that
+    /// gap the same way always_use_copy_instead_of_hardlinks above forces its own setting rather
+    /// than trusting every caller to pass it correctly.
+    settings->set("patch_parts_version", "v2");
     return settings;
 }
 
@@ -1191,6 +1239,43 @@ std::expected<CloudMergeMutateSelectedEntryPtr, SelectMergeFailure> StorageCloud
         /// heuristic entirely -- see MergeTreeDataMergerMutator::selectAllPartsToMergeWithinPartition.
         select_result = merger_mutator.selectAllPartsToMergeWithinPartition(
             metadata_snapshot, parts_collector, merge_predicate, partition_id, final, optimize_skip_merged_partitions);
+    }
+
+    /// Patch-to-patch compaction: tried only for the background path (an explicit OPTIMIZE
+    /// TABLE ... PARTITION p always names a real table partition, never a synthetic
+    /// patch-<hash>-p one, so there's nothing to add there), and only once regular-merge
+    /// selection above found nothing -- same two-phase shape selectPartsToMutate() below already
+    /// uses relative to this function (merge tried first, mutation second). Cost-based selection
+    /// has no natural cross-partition equivalent for patches (each UPDATE's rows live in their
+    /// own synthetic partition, unrelated in content/size to any other), so instead scan every
+    /// currently-active patch partition and grab it whole via selectAllPartsToMergeWithinPartition
+    /// -- the same "take the whole partition, no cost heuristic" call OPTIMIZE PARTITION already
+    /// makes above, just driven automatically here instead of by an explicit user command.
+    /// Not gated on a specific failure reason: the regular-merge attempt's "nothing to combine"
+    /// case (only one part per partition, or no partition crosses the merge-selector's threshold)
+    /// reports CANNOT_SELECT, not NOTHING_TO_MERGE -- see MergeTreeDataMergerMutator::
+    /// selectPartsToMerge()'s own "There is no need to merge parts according to merge selector
+    /// algorithm" case. Any failure of the regular attempt is a reasonable trigger to also try
+    /// the patch attempt; a genuine error (e.g. max_source_parts_bytes misconfigured) just means
+    /// this second attempt harmlessly finds nothing either.
+    if (!select_result.has_value() && partition_id.empty())
+    {
+        std::unordered_set<String> patch_partition_ids;
+        for (const auto & patch : getPatchPartsVectorForInternalUsage())
+            patch_partition_ids.insert(patch->info.getPartitionId());
+
+        for (const auto & patch_partition_id : patch_partition_ids)
+        {
+            auto patch_parts_collector = std::make_shared<CloudMergeTreePartsCollector>(*this, merge_predicate, DataPartKind::Patch);
+            auto patch_select_result = merger_mutator.selectAllPartsToMergeWithinPartition(
+                metadata_snapshot, patch_parts_collector, merge_predicate, patch_partition_id,
+                /*final=*/ false, /*optimize_skip_merged_partitions=*/ false);
+            if (patch_select_result.has_value())
+            {
+                select_result = std::move(patch_select_result);
+                break;
+            }
+        }
     }
 
     if (!select_result.has_value())
@@ -1450,6 +1535,87 @@ void StorageCloudMergeTree::checkMutationIsPossible(const MutationCommands &, co
     /// See the declaration's doc comment in StorageCloudMergeTree.h: deliberately not calling
     /// MergeTreeData::checkMutationIsPossible() here, since its disk hard-link check would reject
     /// every CloudMergeTree table outright.
+}
+
+std::expected<void, PreformattedMessage> StorageCloudMergeTree::supportsLightweightUpdate() const
+{
+    if (auto base_result = MergeTreeData::supportsLightweightUpdate(); !base_result)
+        return base_result;
+
+    /// See the declaration's doc comment in StorageCloudMergeTree.h: v1's Join mode needs
+    /// covering-part-name lookup after merges, which nothing else in this engine implements.
+    if ((*getSettings())[MergeTreeSetting::patch_parts_version] != MergeTreePatchPartsVersion::V2)
+        return std::unexpected(PreformattedMessage::create(
+            "CloudMergeTree only supports lightweight UPDATE with patch_parts_version='v2'"));
+
+    return {};
+}
+
+QueryPipeline StorageCloudMergeTree::updateLightweight(const MutationCommands & commands, ContextPtr local_context)
+{
+    auto component_guard = Coordination::setCurrentComponent("StorageCloudMergeTree::updateLightweight");
+
+    /// See the declaration's doc comment: async relies on client-side ordering assumptions never
+    /// traced against CMT's Keeper-ordered write path -- reject explicitly rather than silently
+    /// accepting an unverified mode.
+    if (local_context->getSettingsRef()[Setting::update_parallel_mode] == UpdateParallelMode::ASYNC)
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+            "update_parallel_mode='async' is not supported for CloudMergeTree lightweight UPDATE");
+
+    auto context_copy = Context::createCopy(local_context);
+    auto zk = getZooKeeper();
+    auto zk_fault = std::make_shared<ZooKeeperWithFaultInjection>(zk);
+
+    /// One Keeper block number per affected *original* partition, allocated up front: this is the
+    /// "data version" every patch part produced for that partition gets stamped with (see
+    /// PatchPartIndex/buildPatchPartIndex), NOT the block number that will later name the patch
+    /// part itself -- that's a separate allocation commitInsertedPart() makes on the patch's own
+    /// synthetic patch-<hash>-<partition_id> partition, same as it does for every other part kind.
+    /// Released immediately after reading the number: unlike commitInsertedPart()'s block lock,
+    /// this one never corresponds to a part actually committed into that partition, so holding it
+    /// any longer would only block other concurrent writers for no reason.
+    std::unordered_map<String, Int64> partition_data_versions;
+    auto affected_partition_ids = getPartitionIdsAffectedByCommands(commands, context_copy);
+    if (affected_partition_ids.empty())
+    {
+        /// No command carried an explicit PARTITION clause: applies table-wide -- same fallback
+        /// buildMutationEntry() uses for the identical situation (see its own doc comment): every
+        /// partition that currently has a block_numbers/<partition_id> znode (Keeper-authoritative,
+        /// unlike this replica's own local active-parts view).
+        for (const auto & name : zk->getChildren(coordination.blockNumbersPath()))
+            affected_partition_ids.insert(name);
+    }
+    for (const auto & partition_id : affected_partition_ids)
+    {
+        coordination.ensureBlockNumbersPartition(zk, partition_id);
+        auto block_lock = createEphemeralLockInZooKeeper(
+            coordination.blockNumbersPartitionPath(partition_id) + "/block-",
+            coordination.tempPath(),
+            zk_fault,
+            /*deduplication_paths=*/{},
+            /*znode_data=*/std::nullopt);
+        partition_data_versions.emplace(partition_id, block_lock.getNumber());
+        block_lock.unlock();
+    }
+
+    /// Generic, reused unmodified: handles sync/auto internally (see its own doc comment in
+    /// PatchPartsLock.h), returns nullptr for async (already rejected above). zookeeper_path is
+    /// the table root, NOT <root>/lightweight_updates -- getLockForSyncMode()/getLockForAutoMode()
+    /// append "lightweight_updates" themselves (mirrors how StorageReplicatedMergeTree passes its
+    /// own zookeeper_path unchanged here too).
+    auto update_lock = getLockForLightweightUpdateInKeeper(
+        commands, context_copy, zk, coordination.getRootPath());
+
+    /// Inherited from MergeTreeData unchanged: the entire read-snapshot-and-produce-patch-rows
+    /// pipeline is table-shape-agnostic, built purely from MergeTreeSettings/
+    /// StorageInMemoryMetadata, no StorageReplicatedMergeTree-specific member access.
+    auto result = updateLightweightImpl(commands, context_copy);
+
+    auto sink = std::make_shared<CloudMergeTreeSinkPatch>(
+        *this, std::move(result.patch_metadata), std::move(partition_data_versions), std::move(update_lock), context_copy);
+    chassert(!result.pipeline.completed());
+    result.pipeline.complete(std::move(sink));
+    return std::move(result.pipeline);
 }
 
 void StorageCloudMergeTree::alter(const AlterCommands & params, ContextPtr local_context, AlterLockHolder & alter_lock_holder)
@@ -1930,9 +2096,21 @@ void StorageCloudMergeTree::backupData(
             auto in_partition = getDataPartsVectorInPartitionForInternalUsage(DataPartState::Active, partition_id, lock);
             data_parts.insert(data_parts.end(), in_partition.begin(), in_partition.end());
         }
+        /// getDataPartsVectorInPartitionForInternalUsage() matches a part's own partition id
+        /// exactly, which never matches a patch part's differently-named partition
+        /// ('patch-<hash>-<partition_id>') -- without this second pass, a partition-filtered
+        /// backup would silently omit every not-yet-absorbed update to that partition. Filtering
+        /// the table's full active-patch set here (rather than a dedicated per-partition Keeper
+        /// lookup) keeps this consistent with backupData()'s existing pattern of working from the
+        /// already-loaded in-memory part set.
+        auto all_patches = getDataPartsVectorForInternalUsage({DataPartState::Active}, {DataPartKind::Patch}, lock);
+        for (const auto & partition_id : partition_ids)
+            for (const auto & patch : all_patches)
+                if (isPatchForPartition(patch->info, partition_id))
+                    data_parts.push_back(patch);
     }
     else
-        data_parts = getDataPartsVectorForInternalUsage({DataPartState::Active}, {DataPartKind::Regular});
+        data_parts = getDataPartsVectorForInternalUsage({DataPartState::Active}, {DataPartKind::Regular, DataPartKind::Patch});
 
     /// backupParts() (inherited from MergeTreeData, unchanged) wraps each part file as a
     /// BackupEntryFromImmutableFile rather than copying eagerly, and can use S3 CopyObject instead
@@ -1945,7 +2123,11 @@ void StorageCloudMergeTree::backupData(
     /// Pending (not-yet-applied) mutations are not backed up -- CloudMergeTree's mutations live
     /// entirely in Keeper (mutations/<id>), not in a local in-memory map like StorageMergeTree's
     /// own backupMutations() reads from. Already-applied mutations are baked into the part data
-    /// above regardless; a real but separate, smaller gap for a future pass.
+    /// above regardless; a real but separate, smaller gap for a future pass. Note this is a
+    /// different gap than an in-flight (uncommitted) lightweight UPDATE: an already-committed,
+    /// not-yet-absorbed patch part is a real `parts/<name>` znode with real data, included above
+    /// like any other active part -- only a lightweight UPDATE that hasn't committed a patch part
+    /// yet shares this same "nothing exists yet to back up" reasoning.
 }
 
 void StorageCloudMergeTree::attachRestoredParts(MutableDataPartsVector && parts, const std::optional<ZooKeeperRetriesInfo> &)
@@ -1962,6 +2144,24 @@ void StorageCloudMergeTree::attachRestoredParts(MutableDataPartsVector && parts,
     /// consistent with CloudMergeTree having no transactions anywhere.
     for (auto & part : parts)
         commitInsertedPart(part, /*deduplication_hashes=*/{}, getContext());
+}
+
+namespace
+{
+    /// A partition-scoped operation (DROP/DETACH/ATTACH/backup PARTITION 'p') must match not only
+    /// parts whose own partition id is exactly `partition_id`, but also any patch part covering
+    /// that partition -- patches live in a differently-named partition
+    /// ('patch-<hash>-<original_partition_id>', see PatchPartInfo.h's doc comment), so a plain
+    /// string-equality check against `partition_id` never matches them, silently leaving a
+    /// partition's patches behind (orphaned znodes with no surviving regular parts left to ever
+    /// absorb them) every time a caller only intended plain-partition equality.
+    /// isPatchForPartition() (PatchPartsUtils.h, unmodified upstream helper) already decodes and
+    /// compares the original partition id correctly; it returns false for a non-patch info, so the
+    /// two checks are mutually exclusive and safe to `||` together.
+    bool partitionIdMatchesOrIsPatchOf(const MergeTreePartInfo & info, const String & partition_id)
+    {
+        return info.getPartitionId() == partition_id || isPatchForPartition(info, partition_id);
+    }
 }
 
 size_t StorageCloudMergeTree::removeActivePartsMatching(const std::function<bool(const String &)> & predicate)
@@ -1996,7 +2196,14 @@ size_t StorageCloudMergeTree::removeActivePartsMatching(const std::function<bool
         DataPartsVector to_remove;
         {
             auto lock = lockParts();
-            auto known = getDataPartsVectorForInternalUsage({DataPartState::Active}, {DataPartKind::Regular}, lock);
+            /// Both kinds: `matched` was built from a Keeper-side, kind-agnostic name predicate
+            /// above (any of this file's callers may legitimately match a patch part's name too,
+            /// e.g. drop()/truncate()'s unconditional `return true`, or dropPartition()'s
+            /// partition-aware predicate below) -- if this local lookup stayed Regular-only, a
+            /// matched patch part's Keeper znode would already be gone (tryRemoveParts() above
+            /// doesn't distinguish kinds either) while its DataPart object silently lingered
+            /// forever in this replica's own data_parts_indexes, never reaching Deleting state.
+            auto known = getDataPartsVectorForInternalUsage({DataPartState::Active}, {DataPartKind::Regular, DataPartKind::Patch}, lock);
             for (const auto & part : known)
                 if (matched_set.contains(part->name))
                     to_remove.push_back(part);
@@ -2056,7 +2263,11 @@ size_t StorageCloudMergeTree::detachActivePartsMatching(const std::function<bool
         DataPartsVector to_remove;
         {
             auto lock = lockParts();
-            auto known = getDataPartsVectorForInternalUsage({DataPartState::Active}, {DataPartKind::Regular}, lock);
+            /// Both kinds -- same reasoning as removeActivePartsMatching()'s identical widening
+            /// just above: a DETACH PARTITION must detach that partition's patches along with its
+            /// regular parts, or a later re-ATTACH silently loses the update (see
+            /// partitionIdMatchesOrIsPatchOf()'s own doc comment).
+            auto known = getDataPartsVectorForInternalUsage({DataPartState::Active}, {DataPartKind::Regular, DataPartKind::Patch}, lock);
             for (const auto & part : known)
                 if (matched_set.contains(part->name))
                     to_remove.push_back(part);
@@ -2106,6 +2317,27 @@ catch (...)
 
 void StorageCloudMergeTree::dropPart(const String & part_name, bool detach, ContextPtr)
 {
+    if (detach)
+    {
+        /// Only the base part is detached; the pending patch is left behind (see the class doc
+        /// comment on partitionIdMatchesOrIsPatchOf -- detachActivePartsMatching()/dropPartition()
+        /// below DO cascade-detach patches together with their base parts, but a single-part
+        /// DETACH PART can never sensibly do that: a patch only ever applies to a *partition* as
+        /// a whole, not to one specific part, so there is no cascade to perform here), so
+        /// re-attaching this one part later would silently revert the update for its rows.
+        /// Reject instead of allowing that data-loss-on-reattach trap -- same guard vanilla's own
+        /// StorageMergeTree::dropPart()/StorageReplicatedMergeTree::dropPart() apply via
+        /// assertNoPatchesForParts(), a generic MergeTreeData method reused unchanged here (proven
+        /// necessary by a reproduced SIGSEGV: applying a patch to a part whose _block_number/
+        /// _block_offset were invalidated by a permitted detach-then-reattach crashes the read
+        /// path, see loadPartAndFixMetadataImpl()'s own writeInvalidatedSystemColumnsFile() call).
+        if (auto part = getPartIfExists(part_name, {DataPartState::Active}))
+        {
+            auto patch_parts = getPatchPartsVectorForPartition(part->info.getPartitionId());
+            assertNoPatchesForParts({part}, patch_parts, "DETACH PART " + part_name);
+        }
+    }
+
     size_t removed = detach
         ? detachActivePartsMatching([&](const String & name) { return name == part_name; })
         : removeActivePartsMatching([&](const String & name) { return name == part_name; });
@@ -2120,10 +2352,30 @@ void StorageCloudMergeTree::dropPartition(const ASTPtr & partition, bool detach,
     String partition_id = getPartitionIDFromQuery(partition, local_context);
     auto predicate = [&](const String & name)
     {
-        return MergeTreePartInfo::fromPartName(name, format_version).getPartitionId() == partition_id;
+        return partitionIdMatchesOrIsPatchOf(MergeTreePartInfo::fromPartName(name, format_version), partition_id);
     };
     if (detach)
+    {
+        /// Same guard as dropPart() above, partition-scoped: unlike a single part, a whole
+        /// partition's DETACH *does* cascade to its patches too (detachActivePartsMatching()
+        /// below, via partitionIdMatchesOrIsPatchOf) -- but the cascade-detached patch's
+        /// _block_number/_block_offset still end up invalidated by loadPartAndFixMetadataImpl()
+        /// on the later re-ATTACH, same underlying hazard as the single-part case. Reject
+        /// up front rather than allowing a DETACH/ATTACH roundtrip that corrupts reads.
+        DataPartsVector partition_parts;
+        DataPartsVector patches_in_partition;
+        {
+            auto lock = lockParts();
+            partition_parts = getDataPartsVectorInPartitionForInternalUsage(DataPartState::Active, partition_id, lock);
+            auto patch_parts = getDataPartsVectorForInternalUsage({DataPartState::Active}, {DataPartKind::Patch}, lock);
+            for (const auto & patch : patch_parts)
+                if (isPatchForPartition(patch->info, partition_id))
+                    patches_in_partition.push_back(patch);
+        }
+        assertNoPatchesForParts(partition_parts, patches_in_partition, "DETACH PARTITION " + partition_id);
+
         detachActivePartsMatching(predicate);
+    }
     else
     {
         removeActivePartsMatching(predicate);
@@ -2157,7 +2409,7 @@ PartitionCommandsResultInfo StorageCloudMergeTree::attachPartition(
     {
         String partition_id = getPartitionIDFromQuery(command.partition, local_context);
         for (const auto & name : detached_names)
-            if (MergeTreePartInfo::fromPartName(name, format_version).getPartitionId() == partition_id)
+            if (partitionIdMatchesOrIsPatchOf(MergeTreePartInfo::fromPartName(name, format_version), partition_id))
                 candidates.push_back(name);
     }
 
@@ -2180,7 +2432,7 @@ PartitionCommandsResultInfo StorageCloudMergeTree::attachPartition(
             applyPartLocationAuthority(name, CloudPartLocation::read(location_buf));
         }
 
-        auto part = buildPartFromDisk(name);
+        auto part = buildPartFromDisk(name, /*is_attach=*/ true);
         if (!part)
             throw Exception(ErrorCodes::NO_SUCH_DATA_PART,
                 "Detached part {} is registered in Keeper but not found on the shared disk", name);
@@ -2265,6 +2517,21 @@ void StorageCloudMergeTree::replacePartitionFrom(const StoragePtr & source_table
             getStorageID().getNameForLogs(), source_storage->getStorageID().getNameForLogs());
 
     String partition_id = getPartitionIDFromQuery(partition, local_context);
+
+    /// v1 scope cut, deliberate and fail-closed (matches this codebase's own precedent --
+    /// updateLightweight()'s NOT_IMPLEMENTED default before this feature existed): cross-table
+    /// partition transfer with unabsorbed patches would need the destination table to also
+    /// support patches, plus an atomic dual-kind transfer through the multi() below -- real,
+    /// separate scope, not attempted here. Silently transferring only the regular parts would
+    /// orphan the patches (no surviving covering regular part left in the source's original
+    /// partition for absorption-GC, see runPartsKillerCycle(), to ever reconcile against), so this
+    /// rejects outright rather than risk that silently.
+    for (const auto & patch : source_storage->getDataPartsVectorForInternalUsage({DataPartState::Active}, {DataPartKind::Patch}))
+        if (isPatchForPartition(patch->info, partition_id))
+            throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+                "Cannot REPLACE/MOVE PARTITION '{}' from table {}: it has an unabsorbed lightweight UPDATE patch ({}) pending, "
+                "which is not yet supported for cross-table partition transfer",
+                partition_id, source_storage->getStorageID().getNameForLogs(), patch->name);
 
     /// Read-lock the source for the duration of the clone below -- it is only ever read from
     /// (its active parts queried, its part data cloned), never mutated by this operation.
@@ -2439,6 +2706,17 @@ void StorageCloudMergeTree::movePartitionToTable(const StoragePtr & dest_table, 
             getStorageID().getNameForLogs(), dest_storage->getStorageID().getNameForLogs());
 
     String partition_id = getPartitionIDFromQuery(partition, local_context);
+
+    /// v1 scope cut, deliberate and fail-closed -- same reasoning as replacePartitionFrom()'s
+    /// identical check: cross-table transfer of a partition with unabsorbed patches is real,
+    /// separate scope, not attempted here. Checked against `this` (self is the SOURCE in this
+    /// call, opposite of replacePartitionFrom()).
+    for (const auto & patch : getDataPartsVectorForInternalUsage({DataPartState::Active}, {DataPartKind::Patch}))
+        if (isPatchForPartition(patch->info, partition_id))
+            throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+                "Cannot MOVE PARTITION '{}' from table {}: it has an unabsorbed lightweight UPDATE patch ({}) pending, "
+                "which is not yet supported for cross-table partition transfer",
+                partition_id, getStorageID().getNameForLogs(), patch->name);
 
     /// Deadlock-free lock ordering across two tables -- MergeTreeData::operation_with_data_parts_mutex
     /// exists specifically for this (its own doc comment references StorageMergeTree's own
@@ -2689,7 +2967,12 @@ try
     /// lockParts() already holds the exclusive lock; the no-argument overload would try to take
     /// its own shared lock on the same non-recursive data_parts_mutex and deadlock this thread
     /// against itself. Pass the held lock through instead.
-    auto known = getDataPartsVectorForInternalUsage({DataPartState::Active}, {DataPartKind::Regular}, lock);
+    /// Both kinds: a patch part committed by another replica (lightweight UPDATE) must be
+    /// adopted through this exact same loop, same as any regular part -- see try_adopt_part
+    /// below, which is already kind-agnostic in its own body (applyPartLocationAuthority,
+    /// buildPartFromDisk, admitPartLocally never hardcode DataPartKind::Regular; the filtering
+    /// was purely at this call site).
+    auto known = getDataPartsVectorForInternalUsage({DataPartState::Active}, {DataPartKind::Regular, DataPartKind::Patch}, lock);
 
     /// The Keeper read must happen after taking `known`, while still holding lockParts() -- not
     /// before, as it originally did. Every part in `known` was added by a commitInsertedPart()
@@ -2757,7 +3040,7 @@ try
         /// failed attempt.
         applyPartLocationAuthority(name, location);
 
-        auto part = buildPartFromDisk(name);
+        auto part = buildPartFromDisk(name, /*is_attach=*/ false);
         if (!part)
         {
             /// With the location applied this can only be a genuinely broken build (the
@@ -2833,7 +3116,12 @@ try
         /// Deleting above -- kept in a genuinely separate vector below so they're never passed to
         /// removePartsFromWorkingSet() a second time). Whatever remains has no replacement coming
         /// this cycle and can be dropped outright.
-        auto still_known = getDataPartsVectorForInternalUsage({DataPartState::Active}, {DataPartKind::Regular}, lock);
+        /// Both kinds: a patch part GC'd (absorption-completed and tombstoned) by another
+        /// replica's parts-killer cycle must be dropped from this replica's local set the same
+        /// way a regular part's DROP/removal is -- otherwise a fully-absorbed, Keeper-removed
+        /// patch would linger forever in this replica's data_parts_indexes, never reaching
+        /// Deleting state.
+        auto still_known = getDataPartsVectorForInternalUsage({DataPartState::Active}, {DataPartKind::Regular, DataPartKind::Patch}, lock);
         DataPartsVector no_longer_active;
         for (const auto & part : still_known)
             if (!active_set.contains(part->name))
@@ -2891,6 +3179,75 @@ try
 
     auto disks = getStoragePolicy()->getDisks();
     const auto & disk = disks.front();
+
+    /// Phase F: patch-absorption GC. Gated on is_az_leader for the same redundant-Keeper-traffic
+    /// reasoning already applied to merge selection (see is_az_leader's own doc comment) -- every
+    /// replica running this independently would be correct, just wasteful. Deliberately reads
+    /// Keeper fresh (loadActivePartNames() below, never this replica's own data_parts_indexes
+    /// cache) for both sides of the comparison -- the exact substitution that closes the
+    /// cross-replica visibility race DESIGN.md documents for regular parts, applied here to avoid
+    /// the same shape of bug: a patch that's still needed must never look safe to drop just
+    /// because this replica's local cache happens to be lagging on the regular part that still
+    /// needs it.
+    if (is_az_leader.load())
+    {
+        int32_t unused_active_version = 0;
+        Strings active_names = coordination.loadActivePartNames(zk, unused_active_version);
+
+        /// Min data_version currently active per *regular* partition -- purely name-derived
+        /// (MergeTreePartInfo::getDataVersion() reads no header/trailer), so this costs nothing
+        /// beyond the getChildren() call already made above.
+        std::unordered_map<String, Int64> min_data_version_by_partition;
+        std::vector<std::pair<String, MergeTreePartInfo>> active_patches;
+        for (const auto & name : active_names)
+        {
+            auto info = MergeTreePartInfo::fromPartName(name, format_version);
+            if (info.isPatch())
+                active_patches.emplace_back(name, info);
+            else
+            {
+                auto [it, inserted] = min_data_version_by_partition.try_emplace(info.getPartitionId(), info.getDataVersion());
+                if (!inserted)
+                    it->second = std::min(it->second, info.getDataVersion());
+            }
+        }
+
+        for (const auto & [patch_name, patch_info] : active_patches)
+        {
+            auto it = min_data_version_by_partition.find(patch_info.getOriginalPartitionId());
+            if (it != min_data_version_by_partition.end())
+            {
+                /// The one Keeper round-trip this check needs beyond the getChildren() above:
+                /// patch_max_data_version isn't derivable from the name, only from the trailer
+                /// (see CloudPartLocation's own doc comment on why it's carried there instead of
+                /// requiring an object-storage read of source_parts.dat per cycle).
+                String header;
+                if (!coordination.tryGetPartHeader(zk, patch_name, header))
+                    continue; /// vanished between loadActivePartNames() and here -- another replica's GC (or a merge) already dealt with it
+
+                ReadBufferFromString trailer_buf(CloudPartLocation::extractTrailerText(header));
+                auto location = CloudPartLocation::read(trailer_buf);
+
+                /// Test-only pause point (fault-injection test 1, see the plan's Testing section):
+                /// lets a test deterministically commit a new, lower-data-version regular part into
+                /// this same partition right after the read above but before the tombstone below,
+                /// and assert this cycle's already-fenced decision stays correct regardless (a part
+                /// committed after the read simply wasn't part of this GC decision -- correctly).
+                FailPointInjection::pauseFailPoint(FailPoints::cloud_merge_tree_patch_gc_absorption_check_pause);
+
+                if (location.patch_max_data_version > it->second)
+                    continue; /// still needed by at least one active regular part in its partition
+            }
+            /// Else: zero active regular parts remain in this patch's original partition at all --
+            /// vacuously safe to drop (also a backstop for DROP PARTITION without a full cascade,
+            /// though Phase A/G's synchronous cascade-drop should make this branch rare in practice).
+
+            /// Fail-closed/idempotent under races: a second replica's concurrent GC cycle reaching
+            /// the same conclusion just gets ZNONODE here, harmless -- same tolerance
+            /// removeActivePartsMatching() already applies to this same call.
+            coordination.tryRemoveParts(zk, {patch_name});
+        }
+    }
 
     for (const auto & tombstone : coordination.listTombstones(zk))
     {

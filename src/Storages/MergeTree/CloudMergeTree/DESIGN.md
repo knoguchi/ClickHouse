@@ -62,6 +62,13 @@ things relative to it:
   replicas/<az>/<seq>            ephemeral-sequential per-AZ election nodes (only when this
                                 replica's availability zone is known). NO per-replica parts;
                                 doubles as the per-AZ merge-selection leader election.
+  lightweight_updates/           required by the generic, reused-unmodified
+    in_progress/<seq>           getLockForLightweightUpdateInKeeper() (update_parallel_mode=
+                                'auto' conflict detection; 'sync' locks lightweight_updates/lock
+                                directly). Created once at table bootstrap (createRootNodes()),
+                                like every other subtree here -- both getLockForSyncMode() and
+                                getLockForAutoMode() unconditionally operate directly under this
+                                path with no ZNONODE tolerance on the parent.
   temp/                         in-flight part registrations for crash cleanup
 ```
 
@@ -163,16 +170,99 @@ mutation under the hood (`lightweight_delete_mode` defaults to
 `ALTER_UPDATE`), the same Keeper-backed mutation path Phase 4 already
 covers -- no CloudMergeTree-specific code needed.
 
-`UPDATE ... SET` (lightweight update) is **not** supported: it writes a
-separate "patch part" instead of a mutation, and CloudMergeTree has no
-patch-part support in its Keeper part-set model (every part-set operation
-in this engine filters to `DataPartKind::Regular` only --
-see `CloudMergeTreePartsCollector`'s own doc comment). `IStorage`'s
-default `updateLightweight()` throws `NOT_IMPLEMENTED` before anything is
-written, so this fails closed rather than silently mishandling a patch
-part -- confirmed by a regression test. Teaching the Keeper part-set model
-about patch parts (commit, adopt, GC, backup/restore, all of it) would be
-a real, separate feature, not attempted here.
+`UPDATE ... SET` (lightweight update, `enable_lightweight_update = 1,
+apply_patch_parts = 1`) is done. It writes a "patch part" -- a normal
+`DataPartKind::Patch` part carrying only the updated columns plus system
+columns (`_block_number`, `_block_offset`, `_data_version`, v2's sort-key
+columns), living in a synthetic `patch-<hash>-<original_partition_id>`
+partition -- committed through the exact same `commitInsertedPart()`
+Keeper-commit hook `INSERT` already uses (`CloudMergeTreeSinkPatch`,
+modelled on `CloudMergeTreeSink`). v1 patches (`Join` mode, tied to a
+specific source part name) are rejected outright
+(`getDefaultSettings()` forces `patch_parts_version = 'v2'`); v2 keys on
+`(sort-key columns, _block_number, _block_offset)`, invariant across
+merges by construction, so the entire read/merge path stays generic and
+unmodified. `MergeTreeData::updateLightweightImpl()` (the
+read-snapshot-and-produce-patch-rows pipeline), `getMutationsSnapshot()`'s
+patch reporting, `getMergingParamsForPatchParts()`, and `MergeTask`'s own
+patch-merge/apply-on-merge branches are all inherited unchanged -- the
+CloudMergeTree-specific work was entirely in teaching the Keeper part-set
+model (adoption, GC, DROP/DETACH cascade, backup) about the second part
+kind, plus one new Keeper subtree (`lightweight_updates/`, required by
+the generic, reused-unmodified `getLockForLightweightUpdateInKeeper()`).
+Patch-to-patch compaction and apply-on-merge both run automatically via
+the same background merge-selection scheduler regular parts use (a
+second, patch-scoped `CloudMergeTreePartsCollector` instance, tried after
+regular-merge selection finds nothing). Patch-absorption GC folds into
+the existing `runPartsKillerCycle()` cadence: each active patch's
+Keeper-stored `max_data_version` (carried in its `CloudPartLocation`
+trailer, so no object-storage read of `source_parts.dat` is needed per
+cycle) is compared against the Keeper-fresh minimum `data_version` among
+active regular parts in its original partition -- deliberately
+Keeper-fresh, not this replica's local part-set cache, the same
+substitution that closed the cross-replica visibility race below applied
+to a second bug class. `DETACH PART`/`DETACH PARTITION` reject outright
+when unabsorbed patches would be left behind (`assertNoPatchesForParts()`,
+a generic `MergeTreeData` method reused unchanged, matching vanilla's own
+guard) -- proven necessary by a reproduced SIGSEGV (see below). Cross-table
+`REPLACE`/`MOVE PARTITION` with unabsorbed patches in the source partition
+are rejected too (real support needs the destination table to also
+support patches plus an atomic dual-kind transfer -- out of scope for v1).
+
+**Lightweight-UPDATE adoption SIGSEGV (found and fixed 2026-08-22).**
+Cross-replica reads of a lightweight-UPDATE patch applied against a
+freshly-adopted, never-merged (0-level) regular part crashed with a
+segfault in vanilla's own `MergeTreeReadersChain::applyPatches()`
+(`BlockCursor::blockNumber()` indexing into an unpopulated column) --
+100% reproducible, and *not* a vanilla bug: an identical
+`ReplicatedMergeTree` table, same S3 storage, same 2-replica/ZooKeeper
+setup, same UPDATE sequence, was verified clean. Root cause:
+`buildPartFromDisk()` (CMT's routine cross-replica part-adoption path,
+called from `updatePartSetFromKeeper()` for every newly-discovered part)
+called the generic `MergeTreeData::loadPartAndFixMetadataImpl()`
+unconditionally -- the same helper vanilla itself only ever calls for a
+genuine ATTACH-from-detached (`StorageReplicatedMergeTree`'s own
+attach-parts-to-missing-partitions path, `MergeTreeData`'s own
+loaded-from-a-detached-directory path), where a part's provenance
+relative to the *current* schema is genuinely unknown and its
+`writeInvalidatedSystemColumnsFile()` call for `_block_number`/
+`_block_offset` is the correct, deliberate choice. CMT's routine
+adoption of an already-active, freshly-committed-elsewhere part is
+structurally equivalent to `StorageReplicatedMergeTree::fetchPart()`
+instead -- which does no such invalidation -- so applying the
+ATTACH-semantic invalidation there was simply wrong, just never
+triggered before lightweight UPDATE became the first CMT feature to
+depend on these columns' per-row values surviving adoption intact. Fixed
+by splitting `buildPartFromDisk()` on a new `is_attach` parameter: the
+genuine-ATTACH call site (`attachPartition()`) keeps calling
+`loadPartAndFixMetadataImpl()` unchanged; the routine-adoption call site
+(`updatePartSetFromKeeper()`) now runs the same sequence minus the
+invalidation call. Closing this also exposed a real, separate gap:
+vanilla itself rejects `DETACH PARTITION`/`DETACH PART` outright when
+unabsorbed patches are present (`assertNoPatchesForParts()`, `SUPPORT_IS_
+DISABLED`, "run `APPLY PATCHES IN PARTITION` first") -- exactly because a
+later re-ATTACH re-triggers this same invalidation-vs-patch hazard even
+with the adoption-path fix in place. CMT's DETACH path didn't replicate
+that guard; it now does, calling the same generic, unmodified
+`assertNoPatchesForParts()` vanilla uses.
+
+**Patch-to-patch merge predicate bug (found and fixed 2026-08-22).**
+`CloudMergeTreeMergePredicate::canMergeParts()`'s mutation-version-
+equality check compared `left.info.mutation` directly (correct for
+regular parts, where CMT -- unlike vanilla, which has no local
+`current_mutations_by_version` map to consult either -- has no cheaper
+derivation available). Patch parts repurpose `.mutation` entirely (it
+holds the patch's own `max_data_version`, stamped by
+`writeTempPartImpl()`), so any two patches in the same synthetic patch
+partition necessarily have *different* `.mutation` values by
+construction -- the direct comparison rejected every patch-to-patch
+merge candidate, silently disabling automatic patch compaction
+(`selectPartsToMerge()`'s patch-scoped second attempt always ran, just
+never found anything it could merge). Fixed by skipping this check when
+`left.info.isPatch()` (both sides are always the same kind, checked just
+above by partition-id equality). Found via
+`test_lightweight_update_many_small_updates_merge_into_one_patch`, which
+failed with 6 patch parts never converging to 1.
 
 `BACKUP`/`RESTORE` is done for part data: `backupData()` wraps each active
 part (optionally partition-filtered) via the inherited `backupParts()`;

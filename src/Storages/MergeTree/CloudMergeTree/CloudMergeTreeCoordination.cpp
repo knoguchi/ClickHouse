@@ -62,6 +62,16 @@ void CloudMergeTreeCoordination::createRootNodes(const zkutil::ZooKeeperPtr & zk
     zk->createIfNotExists(droppedPartsPath(), "");
     zk->createIfNotExists(detachedPartsPath(), "");
     zk->createIfNotExists(deduplicationHashesPath(), "");
+
+    /// Required by the generic, reused-unmodified getLockForLightweightUpdateInKeeper() (see
+    /// StorageCloudMergeTree::updateLightweight()): both getLockForSyncMode() and
+    /// getLockForAutoMode() unconditionally tryCreate()/getChildren() directly under
+    /// <root>/lightweight_updates without ever tolerating ZNONODE on the parent -- vanilla
+    /// StorageReplicatedMergeTree creates the exact same two nodes once at its own table
+    /// bootstrap (see its createTableIfNotExists()) rather than lazily on first UPDATE; mirrored
+    /// here for the same reason.
+    zk->createIfNotExists(root_path + "/lightweight_updates", "");
+    zk->createIfNotExists(root_path + "/lightweight_updates/in_progress", "");
 }
 
 void CloudMergeTreeCoordination::ensureBlockNumbersPartition(const zkutil::ZooKeeperPtr & zk, const String & partition_id) const

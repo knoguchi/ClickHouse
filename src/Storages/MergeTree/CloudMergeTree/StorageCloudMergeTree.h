@@ -171,6 +171,30 @@ public:
     /// support at all yet), so there is nothing else from the base check to preserve.
     void checkMutationIsPossible(const MutationCommands & commands, const Settings & settings) const override;
 
+    /// `ALTER TABLE ... UPDATE ... SET` (lightweight update, `enable_lightweight_update=1`):
+    /// writes a "patch part" -- a normal DataPartKind::Patch part carrying only the updated
+    /// columns, committed via the exact same commitInsertedPart() Keeper-commit hook INSERT
+    /// already uses (see CloudMergeTreeSinkPatch) -- rather than rewriting the base part like a
+    /// heavy mutation does. supportsLightweightUpdate() below additionally restricts this to
+    /// patch_parts_version='v2' (see its own doc comment for why); this override allocates one
+    /// Keeper block number per affected partition up front (the "data version" every produced
+    /// patch part is stamped with, mirroring commitInsertedPart()'s own per-partition block
+    /// allocation) and completes updateLightweightImpl()'s pipeline with the new sink.
+    QueryPipeline updateLightweight(const MutationCommands & commands, ContextPtr context) override;
+
+    /// Base MergeTreeData::supportsLightweightUpdate() already covers UNIQUE KEY (none here),
+    /// custom-partitioning format version, merging mode, and the block-number/block-offset
+    /// materialized-column settings (getDefaultSettings() below force-enables both, matching how
+    /// it already force-enables always_use_copy_instead_of_hardlinks) -- reused unchanged. The
+    /// one CloudMergeTree-specific addition: reject patch_parts_version='v1' outright. v1's
+    /// `Join` mode ties a patch to a specific *source part name*, and resolving that name to
+    /// whichever part currently covers it after a merge needs covering-part lookup logic that
+    /// doesn't exist anywhere else in this engine. v2's `MergeOnKey` mode keys on sort-key
+    /// columns + `_block_number`/`_block_offset`, invariant across merges by construction, so it
+    /// needs no such lookup -- keeping CMT's entire read/merge path (see getMutationsSnapshot(),
+    /// CloudMergeTreeMergePredicate::getPatchesToApplyOnMerge()) fully generic and unmodified.
+    std::expected<void, PreformattedMessage> supportsLightweightUpdate() const override;
+
     /// MergeTreeData::checkAlterIsPossible() (~1000 lines: subscription checks, type-conversion
     /// legality, primary-key/partition-key column restrictions, statistics, indices, TTL -- all
     /// genuinely reusable and NOT reimplemented here) contains exactly one clause that doesn't
@@ -362,7 +386,22 @@ private:
     /// admitting it locally. Returns nullptr if the directory isn't visible on this disk yet, or if
     /// loading fails -- see the extensive comments on the two checks this preserves, originally
     /// written for updatePartSetFromKeeper's try_adopt_part lambda.
-    MutableDataPartPtr buildPartFromDisk(const String & name);
+    ///
+    /// is_attach distinguishes the two call sites' genuinely different semantics: attachPartition()
+    /// (is_attach=true) is a real ATTACH of a part whose provenance relative to the CURRENT schema
+    /// is unknown -- MergeTreeData::loadPartAndFixMetadataImpl()'s writeInvalidatedSystemColumnsFile()
+    /// call for _block_number/_block_offset is correct there, matching vanilla's own identical calls
+    /// for ATTACH-from-detached (StorageReplicatedMergeTree::attachPartsToMissingPartitions,
+    /// MergeTreeData's own loadPartsFromDetached path). updatePartSetFromKeeper()'s routine
+    /// cross-replica adoption of an already-active, freshly-committed-elsewhere part (is_attach=false)
+    /// is NOT that scenario -- it's structurally equivalent to StorageReplicatedMergeTree's own
+    /// fetchPart(), which does no such invalidation. Calling the ATTACH path there was a real,
+    /// reproduced bug (not scoped to lightweight UPDATE, just never triggered before it): a
+    /// cross-replica-adopted 0-level part's _block_number/_block_offset get marked invalidated,
+    /// and reads that depend on their per-row values -- pinned down via a SIGSEGV in
+    /// MergeTreeReadersChain::applyPatches() applying a lightweight-UPDATE patch against such a
+    /// part -- see this method's .cpp definition for the exact reproduction.
+    MutableDataPartPtr buildPartFromDisk(const String & name, bool is_attach);
 
     /// Admit a part built by buildPartFromDisk() into the local working set (addTempPart +
     /// Transaction::commit). Caller must hold lock. Never fails: if something already active
@@ -445,6 +484,7 @@ private:
         const StorageMetadataPtr & metadata_snapshot, std::unique_lock<std::mutex> & lock);
 
     friend class CloudMergeTreeSink;
+    friend class CloudMergeTreeSinkPatch;
     friend class CloudMergeTreeMergePredicate;
     friend class CloudMergePlainMergeTreeTask;
     friend class CloudMergeMutateTask;

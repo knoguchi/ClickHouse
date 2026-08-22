@@ -36,6 +36,17 @@ struct CloudPartLocation
 
     std::vector<Directory> directories;
 
+    /// Patch parts only (see StorageCloudMergeTree lightweight UPDATE support): the maximum data
+    /// version among the patch(es) this patch part's rows derive from -- for a freshly-committed
+    /// patch this is just its own PatchPartIndex's max data version (source_parts.dat), for a
+    /// patch-to-patch merge result it's the max across every input patch that went into it (same
+    /// number MergeTask already computes into the merge result's own source_parts.dat -- capture()
+    /// just reads it back out). Carried here, not read from source_parts.dat on object storage per
+    /// GC cycle, so patch-absorption GC (StorageCloudMergeTree::runPartsKillerCycle()) can decide
+    /// whether a patch is still needed from Keeper-stored part *names* and this one field alone --
+    /// no object-storage or even local-disk read of any kind. 0 (unused) for regular parts.
+    Int64 patch_max_data_version = 0;
+
     /// Captures token + complete file set (checksums.files ∪ getFileNamesWithoutChecksums(),
     /// the same canonical union DataPartsExchange/backups use) from a fully-written part.
     /// The token is invariant under the later rename-into-place (plain_rewritable renames

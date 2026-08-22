@@ -1,6 +1,7 @@
 #include <Storages/MergeTree/CloudMergeTree/CloudPartLocation.h>
 
 #include <Storages/MergeTree/IMergeTreeDataPart.h>
+#include <Storages/MergeTree/PatchParts/PatchPartIndex.h>
 #include <IO/ReadHelpers.h>
 #include <IO/WriteHelpers.h>
 #include <IO/ReadBufferFromString.h>
@@ -60,6 +61,13 @@ CloudPartLocation CloudPartLocation::capture(const IMergeTreeDataPart & part)
     location.directories.push_back(captureDirectory(part, ""));
     for (const auto & [projection_name, projection_part] : part.getProjectionParts())
         location.directories.push_back(captureDirectory(*projection_part, projection_name + ".proj"));
+
+    /// Read back from the part's own in-memory PatchPartIndex (set directly by
+    /// MergeTreeDataWriter::writeTempPatchPart()/MergeTask's patch-merge result, never lazily
+    /// loaded from source_parts.dat here) -- see this field's own doc comment in the header.
+    if (part.info.isPatch())
+        location.patch_max_data_version = static_cast<Int64>(part.getPatchPartIndex().getMaxDataVersion());
+
     return location;
 }
 
@@ -84,6 +92,8 @@ void CloudPartLocation::write(WriteBuffer & out) const
             writeChar('\n', out);
         }
     }
+    writeText(patch_max_data_version, out);
+    writeChar('\n', out);
 }
 
 CloudPartLocation CloudPartLocation::read(ReadBuffer & in)
@@ -120,6 +130,8 @@ CloudPartLocation CloudPartLocation::read(ReadBuffer & in)
             dir.files_with_sizes.emplace(std::move(file_name), file_size);
         }
     }
+    readText(location.patch_max_data_version, in);
+    assertChar('\n', in);
     return location;
 }
 
