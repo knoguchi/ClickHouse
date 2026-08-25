@@ -243,8 +243,10 @@ public:
     /// execution, matching StorageMergeTree's own scheduleDataProcessingJob semantics exactly.
     /// PartsTTLMerge wires to merger_mutator.ttl_merges_blocker (TTL-driven merges exist since
     /// TTL support landed). PartsMove/Cleanup stay unwired (default no-op): no multi-disk part
-    /// moves yet, and no separate cleanup thread -- parts_killer_task's own doc comment explains
-    /// why it's deliberately poll-only rather than exposed through an action lock.
+    /// moves yet, and pausing the parts killer has no operational use while its only consumer is
+    /// grace-period-bounded GC -- deletion of a tombstoned part is already delayed by
+    /// cloud_merge_tree_gc_grace_period_seconds, so there is no window an operator would need
+    /// SYSTEM STOP CLEANUP to extend.
     ActionLock getActionLock(StorageActionBlockType action_type) override;
 
     /// SYSTEM START MERGES: without this, background_operations_assignee stays idle until some

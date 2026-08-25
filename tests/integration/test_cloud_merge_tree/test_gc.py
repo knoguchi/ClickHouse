@@ -639,10 +639,11 @@ def test_patch_gc_absorption_check_pause_does_not_corrupt_concurrent_gc(cluster)
         node1.query(f"SYSTEM ENABLE FAILPOINT {failpoint}")
         try:
             # This module has its own small cluster (split out of test.py precisely so these tests
-            # don't inherit the rest of that file's cumulative BackgroundSchedulePool load), so
-            # the 1s cloud_merge_tree_gc_interval_ms tick above reliably lands within 60s -- no
-            # need to force it, unlike when this test ran amid test.py's other ~89 tables.
-            _wait_failpoint_paused(node1, failpoint, timeout=60)
+            # don't inherit the rest of that file's cumulative BackgroundSchedulePool load), but
+            # the generous timeout stays: a saturated CI host running many integration modules in
+            # parallel can still delay the 1s cloud_merge_tree_gc_interval_ms tick by minutes of
+            # wall clock, which is the flake this timeout was originally raised to absorb.
+            _wait_failpoint_paused(node1, failpoint, timeout=300)
 
             # Ordinary, unrelated write activity while node1's GC decision is parked -- must not
             # be disturbed by, or disturb, the paused GC cycle.

@@ -76,13 +76,6 @@ def drop_table(cluster):
         node.query(f"DROP TABLE IF EXISTS {TABLE_NAME} SYNC")
 
 
-def list_objects(cluster, path="data/"):
-    minio = cluster.minio_client
-    objects = list(minio.list_objects(cluster.minio_bucket, path, recursive=True))
-    logging.info(f"list_objects ({len(objects)}): {[x.object_name for x in objects]}")
-    return objects
-
-
 _backup_id_counter = 0
 
 
