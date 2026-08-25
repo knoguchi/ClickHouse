@@ -241,9 +241,10 @@ public:
     /// nothing for CloudMergeTree -- scheduleDataProcessingJob() checks this same blocker before
     /// selecting merges *or* mutations (see its own comment), so this also pauses mutation
     /// execution, matching StorageMergeTree's own scheduleDataProcessingJob semantics exactly.
-    /// PartsTTLMerge/PartsMove/Cleanup stay unwired (default no-op): CloudMergeTree has no
-    /// TTL-driven merges, no multi-disk part moves, and no separate cleanup thread yet -- correctly
-    /// reflecting the engine's actual current feature set, not an oversight.
+    /// PartsTTLMerge wires to merger_mutator.ttl_merges_blocker (TTL-driven merges exist since
+    /// TTL support landed). PartsMove/Cleanup stay unwired (default no-op): no multi-disk part
+    /// moves yet, and no separate cleanup thread -- parts_killer_task's own doc comment explains
+    /// why it's deliberately poll-only rather than exposed through an action lock.
     ActionLock getActionLock(StorageActionBlockType action_type) override;
 
     /// SYSTEM START MERGES: without this, background_operations_assignee stays idle until some
