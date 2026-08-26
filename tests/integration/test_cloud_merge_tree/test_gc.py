@@ -72,6 +72,31 @@ def list_objects(cluster, path="data/"):
     return objects
 
 
+def table_object_names(cluster, table_uuid):
+    # The set of object names belonging to one table, resolved through plain_rewritable's own
+    # layout: every "data/__meta/<token>/prefix.path" object holds the local directory path the
+    # token stands for, and a table's local paths all contain its UUID ("store/xxx/<uuid>/...").
+    # Needed because tokens are random -- a bucket-wide object count is NOT scoped to a table, and
+    # other tests' async cleanup (or GC) removing THEIR objects must not affect assertions about
+    # this table's objects.
+    minio = cluster.minio_client
+    names = [obj.object_name for obj in list_objects(cluster)]
+    tokens = set()
+    for name in names:
+        parts = name.split("/")
+        if len(parts) == 4 and parts[1] == "__meta" and parts[3] == "prefix.path":
+            content = minio.get_object(cluster.minio_bucket, name).read().decode()
+            if table_uuid in content:
+                tokens.add(parts[2])
+    owned = set()
+    for name in names:
+        parts = name.split("/")
+        token = parts[2] if len(parts) > 2 and parts[1] == "__meta" else parts[1]
+        if token in tokens:
+            owned.add(name)
+    return owned
+
+
 LWU_TABLE_DDL_SETTINGS = (
     "storage_policy = 's3', enable_block_number_column = 1, enable_block_offset_column = 1"
 )
@@ -371,8 +396,11 @@ def test_detached_part_survives_grace_period_and_can_be_reattached(cluster):
             f"SELECT uuid FROM system.tables WHERE table = '{table}'"
         ).strip()
 
-        objects_before = list_objects(cluster)
-        assert len(objects_before) > 0
+        # Scoped to THIS table's objects (see table_object_names): a bucket-wide count also sees
+        # other tests' leftovers being cleaned up asynchronously during the sleep below, which is
+        # irrelevant to the invariant under test and made this assertion flaky.
+        owned_before = table_object_names(cluster, table_uuid)
+        assert len(owned_before) > 0
 
         node1.query(f"ALTER TABLE {table} DETACH PARTITION ID 'all'")
 
@@ -381,8 +409,9 @@ def test_detached_part_survives_grace_period_and_can_be_reattached(cluster):
         # recorded under detached_parts/, a namespace the GC scan never reads. This is the core
         # invariant this whole feature exists to protect.
         time.sleep(20)
-        objects_after_grace_period = list_objects(cluster)
-        assert len(objects_after_grace_period) == len(objects_before)
+        names_after_grace_period = {obj.object_name for obj in list_objects(cluster)}
+        missing = owned_before - names_after_grace_period
+        assert not missing, f"detached table's objects were deleted during the grace period: {sorted(missing)}"
 
         # No tombstone was ever created for it either -- detach uses a separate namespace from drop.
         assert (
@@ -628,21 +657,29 @@ def test_patch_gc_absorption_check_pause_does_not_corrupt_concurrent_gc(cluster)
             f"UPDATE {table} SET c2 = c1 * c1 WHERE id % 2 = 0 "
             f"SETTINGS enable_lightweight_update = 1, apply_patch_parts = 1"
         )
-        node1.query(f"OPTIMIZE TABLE {table} FINAL")
-
         # Park node1's absorption-GC cycle right after it has read the patch's trailer (its
         # committed max_data_version) but before the tombstone decision -- proves the decision
         # made from that single Keeper-fresh read stays self-consistent even while further,
-        # unrelated Keeper activity (node2 runs its own concurrent GC cycle too -- is_az_leader
-        # defaults to true for both nodes here, neither has AZ placement configured -- plus an
-        # ordinary concurrent INSERT below) continues in parallel.
+        # unrelated Keeper activity (plus an ordinary concurrent INSERT below) continues in
+        # parallel.
+        #
+        # Enabled on BOTH nodes, and BEFORE the OPTIMIZE below. This ordering is load-bearing,
+        # and was the historical source of this test's flakiness (which no wait-timeout increase
+        # could ever fix): the absorption pause fires only while an active patch exists, and once
+        # OPTIMIZE makes the patch absorbable, ANY GC cycle -- node1's in the gap before a later
+        # ENABLE FAILPOINT took effect, or node2's, whose failpoint was never enabled at all
+        # (is_az_leader defaults to true for both nodes here, neither has AZ placement
+        # configured, so both run absorption GC) -- could consume the patch first. After that the
+        # pause line is unreachable forever and the wait below necessarily times out. Arming both
+        # nodes first makes reaching the pause deterministic: whichever replica's cycle touches
+        # the patch parks instead of absorbing it.
         node1.query(f"SYSTEM ENABLE FAILPOINT {failpoint}")
+        node2.query(f"SYSTEM ENABLE FAILPOINT {failpoint}")
+        node1.query(f"OPTIMIZE TABLE {table} FINAL")
         try:
-            # This module has its own small cluster (split out of test.py precisely so these tests
-            # don't inherit the rest of that file's cumulative BackgroundSchedulePool load), but
-            # the generous timeout stays: a saturated CI host running many integration modules in
-            # parallel can still delay the 1s cloud_merge_tree_gc_interval_ms tick by minutes of
-            # wall clock, which is the flake this timeout was originally raised to absorb.
+            # Generous timeout purely for host load: a saturated CI host can delay the 1s
+            # cloud_merge_tree_gc_interval_ms tick by a lot of wall clock. Reaching the pause at
+            # all is guaranteed by the arm-before-OPTIMIZE ordering above.
             _wait_failpoint_paused(node1, failpoint, timeout=300)
 
             # Ordinary, unrelated write activity while node1's GC decision is parked -- must not
@@ -653,6 +690,7 @@ def test_patch_gc_absorption_check_pause_does_not_corrupt_concurrent_gc(cluster)
             node1.query(f"SYSTEM NOTIFY FAILPOINT {failpoint}")
         finally:
             node1.query(f"SYSTEM DISABLE FAILPOINT {failpoint}")
+            node2.query(f"SYSTEM DISABLE FAILPOINT {failpoint}")
 
         assert_eq_with_retry(
             node1,
@@ -667,5 +705,6 @@ def test_patch_gc_absorption_check_pause_does_not_corrupt_concurrent_gc(cluster)
         assert_eq_with_retry(node2, f"SELECT sum(c2) FROM {table}", str(expected))
     finally:
         node1.query(f"SYSTEM DISABLE FAILPOINT {failpoint}")
+        node2.query(f"SYSTEM DISABLE FAILPOINT {failpoint}")
         node2.query(f"DROP TABLE IF EXISTS {table} SYNC")
         node1.query(f"DROP TABLE IF EXISTS {table} SYNC")

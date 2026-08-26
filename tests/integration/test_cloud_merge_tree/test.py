@@ -1958,8 +1958,12 @@ def test_concurrent_insert_during_move_partition_is_not_lost(cluster):
         # -- a background merge opportunistically consolidating two of the several small parts
         # below while the MOVE is in flight hits the exact same "one of these parts is no longer
         # active" retry path for a completely different reason, unrelated to this test's actual
-        # target.
+        # target. On BOTH replicas: STOP MERGES is per-server, and node2 (which the racing INSERT
+        # goes through) merges independently -- a node2 merge of the source parts mid-MOVE is
+        # exactly the confound observed in practice (it consumed all five source parts and made
+        # the MOVE's fixed-list commit fail permanently).
         node1.query(f"SYSTEM STOP MERGES {src_table}")
+        node2.query(f"SYSTEM STOP MERGES {src_table}")
 
         # Several parts in partition 0 -- movePartitionToTable's clone loop (one
         # cloneAndLoadDataPart() object-storage copy per part) takes long enough to give the

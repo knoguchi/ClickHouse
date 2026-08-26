@@ -2823,7 +2823,25 @@ void StorageCloudMergeTree::movePartitionToTable(const StoragePtr & dest_table, 
         Coordination::Responses responses;
         auto code = zk->tryMultiNoThrow(ops, responses);
         if (code == Coordination::Error::ZNONODE)
+        {
+            /// If the op that failed is the removal of one of the fixed source parts, that part
+            /// was deactivated concurrently -- typically another replica's merge consuming it, or
+            /// a concurrent DROP. Retrying the same fixed list can never succeed then (the znode
+            /// is gone for good), and it is not a logic error either: the partition legitimately
+            /// changed under a running MOVE. Fail with a retriable, user-facing error instead of
+            /// burning the retry budget into LOGICAL_ERROR. Ops layout: new_parts_with_headers
+            /// creates first, then a (remove, tombstone-create) pair per source part.
+            size_t failed_idx = zkutil::getFailedOpIndex(code, responses);
+            size_t first_removal_idx = new_parts_with_headers.size();
+            if (failed_idx >= first_removal_idx && (failed_idx - first_removal_idx) % 2 == 0)
+                throw Exception(ErrorCodes::NO_SUCH_DATA_PART,
+                    "Source part {} of MOVE PARTITION from table {} to {} is no longer active in Keeper "
+                    "(deactivated concurrently, e.g. by a merge on another replica or a concurrent DROP); "
+                    "retry the query",
+                    old_part_names_to_remove[(failed_idx - first_removal_idx) / 2],
+                    getStorageID().getNameForLogs(), dest_storage->getStorageID().getNameForLogs());
             continue;
+        }
         if (code != Coordination::Error::ZOK)
             throw zkutil::KeeperException(code, "Cannot commit MOVE PARTITION in Keeper between table {} and {}",
                 getStorageID().getNameForLogs(), dest_storage->getStorageID().getNameForLogs());
