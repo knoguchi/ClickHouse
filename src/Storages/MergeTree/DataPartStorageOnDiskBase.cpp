@@ -991,7 +991,14 @@ void DataPartStorageOnDiskBase::clearDirectory(
     /// Sometimes we add something to checksums.files before actually writing checksums and columns on disk.
     /// Also sometimes we write checksums.txt and columns.txt in arbitrary order, so this check becomes complex...
     bool incomplete_temporary_part = is_temp && (!disk->existsFile(fs::path(dir) / "checksums.txt") || !disk->existsFile(fs::path(dir) / "columns.txt"));
-    if (checksums.empty() || incomplete_temporary_part)
+
+    /// On `plain` / `plain_rewritable` object storage disks the per-file "fast path" below is the
+    /// slow path: every unlink there is several sequential object storage round trips (copy to a
+    /// temporary key, delete, delete) executed while the disk-wide metadata lock is held, so
+    /// removing one wide part with hundreds of files stalls every other write on the disk for
+    /// minutes on a high-latency link. Recursive directory removal on those disks is one directory
+    /// rename under the lock and batched object deletes outside it, so always prefer it there.
+    if (checksums.empty() || incomplete_temporary_part || disk->isPlain())
     {
         /// If the part is not completely written, we cannot use fast path by listing files.
         try
