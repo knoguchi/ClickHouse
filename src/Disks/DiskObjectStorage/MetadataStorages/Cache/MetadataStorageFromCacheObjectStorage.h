@@ -60,6 +60,15 @@ public:
     void shutdown() override;
     void refresh(UInt64 not_sooner_than_milliseconds) override;
 
+    /// Forwarded to the underlying metadata storage: a cache disk over `plain_rewritable` must
+    /// honour the same out-of-band directory authority (see IMetadataStorage), otherwise the
+    /// default no-op silently drops it and parts committed by another replica are invisible here.
+    void setAuthoritativeDirectory(
+        const std::string & path,
+        const std::string & remote_token,
+        const std::unordered_map<std::string, uint64_t> & files_with_sizes) override;
+    void removeAuthoritativeDirectory(const std::string & path) override;
+
     std::unordered_map<std::string, std::string> getSerializedMetadata(const std::vector<String> & file_paths) const override;
 
     StoredObjects getStorageObjects(const std::string & path) const override;

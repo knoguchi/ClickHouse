@@ -189,6 +189,19 @@ bool MetadataStorageFromCacheObjectStorage::isTransactional() const
     return underlying->isTransactional();
 }
 
+void MetadataStorageFromCacheObjectStorage::setAuthoritativeDirectory(
+    const std::string & path,
+    const std::string & remote_token,
+    const std::unordered_map<std::string, uint64_t> & files_with_sizes)
+{
+    underlying->setAuthoritativeDirectory(path, remote_token, files_with_sizes);
+}
+
+void MetadataStorageFromCacheObjectStorage::removeAuthoritativeDirectory(const std::string & path)
+{
+    underlying->removeAuthoritativeDirectory(path);
+}
+
 bool MetadataStorageFromCacheObjectStorage::isPlain() const
 {
     return underlying->isPlain();
