@@ -130,8 +130,15 @@ CloudPartLocation CloudPartLocation::read(ReadBuffer & in)
             dir.files_with_sizes.emplace(std::move(file_name), file_size);
         }
     }
-    readText(location.patch_max_data_version, in);
-    assertChar('\n', in);
+    /// Trailing field, added with patch-part (lightweight UPDATE) support. Znodes written by
+    /// builds that predate it end right after the last directory block; treat that as the
+    /// default 0, which is exact -- those builds could not have written a patch part. Without
+    /// this every pre-existing table fails to load on upgrade with ATTEMPT_TO_READ_AFTER_EOF.
+    if (!in.eof())
+    {
+        readText(location.patch_max_data_version, in);
+        assertChar('\n', in);
+    }
     return location;
 }
 
