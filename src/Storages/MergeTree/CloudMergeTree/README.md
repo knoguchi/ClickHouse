@@ -360,3 +360,87 @@ still works without Keeper: `plain_rewritable` keeps writing its own
 `prefix.path` markers on every commit regardless of the authoritative
 override, so listing-based recovery tooling that never consults Keeper
 remains possible; only the hot read/adoption/GC paths are Keeper-only.
+
+## Deployment notes (learned on a 5-replica staging cluster, 2026-09-04/05)
+
+- DDL is not replicated. Create tables with `ON CLUSTER` (or inside a
+  `Replicated` database) so every replica gets the same UUID; the Keeper root
+  is derived from it. A plain `CREATE` on one replica makes a private, empty
+  table with the same name and no warning. A replica rebuilt on an empty disk
+  needs `CREATE TABLE ... UUID '<same uuid>'`.
+- Set `placement.availability_zone` on every replica. Without it every replica
+  runs merge selection; on five replicas that meant five copies of each merge
+  reading the same source parts from object storage, with four losers
+  discarding their output. With one zone configured a single replica leads.
+- Parallel replicas need `parallel_replicas_for_non_replicated_merge_tree = 1`
+  (the engine is not a `StorageReplicatedMergeTree`); without it the query
+  silently runs on the initiator alone.
+- `SYSTEM STOP MERGES` without a table name only covers tables that exist at
+  that moment, as in every MergeTree engine.
+- The `cache` disk type over `plain_rewritable` works (see the fix below), and
+  is the configuration to use: there is no distributed cache, each replica
+  caches for itself, and a cold replica pays the full object storage read once
+  per column.
+
+Three fixes came out of that deployment:
+
+1. Part removal on `plain` / `plain_rewritable` disks now uses recursive
+   directory removal (`DataPartStorageOnDiskBase::clearDirectory`). The
+   per-file path did a copy, a delete and a second delete per file while
+   holding the disk-wide `metadata_mutex`, so removing one 105-column part
+   was over a thousand sequential round trips during which every insert and
+   merge commit on the disk waited. Measured on MinIO for 8 parts of 100
+   columns: 4150 requests before, 24 after, identical object count afterwards.
+2. `CloudPartLocation::read` accepts trailers without the trailing
+   `patch_max_data_version` field, so tables written before patch-part
+   support load instead of failing with `ATTEMPT_TO_READ_AFTER_EOF`.
+3. `MetadataStorageFromCacheObjectStorage` forwards
+   `setAuthoritativeDirectory` / `removeAuthoritativeDirectory` to the
+   underlying storage. Before, a `cache` disk dropped the Keeper-supplied part
+   locations: a 289-part table was fully visible on the writer and empty on
+   the other four replicas, and never merged because the leader saw nothing.
+
+## Benchmark: ClickBench on 5 replicas over DigitalOcean Spaces (2026-09-05)
+
+Setup: 5 replicas (12 GiB memory limit each, 16-core nodes), Keeper with one
+node, `plain_rewritable` disk on DigitalOcean Spaces nyc3 reached across the
+Internet (50 ms RTT, roughly 2 MiB/s per connection, zero 429/503 responses
+ever observed). ClickBench `hits`, 99 997 497 rows, 105 columns, loaded from
+the public parquet with 4 insert threads in 14 minutes with merges running.
+Each of the 43 queries ran 3 times; mark, primary index, uncompressed and
+filesystem caches dropped on the initiator before each query, so run 1 is
+cold and runs 2-3 are hot. Times are wall-clock seconds summed over the 43
+queries; geomean is over per-query times.
+
+| configuration                        | cold sum | hot sum | geomean cold | geomean hot |
+|--------------------------------------|---------:|--------:|-------------:|------------:|
+| 1 replica, no data cache             |   1776 s |  1446 s |        9.0 s |       7.0 s |
+| 1 replica, `cache` disk (10 GiB)     |   1737 s |    84 s |       11.6 s |      0.37 s |
+| 3 replicas, parallel replicas        |    840 s |   787 s |        7.7 s |       6.4 s |
+| 5 replicas, parallel replicas        |    611 s |   575 s |        6.2 s |       5.5 s |
+
+Cold sums by query class, 1 / 3 / 5 replicas: the six wide string scans
+(`URL`, `Title`, `Referer`) 1166 / 412 / 273 s; the 24 medium queries
+595 / 398 / 313 s; the 13 small queries 15 / 30 / 25 s.
+
+Reading it:
+
+- Every cold number is object storage bandwidth. Narrow columns read at about
+  85 MB/s per replica, wide string columns at about 15 MB/s because fewer,
+  larger range requests hit the per-connection ceiling. Hot runs without a
+  data cache only gain what the mark, index and query condition caches save.
+- Parallel replicas split marks evenly and all replicas finish together. The
+  wide scans scale close to the replica count. The medium queries stop near
+  2x because the five replicas share one path to the bucket that saturates
+  around 50 MB/s. Small queries get slower: a coordination round trip costs
+  more than the query.
+- A warm local cache beats four extra replicas by a wide margin: the whole
+  suite in 84 s on one cached replica versus 575 s on five uncached ones.
+  Cold is the same either way, so cold start is paid once per column per
+  replica.
+- Before fix 1 above neither load completed: the first merge round's source
+  removals held the disk lock for hours and inserts froze at 24 M and 63 M
+  rows.
+
+Raw per-query results: `tmp/clickbench/results_staging_*.tsv` in the
+working tree that produced them (not committed).
