@@ -442,5 +442,41 @@ Reading it:
   removals held the disk lock for hours and inserts froze at 24 M and 63 M
   rows.
 
-Raw per-query results: `tmp/clickbench/results_staging_*.tsv` in the
-working tree that produced them (not committed).
+### The same benchmark on AWS, and the same bucket read from both sides
+
+To separate the engine from the network, the same image ran on 4 x
+`c6a.4xlarge` (16 vCPU, 32 GiB, the ClickBench reference instance) in
+us-west-2 with `plain_rewritable` on an in-region S3 bucket, Keeper on the
+first node, a 500 GiB gp3 volume (500 MB/s) as the `cache` disk. Load of the
+same 100 M rows took 2 min 19 s instead of 14 min. Then three staging pods
+were pointed at the AWS Keeper and the AWS bucket (tables attached by UUID,
+merges stopped) and ran the same 43 queries against the same parts.
+
+| reader                    | storage                     | cold sum | hot sum | geomean cold | geomean hot |
+|---------------------------|-----------------------------|---------:|--------:|-------------:|------------:|
+| staging pod               | DigitalOcean Spaces nyc3    |   1776 s |  1446 s |        9.0 s |       7.0 s |
+| staging pod               | AWS S3 us-west-2            |   2125 s |  1737 s |       11.8 s |       9.0 s |
+| AWS `c6a.4xlarge`         | AWS S3 us-west-2            |     75 s |    40 s |       0.68 s |      0.35 s |
+| AWS, `cache` disk         | AWS S3 us-west-2            |     63 s |    19 s |       0.69 s |      0.13 s |
+| AWS, 3 replicas parallel  | AWS S3 us-west-2            |     70 s |    48 s |       0.78 s |      0.51 s |
+
+Same table (UUID, part count, row count and a `cityHash64` fingerprint
+verified identical from both sides), same binary. Reading the AWS bucket from
+the staging datacenter is as slow as reading Spaces from there and 28x slower
+than reading it from inside AWS: the object store was never the variable, the
+staging datacenter's single egress path was. On AWS the engine's cold suite
+lands next to ClickBench's own "ClickHouse (web)" entry (63.6 s) and beats the
+local-EBS entry cold (154.9 s); warm with the cache disk it is within 10% of
+local-disk ClickHouse on the same instance type (19.3 s vs 17.5 s) and matches
+ClickHouse Cloud's hot geomean (0.13 s vs 0.14 s), while trailing Cloud cold by
+3x (63 s vs 20 s), which is the absent distributed cache. Three parallel
+replicas are 7% faster cold and 20% slower hot than one, the same shape as
+Cloud's own 1/2/3-node entries: at this data size on fast storage, extra
+replicas buy availability, not speed.
+
+Published reference numbers used above are from the ClickBench repository
+as of 2026-09-05 (`clickhouse`, `clickhouse-web`, `clickhouse-cloud` results).
+
+Raw per-query results: `tmp/clickbench/results_staging_*.tsv` and
+`tmp/aws/results_aws_*.tsv` in the working tree that produced them (not
+committed).
