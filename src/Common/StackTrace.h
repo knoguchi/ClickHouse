@@ -17,11 +17,6 @@
   * those is left out rather than making the whole header unavailable, since `Common/Exception.h`
   * includes it and so does most of the tree.
   */
-#ifdef OS_SUNOS
-#   undef ERR
-#   undef FS
-#   undef SS
-#endif
 #if !defined(CLICKHOUSE_PARSER_MINIMAL_BUILD)
 #include <csignal>
 #include <csetjmp>
@@ -34,6 +29,11 @@
 #   define _XOPEN_SOURCE 700
 #endif
 #include <ucontext.h>
+#endif
+#ifdef OS_SUNOS
+#   undef ERR
+#   undef FS
+#   undef SS
 #endif
 
 /** The stack trace of the throw that created an exception, recorded inside the `std::exception`
