@@ -7,6 +7,7 @@
 #include <Common/SymbolIndex.h>
 
 #include <algorithm>
+#include <exception>
 #include <optional>
 
 #include <filesystem>
@@ -473,12 +474,29 @@ void collectSymbolsFromELF(
  * Is called by dl_iterate_phdr for every loaded shared lib until something
  * else than 0 is returned by one call of this function.
  */
-int collectSymbols(DynamicLinkingProgramHeaderInfo * info, size_t, void * data_ptr)
+struct CollectSymbolsContext
 {
-    SymbolIndex::Data & data = *reinterpret_cast<SymbolIndex::Data *>(data_ptr);
+    SymbolIndex::Data & data;
+    std::exception_ptr exception;
+};
 
-    collectSymbolsFromProgramHeaders(info, data.symbols);
-    collectSymbolsFromELF(info, data.symbols, data.objects, data.self_build_id);
+int collectSymbols(DynamicLinkingProgramHeaderInfo * info, size_t, void * context_ptr)
+{
+    CollectSymbolsContext & context = *reinterpret_cast<CollectSymbolsContext *>(context_ptr);
+    SymbolIndex::Data & data = context.data;
+
+    /// An exception must not unwind through the frames of `dl_iterate_phdr`: it is C code, and it holds
+    /// the loader lock while it calls us. Stop the iteration, and rethrow after `dl_iterate_phdr` returns.
+    try
+    {
+        collectSymbolsFromProgramHeaders(info, data.symbols);
+        collectSymbolsFromELF(info, data.symbols, data.objects, data.self_build_id);
+    }
+    catch (...)
+    {
+        context.exception = std::current_exception();
+        return 1;
+    }
 
     /* Continue iterations */
     return 0;
@@ -703,7 +721,10 @@ const SymbolIndex::Object * find(const void * address, const std::vector<SymbolI
 void SymbolIndex::load()
 {
 #if defined(__ELF__)
-    dl_iterate_phdr(collectSymbols, &data);
+    CollectSymbolsContext context{data, {}};
+    dl_iterate_phdr(collectSymbols, &context);
+    if (context.exception)
+        std::rethrow_exception(context.exception);
 #elif defined(OS_DARWIN)
     uint32_t image_count = _dyld_image_count();
     for (uint32_t i = 0; i < image_count; ++i)
