@@ -11,10 +11,21 @@ add_compile_definitions(_REENTRANT _POSIX_PTHREAD_SEMANTICS __EXTENSIONS__ _XOPE
 
 # We use illumos ld for native builds and lld to cross-build on linux. Detect
 # the linker being used for conditional options below.
+# The probe must find the linker the driver actually runs, so it honours -fuse-ld and --ld-path
+# (CMAKE_EXE_LINKER_FLAGS from cmake/tools.cmake). `--print-prog-name=ld` ignores both.
 set (SUNOS_LINKER_EXECUTABLE "${ILLUMOS_LLD}")
 if (NOT SUNOS_LINKER_EXECUTABLE)
-    execute_process(COMMAND "${CMAKE_CXX_COMPILER}" --print-prog-name=ld
-        OUTPUT_VARIABLE SUNOS_LINKER_EXECUTABLE OUTPUT_STRIP_TRAILING_WHITESPACE COMMAND_ERROR_IS_FATAL ANY)
+    file (WRITE "${CMAKE_BINARY_DIR}/sunos_ld_probe.cc" "int main () { return 0; }\n")
+    separate_arguments (SUNOS_LD_PROBE_FLAGS UNIX_COMMAND "${CMAKE_EXE_LINKER_FLAGS}")
+    # `-v` prints the linker invocation before running it; the probe's link result is not used.
+    execute_process(COMMAND "${CMAKE_CXX_COMPILER}" ${SUNOS_LD_PROBE_FLAGS} -v
+        -o "${CMAKE_BINARY_DIR}/sunos_ld_probe" "${CMAKE_BINARY_DIR}/sunos_ld_probe.cc"
+        OUTPUT_VARIABLE SUNOS_LD_PROBE_OUTPUT ERROR_VARIABLE SUNOS_LD_PROBE_OUTPUT)
+    string (REGEX MATCH "\"[^\"]*/ld\" [^\n]*crt1" SUNOS_LD_PROBE_LINE "${SUNOS_LD_PROBE_OUTPUT}")
+    if (NOT SUNOS_LD_PROBE_LINE)
+        message (FATAL_ERROR "Cannot find the linker invoked by ${CMAKE_CXX_COMPILER} -v")
+    endif ()
+    string (REGEX REPLACE "^\"([^\"]*)\".*" "\\1" SUNOS_LINKER_EXECUTABLE "${SUNOS_LD_PROBE_LINE}")
 endif ()
 execute_process(COMMAND "${SUNOS_LINKER_EXECUTABLE}" --version
     OUTPUT_VARIABLE SUNOS_LINKER_BANNER ERROR_VARIABLE SUNOS_LINKER_BANNER COMMAND_ERROR_IS_FATAL ANY)
